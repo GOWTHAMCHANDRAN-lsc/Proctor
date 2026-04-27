@@ -1,0 +1,8 @@
+{
+  "name": "LSC Proctor",
+  "description": "A secure, AI-enhanced proctored examination platform with real-time monitoring, automated scheduling, and detailed analytics.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}

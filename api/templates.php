@@ -18,6 +18,7 @@ function datetime_to_ms(?string $dt): ?int {
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
+    require_staff();
     $companyId = require_company_id();
     $channel = isset($_GET['channel']) ? strtoupper(trim((string)$_GET['channel'])) : null;
     if ($channel === '') $channel = null;

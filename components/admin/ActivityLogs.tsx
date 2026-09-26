@@ -1,9 +1,13 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { AuditLog, Student } from '../../types';
+import { AuditLog, Student, UserRole } from '../../types';
 import { apiGet } from '../../services/api';
+import { Pagination, usePagination } from './Pagination';
 import { Search, ShieldCheck, User, Server } from 'lucide-react';
 
-export const ActivityLogs: React.FC<{ students?: Student[] }> = ({ students = [] }) => {
+export const ActivityLogs: React.FC<{ students?: Student[]; role?: UserRole }> = ({ students = [], role }) => {
+  // Only super admins can see (and filter by) super-admin / platform activity; the API enforces
+  // this too, so the option is hidden here to avoid an empty, misleading filter for company staff.
+  const isSuperAdmin = role === UserRole.SUPER_ADMIN;
   const [logs, setLogs] = useState<AuditLog[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
@@ -59,6 +63,8 @@ export const ActivityLogs: React.FC<{ students?: Student[] }> = ({ students = []
     });
   }, [logs, search, roleFilter]);
 
+  const paging = usePagination(filtered, `${search}|${roleFilter}`);
+
   const renderRoleBadge = (role: AuditLog['actorRole']) => {
     if (role === 'ADMIN') return { label: 'ADMIN', tone: 'bg-blue-100 text-blue-700 border-blue-200', icon: <ShieldCheck size={12} /> };
     if (role === 'SUPER_ADMIN') return { label: 'SUPER ADMIN', tone: 'bg-violet-100 text-violet-700 border-violet-200', icon: <ShieldCheck size={12} /> };
@@ -94,7 +100,7 @@ export const ActivityLogs: React.FC<{ students?: Student[] }> = ({ students = []
           >
             <option value="ALL">All Roles</option>
             <option value="ADMIN">Admin</option>
-            <option value="SUPER_ADMIN">Super Admin</option>
+            {isSuperAdmin && <option value="SUPER_ADMIN">Super Admin</option>}
             <option value="PROCTOR">Proctor</option>
             <option value="STUDENT">Student</option>
             <option value="SYSTEM">System</option>
@@ -127,7 +133,7 @@ export const ActivityLogs: React.FC<{ students?: Student[] }> = ({ students = []
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {filtered.map(log => {
+                {paging.pageItems.map(log => {
                   const badge = renderRoleBadge(log.actorRole);
                   const actorLabel = log.actorRole === 'STUDENT' ? formatStudent(log.actorId) : (log.actorId || 'N/A');
                   const targetLabel = log.targetType
@@ -165,6 +171,7 @@ export const ActivityLogs: React.FC<{ students?: Student[] }> = ({ students = []
             </table>
           </div>
         )}
+        {!loading && filtered.length > 0 && <Pagination state={paging} label="events" />}
       </div>
     </div>
   );

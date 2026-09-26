@@ -19,6 +19,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     json_response(['error' => 'Method not allowed.'], 405);
 }
 
+require_staff();
 $companyId = require_company_id();
 
 $channel = isset($_GET['channel']) ? strtoupper(trim((string)$_GET['channel'])) : null;

@@ -24,3 +24,16 @@ dist-ssr
 *.sw?
 .env
 .env.local
+# Local/runtime artifacts (not source)
+dist.bak-*/
+*.bak
+__pycache__/
+*.pyc
+python_ai/venv/
+storage/
+.env.*
+!.env.example
+
+# Private documents — never commit (repo is public)
+*.docx
+.claude/settings.local.json

@@ -2,21 +2,104 @@ export enum UserRole {
   ADMIN = 'ADMIN',
   SUPER_ADMIN = 'SUPER_ADMIN',
   PROCTOR = 'PROCTOR',
+  // Read-only staff role: can only see the Dashboard and Results tabs.
+  VIEWER = 'VIEWER',
   STUDENT = 'STUDENT'
 }
 
 export enum QuestionType {
-  MCQ = 'MCQ',
+  MCQ = 'MCQ',                   // single correct option
+  MULTI_SELECT = 'MULTI_SELECT', // multiple correct options (checkbox)
+  TRUE_FALSE = 'TRUE_FALSE',     // True / False
+  YES_NO = 'YES_NO',             // Yes / No
+  SHORT_TEXT = 'SHORT_TEXT',     // one-line free text (manual grade)
+  LONG_TEXT = 'LONG_TEXT',       // essay / paragraph (manual grade)
+  FILL_BLANK = 'FILL_BLANK',     // fill in the blank(s)
+  NUMERIC = 'NUMERIC',           // numeric value (+/- tolerance)
+  DATE = 'DATE',                 // calendar date
+  TIME = 'TIME',                 // time of day
+  MATCHING = 'MATCHING',         // match left column to right column
+  ORDERING = 'ORDERING',         // arrange items into the correct order
+  DRAG_DROP = 'DRAG_DROP',       // drag items into buckets
+  // Legacy alias. Historic rows stored 'TEXT'; treated as LONG_TEXT everywhere.
   TEXT = 'TEXT'
 }
+
+// The auto-gradable objective types. SHORT_TEXT / LONG_TEXT / TEXT are graded manually.
+export const AUTO_GRADED_TYPES: QuestionType[] = [
+  QuestionType.MCQ,
+  QuestionType.MULTI_SELECT,
+  QuestionType.TRUE_FALSE,
+  QuestionType.YES_NO,
+  QuestionType.FILL_BLANK,
+  QuestionType.NUMERIC,
+  QuestionType.DATE,
+  QuestionType.TIME,
+  QuestionType.MATCHING,
+  QuestionType.ORDERING,
+  QuestionType.DRAG_DROP,
+];
+
+export const isManualGraded = (type: QuestionType): boolean =>
+  type === QuestionType.SHORT_TEXT || type === QuestionType.LONG_TEXT || type === QuestionType.TEXT;
+
+/**
+ * Structured correct-answer specification, stored on the question as `answerKey`.
+ * Only the field(s) relevant to the question's type are populated:
+ *  - MULTI_SELECT: correctIndices
+ *  - FILL_BLANK:   blanks (one entry per blank, each with accepted alternates)
+ *  - NUMERIC:      value (+ optional tolerance)
+ *  - DATE/TIME:    value ('YYYY-MM-DD' / 'HH:MM')
+ *  - MATCHING:     pairs (leftIndex -> rightIndex)
+ *  - ORDERING:     order (correct sequence of item indices)
+ *  - DRAG_DROP:    placements (itemIndex -> bucketIndex)
+ * MCQ / TRUE_FALSE / YES_NO use correctOptionIndex instead of answerKey.
+ */
+export interface AnswerKey {
+  correctIndices?: number[];
+  blanks?: { accepted: string[] }[];
+  value?: number | string;
+  tolerance?: number | null;
+  pairs?: Record<number, number>;
+  order?: number[];
+  placements?: Record<number, number>;
+}
+
+// Column/bucket data for structured types, stored on the question as `matchOptions`.
+export interface MatchOptions {
+  left?: string[];    // MATCHING
+  right?: string[];   // MATCHING
+  items?: string[];   // ORDERING / DRAG_DROP
+  buckets?: string[]; // DRAG_DROP
+}
+
+// Device classes an exam can be restricted to. 'desktop' covers laptops and desktop
+// computers (a browser cannot tell them apart); 'tablet' and 'mobile' (phone) are detected
+// separately. If an exam allows none of the candidate's device class, the exam is blocked.
+export type DeviceType = 'desktop' | 'tablet' | 'mobile';
 
 export interface Question {
   id: string;
   text: string;
   type: QuestionType;
   options?: string[];
-  correctOptionIndex?: number; // For MCQ
+  correctOptionIndex?: number; // For MCQ / TRUE_FALSE / YES_NO
+  // Structured correct-answer spec for MULTI_SELECT, FILL_BLANK, NUMERIC, DATE, TIME,
+  // MATCHING, ORDERING, DRAG_DROP. Null/undefined for option-index and free-text types.
+  answerKey?: AnswerKey | null;
+  // Column/bucket/item data for MATCHING, ORDERING, DRAG_DROP.
+  matchOptions?: MatchOptions | null;
   marks: number;
+  /**
+   * Marks deducted when this question is answered but wrong (auto-graded types only).
+   * 0/undefined = no negative marking, which is what every question keeps until an admin sets one.
+   */
+  negativeMarks?: number;
+  /**
+   * Max words a candidate may write, for TEXT (descriptive) questions only.
+   * null / undefined = no limit, which is what every question without an explicit cap gets.
+   */
+  wordLimit?: number | null;
   sectionId?: string;
   sectionTitle?: string;
 }
@@ -37,16 +120,22 @@ export interface Exam {
   durationMinutes: number;
   startTime: number; // Timestamp in ms
   endTime: number;   // Timestamp in ms
+  timezone?: string; // IANA zone (e.g. "Asia/Riyadh") for displaying/entering the schedule
   questions: Question[];
   sections?: ExamSection[];
   questionCount?: number; // Number of questions to present to student (subset limit)
   shuffleQuestions?: boolean; // Whether to randomize question order/selection
   showResults?: boolean; // Whether to show results immediately after submission
+  // Certificate issuance is on-demand only (never automatic on pass) and only reachable at all
+  // when this is enabled for the exam. Set once at exam creation/edit.
+  certificateEnabled?: boolean;
   attemptPolicy?: 'LAST'; // Multi-attempt scoring policy disabled; always last attempt
   reconnectLimit?: number; // Allowed reconnection attempts for active sessions
   passPercent?: number; // Percentage required to pass the exam
   totalMarks: number;
   status: 'DRAFT' | 'PUBLISHED' | 'ARCHIVED';
+  // Which device classes may take this exam. Empty/undefined means all devices allowed.
+  allowedDeviceTypes?: DeviceType[];
   proctoringConfig: {
     cameraRequired: boolean;
     microphoneRequired: boolean;
@@ -58,10 +147,30 @@ export interface Exam {
       fullscreen: number;
       copyPaste: number;
     };
+    // Seconds of sustained gaze-away / talking tolerated before GAZE_AWAY / AUDIO_DETECTED fires.
+    proctorTiming?: {
+      gazeAwaySeconds: number;
+      audioSeconds: number;
+    };
   };
   assignedStudentIds?: string[];
   assignedBatchIds?: number[];
+  // Assigned students who have not been sent an access link yet (server-computed, read-only).
+  pendingInviteCount?: number;
+  // Assigned students who have never opened this exam — no session row at all (server-computed,
+  // read-only). This is the audience a "not attempted" reminder targets.
+  notAttemptedCount?: number;
+  // Per-exam subject/message overrides composed in the Mail Composer. An absent kind means the
+  // built-in default body is used for that mail.
+  mailTemplates?: Partial<Record<ExamMailKind, ExamMailTemplate>>;
   notificationConfig?: NotificationConfig;
+}
+
+export type ExamMailKind = 'INVITE' | 'REMINDER';
+
+export interface ExamMailTemplate {
+  subject: string;
+  message: string;
 }
 
 export interface ExamSection {
@@ -82,13 +191,15 @@ export interface Student {
   registrationId: string;
   companyId?: number;
   company?: string;
-  batchId?: number | null;
-  batch?: string | null;
+  batches: { id: number; name: string }[];
+  enrolled?: boolean;
+  enrolledAt?: string | null;
 }
 
 export interface Batch {
   id: number;
   companyId: number;
+  companyName?: string | null;
   name: string;
   description?: string | null;
   studentCount?: number;
@@ -216,10 +327,10 @@ export interface ExamSession {
 
 export interface ViolationLog {
   timestamp: number;
-  type: 'TAB_SWITCH' | 'NO_FACE' | 'MULTIPLE_FACES' | 'GAZE_AWAY' | 'AUDIO_DETECTED' | 'FULLSCREEN_EXIT' | 'COPY_PASTE' | 'PHONE_DETECTED' | 'ANOMALY_OBJECT' | 'LOCATION_CHANGE';
+  type: 'TAB_SWITCH' | 'NO_FACE' | 'MULTIPLE_FACES' | 'GAZE_AWAY' | 'AUDIO_DETECTED' | 'FULLSCREEN_EXIT' | 'COPY_PASTE' | 'PHONE_DETECTED' | 'ANOMALY_OBJECT' | 'LOCATION_CHANGE' | 'IDENTITY_CHANGE' | 'SUSPICIOUS_BEHAVIOR';
   description: string;
   snapshot?: string; // Base64 image string of the webcam at that moment
-  category?: 'camera' | 'microphone' | 'screen' | 'browser' | 'device' | 'location';
+  category?: 'camera' | 'microphone' | 'screen' | 'browser' | 'device' | 'location' | 'behavior';
   confidence?: number;
   metadata?: Record<string, any>;
 }
@@ -236,9 +347,13 @@ export interface ResultAnswer {
   questionType: QuestionType;
   options?: string[] | null;
   correctOptionIndex?: number | null;
+  answerKey?: AnswerKey | null;
+  matchOptions?: MatchOptions | null;
   marks: number;
   answerText?: string | null;
   answerOptionIndex?: number | null;
+  // Structured student response (arrays/objects) for non-option-index types.
+  answerJson?: any;
   isCorrect?: boolean | null;
   awardedMarks?: number | null;
   timeSpentSec?: number | null;
@@ -261,6 +376,9 @@ export interface ExamResultRecord {
   finalMaxScore?: number | null;
   finalPassed?: boolean | null;
   finalPercent?: number | null;
+  answeredCount?: number | null;
+  terminationReason?: string | null;
+  violationCount?: number | null;
   answers: ResultAnswer[];
 }
 
@@ -312,6 +430,64 @@ export interface DeliveryLog {
   error?: string | null;
   templateId?: number | null;
   metadata?: Record<string, any> | null;
+  createdAt: number;
+}
+
+// V1 automation Phase 1: inbound webhook connector that auto-schedules an exam when a source
+// platform reports a learner completed a mapped course. See docs/ProctorGuard_V1_Requirements.md.
+export interface IntegrationConnector {
+  id: string;
+  name: string;
+  status: 'ACTIVE' | 'DISABLED';
+  secretMasked: string;
+  fieldMap: Record<string, string>;
+  createdAt: number;
+}
+
+export interface IntegrationEvent {
+  id: number;
+  connectorId: string;
+  eventType?: string | null;
+  status: 'RECEIVED' | 'PROCESSED' | 'FAILED' | 'DEAD' | 'UNMAPPED' | 'SKIPPED_GATE';
+  attempts: number;
+  error?: string | null;
+  payload?: Record<string, any> | null;
+  receivedAt: number;
+  processedAt?: number | null;
+}
+
+export interface CourseExamMapping {
+  id: number;
+  connectorId: string;
+  externalCourseId: string;
+  examId: string;
+  examTitle?: string | null;
+  batchId?: number | null;
+  batchName?: string | null;
+  active: boolean;
+}
+
+// V1 automation Phase 2: certificate hand-off to an external certificate system on a session's
+// final pass. See docs/ProctorGuard_V1_Requirements.md §7.6. The external call is currently a
+// stub (call_certificate_api() in api/certificates.php) pending the vendor's real API contract, so
+// issuances typically sit in FAILED with an explanatory error until that's wired in.
+export interface CertificateIssuance {
+  id: number;
+  sessionId: number;
+  studentId: string;
+  studentName: string;
+  studentEmail: string;
+  examId: string;
+  examTitle: string;
+  verificationId: string;
+  externalCertificateId?: string | null;
+  verificationUrl?: string | null;
+  status: 'PENDING' | 'ISSUED' | 'FAILED';
+  attempts: number;
+  error?: string | null;
+  issuedAt?: number | null;
+  lastEmailedAt?: number | null;
+  emailCount: number;
   createdAt: number;
 }
 
@@ -370,6 +546,11 @@ export interface RecordingSessionRecord {
     fileUrl?: string | null;
     createdAt?: number | null;
   }>;
+  // On-demand re-analysis of this recording's camera stream against the live AI detector.
+  recheckStatus?: 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED' | null;
+  recheckFoundCount?: number | null;
+  recheckError?: string | null;
+  recheckFinishedAt?: number | null;
 }
 
 export interface RecordingSummary {

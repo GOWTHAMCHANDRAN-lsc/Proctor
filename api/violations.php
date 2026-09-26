@@ -21,10 +21,10 @@ function ensure_violation_enum(PDO $pdo): void {
         $column = $stmt ? $stmt->fetch() : null;
         if ($stmt) $stmt->closeCursor();
         $type = is_array($column) ? (string)($column['Type'] ?? '') : '';
-        if (stripos($type, 'GAZE_AWAY') !== false && stripos($type, 'LOCATION_CHANGE') !== false) {
+        if (stripos($type, 'GAZE_AWAY') !== false && stripos($type, 'LOCATION_CHANGE') !== false && stripos($type, 'IDENTITY_CHANGE') !== false && stripos($type, 'SUSPICIOUS_BEHAVIOR') !== false) {
             return;
         }
-        $pdo->exec("ALTER TABLE violation_logs MODIFY type ENUM('TAB_SWITCH','NO_FACE','MULTIPLE_FACES','GAZE_AWAY','AUDIO_DETECTED','FULLSCREEN_EXIT','COPY_PASTE','PHONE_DETECTED','ANOMALY_OBJECT','LOCATION_CHANGE') NOT NULL");
+        $pdo->exec("ALTER TABLE violation_logs MODIFY type ENUM('TAB_SWITCH','NO_FACE','MULTIPLE_FACES','GAZE_AWAY','AUDIO_DETECTED','FULLSCREEN_EXIT','COPY_PASTE','PHONE_DETECTED','ANOMALY_OBJECT','LOCATION_CHANGE','IDENTITY_CHANGE','SUSPICIOUS_BEHAVIOR') NOT NULL");
     } catch (Throwable $e) {
         // Existing deployments may not allow online enum migration; insert errors will surface normally.
     }
@@ -42,6 +42,7 @@ function violation_category_for_type(string $type): string {
         'TAB_SWITCH', 'COPY_PASTE' => 'browser',
         'FULLSCREEN_EXIT' => 'screen',
         'LOCATION_CHANGE' => 'location',
+        'SUSPICIOUS_BEHAVIOR' => 'behavior',
         default => 'camera',
     };
 }
@@ -51,10 +52,14 @@ ensure_violation_enum($pdo);
 ensure_violation_metadata_schema($pdo);
 
 if ($method === 'GET') {
+    require_staff(); // admin-only read: blocks tokenless/forged-header access
     $companyId = require_company_id();
     $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 20;
     if ($limit <= 0) $limit = 20;
+    if ($limit > 2000) $limit = 2000;
     $sessionId = isset($_GET['sessionId']) ? (int)$_GET['sessionId'] : null;
+    $studentFilter = isset($_GET['studentId']) ? trim((string)$_GET['studentId']) : '';
+    $examFilter = isset($_GET['examId']) ? trim((string)$_GET['examId']) : '';
     if (!db_table_exists($pdo, 'violation_logs') || !db_table_exists($pdo, 'exam_sessions')) {
         json_response(['violations' => []]);
     }
@@ -114,10 +119,19 @@ if ($method === 'GET') {
             JOIN exam_sessions es ON es.id = vl.session_id
             ' . ($hasReviews ? 'LEFT JOIN violation_reviews vr ON vr.violation_id = vl.id' : '') . '
             WHERE vl.company_id = ?
+            ' . ($studentFilter !== '' ? 'AND es.student_id = ?' : '') . '
+            ' . ($examFilter !== '' ? 'AND es.exam_id = ?' : '') . '
             ORDER BY vl.occurred_at DESC
             LIMIT ?');
-        $stmt->bindValue(1, $companyId, PDO::PARAM_INT);
-        $stmt->bindValue(2, $limit, PDO::PARAM_INT);
+        $bindIndex = 1;
+        $stmt->bindValue($bindIndex++, $companyId, PDO::PARAM_INT);
+        if ($studentFilter !== '') {
+            $stmt->bindValue($bindIndex++, $studentFilter, PDO::PARAM_STR);
+        }
+        if ($examFilter !== '') {
+            $stmt->bindValue($bindIndex++, $examFilter, PDO::PARAM_STR);
+        }
+        $stmt->bindValue($bindIndex++, $limit, PDO::PARAM_INT);
         $stmt->execute();
         $rows = $stmt->fetchAll();
         $stmt->closeCursor();
@@ -214,9 +228,39 @@ if ($method === 'POST') {
         json_response(['error' => 'Violation storage is unavailable on this database.'], 503);
     }
 
+    // Resolve the session once for the whole batch. Prefer the exact session the client is
+    // running under; fall back to the latest attempt only when it isn't supplied (or is stale
+    // after an admin reset). Guessing per-violation attached evidence to the wrong attempt.
+    $requestedSessionId = isset($payload['sessionId']) && is_numeric($payload['sessionId'])
+        ? (int)$payload['sessionId']
+        : null;
+    $sessionRowId = null;
+    if ($requestedSessionId) {
+        $stmt = $pdo->prepare('SELECT id FROM exam_sessions
+                               WHERE id = ? AND company_id = ? AND exam_id = ? AND student_id = ?');
+        $stmt->execute([$requestedSessionId, $companyId, $examId, $studentId]);
+        $row = $stmt->fetch();
+        $stmt->closeCursor();
+        if ($row) $sessionRowId = (int)$row['id'];
+    }
+    if ($sessionRowId === null) {
+        $stmt = $pdo->prepare('SELECT id FROM exam_sessions
+                               WHERE company_id = ? AND exam_id = ? AND student_id = ?
+                               ORDER BY start_time DESC
+                               LIMIT 1');
+        $stmt->execute([$companyId, $examId, $studentId]);
+        $row = $stmt->fetch();
+        $stmt->closeCursor();
+        if ($row) $sessionRowId = (int)$row['id'];
+    }
+    if ($sessionRowId === null) {
+        // saved: 0 tells the client to keep the evidence queued and retry later.
+        json_response(['saved' => 0, 'errors' => ['Session not found for this exam attempt.']]);
+    }
+
     $errors = [];
     $count = 0;
-    $allowedTypes = ['TAB_SWITCH','NO_FACE','MULTIPLE_FACES','GAZE_AWAY','AUDIO_DETECTED','FULLSCREEN_EXIT','COPY_PASTE','PHONE_DETECTED','ANOMALY_OBJECT','LOCATION_CHANGE'];
+    $allowedTypes = ['TAB_SWITCH','NO_FACE','MULTIPLE_FACES','GAZE_AWAY','AUDIO_DETECTED','FULLSCREEN_EXIT','COPY_PASTE','PHONE_DETECTED','ANOMALY_OBJECT','LOCATION_CHANGE','IDENTITY_CHANGE','SUSPICIOUS_BEHAVIOR'];
     foreach ($violations as $v) {
         $type = strtoupper(trim((string)($v['type'] ?? '')));
         $description = $v['description'] ?? '';
@@ -236,24 +280,12 @@ if ($method === 'POST') {
         }
 
         try {
-            $sessionStmt = $pdo->prepare('SELECT id
-                                          FROM exam_sessions
-                                          WHERE company_id = ? AND exam_id = ? AND student_id = ?
-                                          ORDER BY start_time DESC
-                                          LIMIT 1');
-            $sessionStmt->execute([$companyId, $examId, $studentId]);
-            $session = $sessionStmt->fetch();
-            $sessionStmt->closeCursor();
-            if (!$session) {
-                throw new RuntimeException('Session not found.');
-            }
-
             $stmt = $pdo->prepare('INSERT INTO violation_logs
                 (company_id, session_id, occurred_at, type, category, confidence, description, snapshot_base64, metadata_json)
                 VALUES (?, ?, FROM_UNIXTIME(?), ?, ?, ?, ?, ?, ?)');
             $stmt->execute([
                 $companyId,
-                (int)$session['id'],
+                $sessionRowId,
                 $timestamp,
                 $type,
                 $category !== '' ? $category : violation_category_for_type($type),

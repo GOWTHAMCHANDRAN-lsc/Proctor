@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { AlertOctagon, Radio, Search, Users, ShieldAlert, TrendingUp, User } from 'lucide-react';
 import { apiGet, apiPost } from '../../services/api';
+import { Pagination, usePagination } from './Pagination';
+import { groupViolationEpisodes, formatEpisodeDuration } from '../../services/violationEpisodes';
 import { AccessRequestRecord, Exam, Student } from '../../types';
 
 type ViolationFeedItem = {
@@ -14,6 +16,7 @@ type ViolationFeedItem = {
   timestamp: number;
   snapshot?: string | null;
   description?: string;
+  metadata?: Record<string, any> | null;
   review?: {
     decision?: string | null;
     note?: string | null;
@@ -21,6 +24,9 @@ type ViolationFeedItem = {
     reviewedAt?: number | null;
   };
 };
+
+/** One real incident. `episodeCount` is how many raw detector events it produced. */
+type IncidentItem = ViolationFeedItem & { episodeCount: number; episodeMs: number };
 
 export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({ exams, students }) => {
   const [alerts, setAlerts] = useState<ViolationFeedItem[]>([]);
@@ -69,9 +75,24 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
     };
   }, []);
 
+  // The feed reports INCIDENTS, not raw detector pings. A candidate whose webcam feeds a placeholder
+  // image for 19 minutes generates 100+ NO_FACE rows; listing each one buried the events that
+  // actually matter (a phone, a second face) and made every count meaningless. Every stat and list
+  // below is therefore built from grouped incidents, not raw alerts.
+  const incidents = useMemo<IncidentItem[]>(
+    () => groupViolationEpisodes(alerts).map(ep => ({
+      ...ep.first,
+      description: ep.description || ep.first.description,
+      snapshot: ep.snapshot ?? ep.first.snapshot,
+      episodeCount: ep.count,
+      episodeMs: ep.durationMs,
+    })),
+    [alerts],
+  );
+
   const alertsSorted = useMemo(() => {
-    return [...alerts].sort((a, b) => b.timestamp - a.timestamp);
-  }, [alerts]);
+    return [...incidents].sort((a, b) => b.timestamp - a.timestamp);
+  }, [incidents]);
 
   const requestsSorted = useMemo(() => {
     return [...accessRequests].sort((a, b) => b.requestedAt - a.requestedAt);
@@ -87,6 +108,8 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
       'TAB_SWITCH',
       'COPY_PASTE',
       'FULLSCREEN_EXIT',
+      'IDENTITY_CHANGE',
+      'SUSPICIOUS_BEHAVIOR',
     ]);
 
     const stats = new Map<string, {
@@ -113,7 +136,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
       });
     });
 
-    alerts.forEach(a => {
+    incidents.forEach(a => {
       const entry = stats.get(a.studentId);
       if (!entry) return;
       entry.total += 1;
@@ -134,19 +157,19 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
       const nameB = b.student.fullName.toLowerCase();
       return nameA.localeCompare(nameB);
     });
-  }, [alerts, students]);
+  }, [incidents, students]);
 
   const analysis = useMemo(() => {
     const now = Date.now();
-    const totalAlerts = alerts.length;
-    const recentAlerts = alerts.filter(a => now - a.timestamp < 24 * 60 * 60 * 1000).length;
-    const flaggedStudents = new Set(alerts.map(a => a.studentId)).size;
+    const totalAlerts = incidents.length;
+    const recentAlerts = incidents.filter(a => now - a.timestamp < 24 * 60 * 60 * 1000).length;
+    const flaggedStudents = new Set(incidents.map(a => a.studentId)).size;
     const typeCount = new Map<string, number>();
-    alerts.forEach(a => typeCount.set(a.type, (typeCount.get(a.type) || 0) + 1));
+    incidents.forEach(a => typeCount.set(a.type, (typeCount.get(a.type) || 0) + 1));
     const topTypes = Array.from(typeCount.entries()).sort((a, b) => b[1] - a[1]).slice(0, 3);
     const topStudent = studentStats.find(s => s.total > 0) || null;
     return { totalAlerts, recentAlerts, flaggedStudents, topTypes, topStudent };
-  }, [alerts, studentStats]);
+  }, [incidents, studentStats]);
 
   const examStats = useMemo(() => {
     const stats = new Map<string, { exam: Exam; total: number; lastSeen: number | null; types: Map<string, number> }>();
@@ -154,7 +177,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
       stats.set(exam.id, { exam, total: 0, lastSeen: null, types: new Map() });
     });
 
-    alerts.forEach(alert => {
+    incidents.forEach(alert => {
       const entry = stats.get(alert.examId);
       if (!entry) return;
       entry.total += 1;
@@ -166,7 +189,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
       if (b.total !== a.total) return b.total - a.total;
       return a.exam.title.localeCompare(b.exam.title);
     });
-  }, [alerts, exams]);
+  }, [incidents, exams]);
 
   const filtered = useMemo(() => {
     let list = alertsSorted;
@@ -190,6 +213,13 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
       );
     });
   }, [alertsSorted, search, exams, students, selectedStudentId]);
+
+  // Every long list on this screen pages independently — the feed and the risk panels each grow
+  // without bound on a busy exam day.
+  const feedPaging = usePagination(filtered, `${search}|${selectedStudentId}|${selectedExamId}`);
+  const studentPaging = usePagination(studentStats, search, 10);
+  const examPaging = usePagination(examStats, search, 9);
+  const requestPaging = usePagination(requestsSorted, '', 10);
 
   const getRiskLabel = (score: number) => {
     if (score >= 18) return { label: 'High', tone: 'bg-red-100 text-red-700 border-red-200' };
@@ -342,7 +372,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
           {examStats.length === 0 && (
             <div className="text-xs text-slate-400">No exam alerts yet.</div>
           )}
-          {examStats.map(entry => {
+          {examPaging.pageItems.map(entry => {
             const isActive = selectedExamId === entry.exam.id;
             return (
               <button
@@ -363,6 +393,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
             );
           })}
         </div>
+        <Pagination state={examPaging} label="exams" hidePageSize className="-mx-4 -mb-4 mt-3 rounded-b-xl" />
       </div>
 
       <div className="lsc-panel p-4">
@@ -376,7 +407,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
           {requestsSorted.length === 0 && (
             <p className="text-xs text-slate-400">No access requests yet.</p>
           )}
-          {requestsSorted.map(request => {
+          {requestPaging.pageItems.map(request => {
             const student = students.find(s => s.id === request.studentId);
             const exam = exams.find(e => e.id === request.examId);
             const pending = request.status === 'PENDING';
@@ -463,13 +494,14 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
             );
           })}
         </div>
+        <Pagination state={requestPaging} label="requests" hidePageSize className="-mx-4 -mb-4 mt-3 rounded-b-xl" />
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-[360px_1fr] gap-6">
         <div className="lsc-panel overflow-hidden">
           <div className="p-4 lsc-panel-header flex items-center justify-between">
             <h3 className="font-semibold text-slate-800 flex items-center gap-2">
-              <User size={16} className="text-[#3558ff]" /> Student Risk Analysis
+              <User size={16} className="text-[var(--lsc-primary)]" /> Student Risk Analysis
             </h3>
             <button
               onClick={() => setSelectedStudentId(null)}
@@ -479,7 +511,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
             </button>
           </div>
           <div className="p-4 space-y-3 max-h-[640px] overflow-y-auto">
-            {studentStats.map(entry => {
+            {studentPaging.pageItems.map(entry => {
               const risk = getRiskLabel(entry.score);
               const isActive = selectedStudentId === entry.student.id;
               return (
@@ -517,6 +549,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
               );
             })}
           </div>
+          <Pagination state={studentPaging} label="students" hidePageSize />
         </div>
 
         <div className="lsc-panel overflow-hidden">
@@ -527,7 +560,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
             <span className="text-xs font-mono text-slate-500">REAL-TIME</span>
           </div>
           <div className="p-4 space-y-4 max-h-[640px] overflow-y-auto">
-            {filtered.map(alert => {
+            {feedPaging.pageItems.map(alert => {
               const student = students.find(s => s.id === alert.studentId);
               const exam = exams.find(e => e.id === alert.examId);
               const status = alert.review?.decision || 'PENDING';
@@ -537,9 +570,16 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
                     <AlertOctagon size={16} className="text-rose-600" />
                   </div>
                   <div className="flex-1">
-                    <div className="flex justify-between items-start">
-                      <span className="text-sm font-bold text-slate-900">{alert.type.replace('_', ' ')}</span>
-                      <span className="text-xs text-slate-400">{new Date(alert.timestamp).toLocaleString()}</span>
+                    <div className="flex justify-between items-start gap-2">
+                      <span className="text-sm font-bold text-slate-900">
+                        {alert.type.replace('_', ' ')}
+                        {alert.episodeCount > 1 && alert.episodeMs >= 1000 && (
+                          <span className="ml-2 text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 align-middle">
+                            continuous · {formatEpisodeDuration(alert.episodeMs)} · {alert.episodeCount}×
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-xs text-slate-400 shrink-0">{new Date(alert.timestamp).toLocaleString()}</span>
                     </div>
                     <p className="text-xs text-slate-600 mt-1">
                       <span className="font-medium text-slate-800">{student?.fullName || alert.studentId}</span> in {exam?.title || alert.examId}
@@ -581,6 +621,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
               <p className="text-xs text-slate-400 text-center py-6">No security alerts yet.</p>
             )}
           </div>
+          <Pagination state={feedPaging} label="alerts" />
         </div>
       </div>
 

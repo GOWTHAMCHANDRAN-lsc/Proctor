@@ -6,6 +6,7 @@ require __DIR__ . '/_bootstrap.php';
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
+    require_staff(); // admin-only read: blocks tokenless/forged-header access
     $companyId = require_company_id();
     $examId = isset($_GET['examId']) ? trim((string)$_GET['examId']) : '';
     if ($examId === '') {
@@ -45,7 +46,7 @@ if ($method === 'GET') {
 
     $sessionScores = [];
     foreach ($sessions as $s) {
-        $sessionScores[(int)$s['id']] = $s['total_score'] !== null ? (int)$s['total_score'] : 0;
+        $sessionScores[(int)$s['id']] = $s['total_score'] !== null ? (float)$s['total_score'] : 0;
     }
 
     $sessionIds = array_keys($sessionScores);
@@ -117,13 +118,13 @@ if ($method === 'GET') {
             $correct = (bool)$isCorrect;
         } elseif ($awarded !== null) {
             $graded = true;
-            $correct = ((int)$awarded === $marks);
+            $correct = ((float)$awarded === (float)$marks);
         }
 
         if ($graded) {
             $stats[$qid]['gradedAttempts'] += 1;
             $stats[$qid]['correct'] += $correct ? 1 : 0;
-            $stats[$qid]['totalAwarded'] += (int)$awarded;
+            $stats[$qid]['totalAwarded'] += (float)$awarded;
         }
 
         if ($row['seconds_spent'] !== null) {

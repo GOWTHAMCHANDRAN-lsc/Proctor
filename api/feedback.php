@@ -115,11 +115,14 @@ if ($method === 'POST') {
         $sessionId = $session ? (int)$session['id'] : null;
     }
 
-    $batchStmt = $pdo->prepare('SELECT batch_id FROM students WHERE company_id = ? AND id = ? LIMIT 1');
-    $batchStmt->execute([$companyId, $studentId]);
-    $student = $batchStmt->fetch();
+    // A student can now be in more than one batch — this column is a denormalized snapshot
+    // (one value), so we just record any one of their current batches.
+    try { ensure_student_batches_schema($pdo); } catch (Throwable $e) { /* best-effort */ }
+    $batchStmt = $pdo->prepare('SELECT batch_id FROM student_batches WHERE student_id = ? LIMIT 1');
+    $batchStmt->execute([$studentId]);
+    $batchId = $batchStmt->fetchColumn();
     $batchStmt->closeCursor();
-    $batchId = $student && $student['batch_id'] !== null ? (int)$student['batch_id'] : null;
+    $batchId = $batchId !== false && $batchId !== null ? (int)$batchId : null;
 
     $stmt = $pdo->prepare('INSERT INTO session_feedback
         (company_id, session_id, exam_id, student_id, batch_id, rating, clarity_rating, platform_rating, comment)

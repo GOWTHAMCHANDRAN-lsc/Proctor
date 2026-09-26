@@ -42,6 +42,16 @@ const getCompanyIdHeader = (): string | null => {
       const raw = localStorage.getItem('pg_admin_auth');
       if (raw) {
         const parsed = JSON.parse(raw);
+        // A SUPER_ADMIN is not pinned to a single company — the global company switcher stores the
+        // company they are currently acting on. That selection scopes every screen (dashboard,
+        // exams, students, monitoring, results, recordings, security, audit) via this header.
+        // Only honoured for SUPER_ADMIN so a regular admin can never widen its own scope.
+        if (String(parsed?.role || '').toUpperCase() === 'SUPER_ADMIN') {
+          const override = Number(localStorage.getItem('pg_admin_active_company'));
+          if (Number.isFinite(override) && override > 0) {
+            return String(override);
+          }
+        }
         const companyId = Number(parsed?.companyId);
         if (Number.isFinite(companyId) && companyId > 0) {
           return String(companyId);
@@ -96,7 +106,63 @@ const buildHeaders = (base?: HeadersInit) => {
   if (actorId) {
     headers.set('X-Actor-Id', actorId);
   }
+  // Signed session token minted by the server at login. This — not the X-User-Role/X-Company-Id
+  // headers — is what authorizes privileged requests once token enforcement is on.
+  const authToken = getAdminAuthValue('token');
+  // Student exam-access token: the signed grant for the exam-taking page. On that page (not
+  // /admin), this must ALWAYS win over any admin token — a staff member testing/proctoring from
+  // the same browser they're logged into the admin panel with would otherwise silently send their
+  // (possibly stale, wrong-company, or since-expired) admin session instead of the exam token, which
+  // hits the staff-only code path and 401s a perfectly valid student link. The two tokens are scoped
+  // to two completely separate UI contexts and must never bleed into each other.
+  const examToken = typeof window !== 'undefined' ? localStorage.getItem('pg_student_exam_token') : null;
+  if (!isAdminRoute && examToken) {
+    headers.set('X-Exam-Token', examToken);
+  } else if (authToken) {
+    headers.set('X-Auth-Token', authToken);
+  } else if (examToken) {
+    headers.set('X-Exam-Token', examToken);
+  }
   return headers;
+};
+
+// When the server rejects our session (missing/expired/invalid token) on an admin screen, drop the
+// stale session and bounce back to the login screen so the user can re-authenticate.
+//
+// This must NOT hard-reload: a hard reload on every 401 creates a reload LOOP whenever a login
+// stores a token the server won't accept (e.g. an empty token, or a session minted before this
+// deploy) — the app boots "authed", fires data calls, gets 401, reloads, and repeats forever.
+// Instead we clear the session and dispatch a one-shot event that App handles with a soft React
+// logout (render the login screen, no navigation). The one-shot guard means concurrent 401s from a
+// burst of parallel requests collapse into a single logout, and we never fire again until the user
+// re-authenticates (which resets the guard on the next successful login-driven reload of state).
+let authExpiryHandled = false;
+
+const handleAuthExpiry = (status: number) => {
+  if (status !== 401) return;
+  if (typeof window === 'undefined') return;
+  if (!window.location.pathname.startsWith('/admin')) return;
+  if (authExpiryHandled) return;
+  authExpiryHandled = true;
+  try {
+    localStorage.removeItem('pg_admin_auth');
+    localStorage.removeItem('pg_admin_authed');
+    localStorage.removeItem('pg_admin_session');
+    localStorage.removeItem('pg_admin_active_company');
+  } catch {
+    // ignore
+  }
+  try {
+    window.dispatchEvent(new CustomEvent('pg:auth-expired'));
+  } catch {
+    // ignore
+  }
+};
+
+// Allow the app to re-arm the expiry handler after a fresh login so a later genuine expiry is
+// caught again within the same page load.
+export const resetAuthExpiryGuard = () => {
+  authExpiryHandled = false;
 };
 
 export const apiGet = async <T,>(path: string): Promise<T> => {
@@ -104,6 +170,7 @@ export const apiGet = async <T,>(path: string): Promise<T> => {
   const text = await res.text();
   const body = text.trim();
   if (!res.ok) {
+    handleAuthExpiry(res.status);
     throw new Error(body || `API GET failed: ${res.status}`);
   }
   try {
@@ -113,17 +180,26 @@ export const apiGet = async <T,>(path: string): Promise<T> => {
   }
 };
 
+const parseJsonResponse = async <T,>(res: Response, label: string): Promise<T> => {
+  const body = (await res.text()).trim();
+  if (!res.ok) {
+    handleAuthExpiry(res.status);
+    throw new Error(body || `${label} failed: ${res.status}`);
+  }
+  try {
+    return JSON.parse(body) as T;
+  } catch {
+    throw new Error(body || `${label} failed: Invalid JSON response.`);
+  }
+};
+
 export const apiPost = async <T,>(path: string, body: unknown): Promise<T> => {
   const res = await fetch(buildUrl(path), {
     method: 'POST',
     headers: buildHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || `API POST failed: ${res.status}`);
-  }
-  return res.json() as Promise<T>;
+  return parseJsonResponse<T>(res, 'API POST');
 };
 
 export const apiPostForm = async <T,>(path: string, formData: FormData): Promise<T> => {
@@ -132,9 +208,5 @@ export const apiPostForm = async <T,>(path: string, formData: FormData): Promise
     headers: buildHeaders(),
     body: formData,
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || `API POST form failed: ${res.status}`);
-  }
-  return res.json() as Promise<T>;
+  return parseJsonResponse<T>(res, 'API POST form');
 };

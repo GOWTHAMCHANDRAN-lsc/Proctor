@@ -2,6 +2,7 @@
 declare(strict_types=1);
 
 require __DIR__ . '/_bootstrap.php';
+require_once __DIR__ . '/certificates.php';
 
 function datetime_to_ms(?string $dt): ?int {
     if ($dt === null) return null;
@@ -30,6 +31,7 @@ function table_exists(PDO $pdo, string $tableName): bool {
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
+    require_staff(); // admin-only read: blocks tokenless/forged-header access
     $companyId = require_company_id();
     $audit = isset($_GET['audit']) && (string)$_GET['audit'] === '1';
     $sessionIdParam = isset($_GET['sessionId']) ? (int)$_GET['sessionId'] : null;
@@ -55,8 +57,8 @@ if ($method === 'GET') {
                 'id' => (int)$row['id'],
                 'sessionId' => (int)$row['session_id'],
                 'questionId' => $row['question_id'],
-                'previousAwardedMarks' => $row['previous_awarded_marks'] !== null ? (int)$row['previous_awarded_marks'] : null,
-                'newAwardedMarks' => $row['new_awarded_marks'] !== null ? (int)$row['new_awarded_marks'] : null,
+                'previousAwardedMarks' => $row['previous_awarded_marks'] !== null ? (float)$row['previous_awarded_marks'] : null,
+                'newAwardedMarks' => $row['new_awarded_marks'] !== null ? (float)$row['new_awarded_marks'] : null,
                 'previousIsCorrect' => $row['previous_is_correct'] !== null ? (bool)$row['previous_is_correct'] : null,
                 'newIsCorrect' => $row['new_is_correct'] !== null ? (bool)$row['new_is_correct'] : null,
                 'actor' => $row['actor'],
@@ -85,20 +87,61 @@ if ($method === 'GET') {
         $params[] = $sessionIdParam;
     }
 
+    // Reconcile unfinished attempts so no attempt (and its violations) is lost from results.
+    // Both of these must surface as a FAIL:
+    //   (a) Abandoned — still IN_PROGRESS but the attempt has outlived its own allotted time by a
+    //       30-minute grace, so the candidate never submitted. Definitively over → TERMINATED + fail.
+    //       (Duration-based only: this never touches a genuinely live attempt within its time.)
+    //   (b) Terminated attempts that predate pass/fail stamping (passed IS NULL) → stamp passed = 0.
+    db_add_column_if_missing($pdo, 'exam_sessions', 'termination_reason', 'VARCHAR(255) NULL AFTER passed');
+    try {
+        $sweepAbandoned = $pdo->prepare(
+            "UPDATE exam_sessions es
+             JOIN exams e ON e.id = es.exam_id AND e.company_id = es.company_id
+                SET es.status = 'TERMINATED', es.end_time = NOW(3), es.passed = 0,
+                    es.termination_reason = COALESCE(es.termination_reason, 'Not submitted — exam time elapsed. Scored on attended questions.')
+              WHERE es.company_id = ?
+                AND es.status = 'IN_PROGRESS'
+                AND DATE_ADD(es.start_time, INTERVAL (COALESCE(e.duration_minutes, 0) + 30) MINUTE) < NOW(3)"
+        );
+        $sweepAbandoned->execute([$companyId]);
+        $sweepAbandoned->closeCursor();
+
+        $sweepTerminated = $pdo->prepare(
+            "UPDATE exam_sessions
+                SET passed = 0
+              WHERE company_id = ? AND status = 'TERMINATED' AND passed IS NULL"
+        );
+        $sweepTerminated->execute([$companyId]);
+        $sweepTerminated->closeCursor();
+    } catch (Throwable $e) {
+        // Best-effort reconciliation — never block the results listing on it.
+    }
+
     $sql = 'SELECT es.id, es.exam_id, es.student_id, es.start_time, es.end_time, es.status, es.total_score, es.max_score, es.passed,
-                   e.pass_percent
+                   es.termination_reason,
+                   e.pass_percent,
+                   (SELECT COUNT(*) FROM violation_logs vl WHERE vl.session_id = es.id) AS violation_count
             FROM exam_sessions es
             JOIN exams e ON e.id = es.exam_id AND e.company_id = es.company_id
             WHERE es.company_id = ?';
     if (!empty($where)) {
         $sql .= ' AND ' . implode(' AND ', $where);
     }
-    $sql .= ' AND es.status = \'COMPLETED\'';
+    // Include TERMINATED attempts (violation-blocked or abandoned) alongside COMPLETED so they show
+    // as fails — nothing a candidate did is lost, even if they never submitted. The frontend already
+    // renders and counts the TERMINATED status.
+    $sql .= ' AND es.status IN (\'COMPLETED\', \'TERMINATED\')';
     $sql .= ' ORDER BY es.start_time DESC';
 
     $stmt = $pdo->prepare($sql);
     $stmt->execute($params);
     $sessions = $stmt->fetchAll();
+
+    // violation_count above is the RAW event count, which reports one sustained problem (a webcam
+    // showing a placeholder for 19 minutes) as 112 violations against the candidate. Report real
+    // incidents instead, and keep the raw tally alongside it so nothing is hidden.
+    $episodeCounts = violation_episode_counts($pdo, $companyId);
 
     $groups = [];
     foreach ($sessions as $s) {
@@ -136,12 +179,15 @@ if ($method === 'GET') {
             sa.question_id,
             sa.answer_text,
             sa.answer_option_index,
+            sa.answer_json,
             sa.is_correct,
             sa.awarded_marks,
             q.text,
             q.type,
             q.options_json,
             q.correct_option_index,
+            q.answer_key_json,
+            q.match_options_json,
             q.marks,
             eq.display_order,
             {$timeSelect}
@@ -162,34 +208,47 @@ if ($method === 'GET') {
         $answersStmt->closeCursor();
 
         $answers = array_map(function ($row) {
-            $options = null;
-            if (!empty($row['options_json'])) {
-                $decoded = json_decode($row['options_json'], true);
-                $options = is_array($decoded) ? $decoded : null;
-            }
+            $decodeJson = function ($raw) {
+                if ($raw === null || $raw === '') return null;
+                $decoded = json_decode((string)$raw, true);
+                return $decoded === null && json_last_error() !== JSON_ERROR_NONE ? null : $decoded;
+            };
+            $options = $decodeJson($row['options_json']);
             return [
                 'questionId' => $row['question_id'],
                 'questionText' => $row['text'],
                 'questionType' => $row['type'],
-                'options' => $options,
+                'options' => is_array($options) ? $options : null,
                 'correctOptionIndex' => $row['correct_option_index'] !== null ? (int)$row['correct_option_index'] : null,
+                'answerKey' => $decodeJson($row['answer_key_json']),
+                'matchOptions' => $decodeJson($row['match_options_json']),
                 'marks' => (int)$row['marks'],
                 'answerText' => $row['answer_text'],
                 'answerOptionIndex' => $row['answer_option_index'] !== null ? (int)$row['answer_option_index'] : null,
+                'answerJson' => $decodeJson($row['answer_json']),
                 'isCorrect' => $row['is_correct'] !== null ? (bool)$row['is_correct'] : null,
-                'awardedMarks' => $row['awarded_marks'] !== null ? (int)$row['awarded_marks'] : null,
+                'awardedMarks' => $row['awarded_marks'] !== null ? (float)$row['awarded_marks'] : null,
                 'timeSpentSec' => $row['seconds_spent'] !== null ? (int)$row['seconds_spent'] : null,
             ];
         }, $answerRows);
 
-        $score = $s['total_score'] !== null ? (int)$s['total_score'] : null;
-        $maxScore = $s['max_score'] !== null ? (int)$s['max_score'] : null;
+        $score = $s['total_score'] !== null ? (float)$s['total_score'] : null;
+        $maxScore = $s['max_score'] !== null ? (float)$s['max_score'] : null;
         $passPercent = isset($s['pass_percent']) ? (int)$s['pass_percent'] : 60;
         if ($passPercent < 0) $passPercent = 0;
         if ($passPercent > 100) $passPercent = 100;
         $finalPercent = null;
         if ($score !== null && $maxScore !== null && $maxScore > 0) {
             $finalPercent = (int)round(($score / $maxScore) * 100);
+        }
+
+        // How many questions the candidate actually attended (answered), for terminated/abandoned
+        // attempts where that differs from the full paper.
+        $answeredCount = 0;
+        foreach ($answers as $a) {
+            if ($a['answerOptionIndex'] !== null || ($a['answerText'] !== null && $a['answerText'] !== '')) {
+                $answeredCount++;
+            }
         }
 
         $results[] = [
@@ -211,6 +270,13 @@ if ($method === 'GET') {
             'finalPassed' => $s['passed'] !== null
                 ? (bool)$s['passed']
                 : ($finalPercent !== null ? ($finalPercent >= $passPercent) : null),
+            'answeredCount' => $answeredCount,
+            'terminationReason' => $s['termination_reason'] ?? null,
+            // Real incidents (a sustained problem counts once), with the raw detector-event tally
+            // kept alongside it. Falls back to the raw count if episode grouping was unavailable.
+            'violationCount' => $episodeCounts[(int)$s['id']]
+                ?? (isset($s['violation_count']) ? (int)$s['violation_count'] : 0),
+            'violationEventCount' => isset($s['violation_count']) ? (int)$s['violation_count'] : 0,
             'answers' => $answers,
         ];
     }
@@ -280,7 +346,7 @@ if ($method === 'POST') {
         if (!isset($currentMap[$qid])) continue;
 
         $row = $currentMap[$qid];
-        $prevAwarded = $row['awarded_marks'] !== null ? (int)$row['awarded_marks'] : null;
+        $prevAwarded = $row['awarded_marks'] !== null ? (float)$row['awarded_marks'] : null;
         $prevCorrect = $row['is_correct'] !== null ? (bool)$row['is_correct'] : null;
         $qType = $row['type'];
         $qMarks = (int)$row['marks'];
@@ -289,7 +355,7 @@ if ($method === 'POST') {
         if ($newAwarded === '' || $newAwarded === null) {
             $newAwarded = null;
         } elseif (is_numeric($newAwarded)) {
-            $newAwarded = (int)$newAwarded;
+            $newAwarded = (float)$newAwarded;
         } else {
             $newAwarded = $prevAwarded;
         }
@@ -298,10 +364,11 @@ if ($method === 'POST') {
         if ($newCorrect !== null) {
             $newCorrect = (bool)$newCorrect;
         } else {
-            if ($qType === 'MCQ' && $newAwarded !== null) {
+            if (!is_manual_question_type($qType) && $newAwarded !== null) {
+                // Auto-graded types are all-or-nothing: derive correctness from the marks.
                 if ($newAwarded >= $qMarks) {
                     $newCorrect = true;
-                } elseif ($newAwarded === 0) {
+                } elseif ((float)$newAwarded === 0.0) {
                     $newCorrect = false;
                 } else {
                     $newCorrect = null;
@@ -344,10 +411,10 @@ if ($method === 'POST') {
     foreach ($scoreRows as $r) {
         $marks = (int)$r['marks'];
         $maxScore += $marks;
-        if ($r['type'] === 'TEXT' && $r['awarded_marks'] === null) {
+        if (is_manual_question_type($r['type']) && $r['awarded_marks'] === null) {
             $pending = true;
         }
-        $totalScore += $r['awarded_marks'] !== null ? (int)$r['awarded_marks'] : 0;
+        $totalScore += $r['awarded_marks'] !== null ? (float)$r['awarded_marks'] : 0;
     }
 
     $passed = null;
@@ -367,6 +434,9 @@ if ($method === 'POST') {
     $updateSession = $pdo->prepare('UPDATE exam_sessions SET total_score = ?, max_score = ?, passed = ? WHERE id = ? AND company_id = ?');
     $updateSession->execute([$totalScore, $maxScore, $passed, $sessionId, $companyId]);
 
+    // Certification is on-demand only — this regrade no longer auto-fires maybe_issue_certificate().
+    // An admin issues a certificate explicitly from a passed result. See api/certificates.php.
+
     $log = $pdo->prepare('CALL sp_log_access(?, ?, ?, ?, ?, ?)');
     $log->execute([$companyId, $session['exam_id'], $session['student_id'], 'RE-GRADE', 'OK', "Updated {$updated} answers"]);
     while ($log->nextRowset()) {}
@@ -383,7 +453,8 @@ if ($method === 'POST') {
         'metadata' => ['note' => $note]
     ]);
 
-    json_response(['ok' => true, 'updated' => $updated]);
+    respond_then_continue(['ok' => true, 'updated' => $updated]);
+    exit;
 }
 
 json_response(['error' => 'Method not allowed.'], 405);

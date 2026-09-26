@@ -1,4 +1,4 @@
-﻿import React, { useState, useEffect, useCallback } from 'react';
+﻿import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Layout } from './components/Layout';
 import { Dashboard } from './components/admin/Dashboard';
 import { ExamManager } from './components/admin/ExamManager';
@@ -6,22 +6,31 @@ import { StudentManager } from './components/admin/StudentManager';
 import { Monitoring } from './components/admin/Monitoring';
 import { SecurityFeed } from './components/admin/SecurityFeed';
 import { Recordings } from './components/admin/Recordings';
+import { LiveProctoring } from './components/admin/LiveProctoring';
+import { Integrations } from './components/admin/Integrations';
+import { Certificates } from './components/admin/Certificates';
+import { Communications } from './components/admin/Communications';
 import { Results } from './components/admin/Results';
 import { ActivityLogs } from './components/admin/ActivityLogs';
 import { UserDirectory } from './components/admin/UserDirectory';
 import { SuperAdminControl } from './components/admin/SuperAdminControl';
+import { Settings } from './components/admin/Settings';
+import { SettingsProvider, useSettings } from './services/appSettings';
 import { ExamTake } from './components/student/ExamTake';
 import { ExamResult } from './components/student/ExamResult';
 import { UserRole, Exam, Student, ViolationLog, Question, ExamSession } from './types';
 import { MOCK_EXAMS, MOCK_STUDENTS, MOCK_SESSIONS } from './services/mockStore';
-import { Lock, ArrowRight, KeyRound, AlertCircle } from 'lucide-react';
-import { apiGet, apiPost } from './services/api';
+import { ArrowRight, KeyRound, AlertCircle } from 'lucide-react';
+import { apiGet, apiPost, resetAuthExpiryGuard } from './services/api';
+import { resolveExamTimezone, formatScheduleShort } from './services/timezone';
 
 const ADMIN_SESSION_KEY = 'pg_admin_session';
 const ADMIN_SESSION_LEGACY_KEY = 'pg_admin_authed';
 const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const ADMIN_AUTH_STORAGE_KEY = 'pg_admin_auth';
 const STUDENT_COMPANY_STORAGE_KEY = 'pg_student_company';
+const STUDENT_EXAM_TOKEN_KEY = 'pg_student_exam_token';
+const ADMIN_ACTIVE_COMPANY_KEY = 'pg_admin_active_company';
 const ADMIN_AUTH_URL = import.meta.env.VITE_ADMIN_AUTH_URL || 'https://auth.lsc-india.org/api/login';
 const SUPER_ADMIN_EMAILS = new Set(
   String(import.meta.env.VITE_SUPER_ADMIN_EMAILS || '')
@@ -82,14 +91,18 @@ const isSuperAdminEmail = (value: unknown) => {
   return email !== '' && SUPER_ADMIN_EMAILS.has(email);
 };
 
-const normalizeAdminRole = (value: unknown): UserRole.ADMIN | UserRole.SUPER_ADMIN | UserRole.PROCTOR => {
+// Roles that can sign in to the staff console (everything except STUDENT).
+type AdminConsoleRole = UserRole.ADMIN | UserRole.SUPER_ADMIN | UserRole.PROCTOR | UserRole.VIEWER;
+
+const normalizeAdminRole = (value: unknown): AdminConsoleRole => {
   const role = String(value || '').trim().toUpperCase();
   if (role === UserRole.SUPER_ADMIN) return UserRole.SUPER_ADMIN;
   if (role === 'PROCTOR') return UserRole.PROCTOR;
+  if (role === 'VIEWER') return UserRole.VIEWER;
   return UserRole.ADMIN;
 };
 
-const getStoredAdminRole = (): UserRole.ADMIN | UserRole.SUPER_ADMIN | UserRole.PROCTOR => {
+const getStoredAdminRole = (): AdminConsoleRole => {
   if (typeof window === 'undefined') return UserRole.ADMIN;
   try {
     const raw = localStorage.getItem(ADMIN_AUTH_STORAGE_KEY);
@@ -107,6 +120,32 @@ const clearAdminSession = () => {
     localStorage.removeItem(ADMIN_SESSION_KEY);
     localStorage.removeItem(ADMIN_SESSION_LEGACY_KEY);
     localStorage.removeItem(ADMIN_AUTH_STORAGE_KEY);
+    localStorage.removeItem(ADMIN_ACTIVE_COMPANY_KEY);
+  } catch {
+    // ignore storage errors
+  }
+};
+
+const getStoredActiveCompanyId = (): number | null => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(ADMIN_ACTIVE_COMPANY_KEY);
+    if (!raw) return null;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+const storeActiveCompanyId = (companyId: number | null) => {
+  if (typeof window === 'undefined') return;
+  try {
+    if (companyId && companyId > 0) {
+      localStorage.setItem(ADMIN_ACTIVE_COMPANY_KEY, String(companyId));
+    } else {
+      localStorage.removeItem(ADMIN_ACTIVE_COMPANY_KEY);
+    }
   } catch {
     // ignore storage errors
   }
@@ -131,6 +170,19 @@ const storeStudentCompanyId = (companyId: number | null) => {
       localStorage.setItem(STUDENT_COMPANY_STORAGE_KEY, String(companyId));
     } else {
       localStorage.removeItem(STUDENT_COMPANY_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+};
+
+const storeStudentExamToken = (token: string | null) => {
+  if (typeof window === 'undefined') return;
+  try {
+    if (token) {
+      localStorage.setItem(STUDENT_EXAM_TOKEN_KEY, token);
+    } else {
+      localStorage.removeItem(STUDENT_EXAM_TOKEN_KEY);
     }
   } catch {
     // ignore storage errors
@@ -278,7 +330,7 @@ const buildPreStartInstructions = (exam: Exam): string[] => {
     tabSwitchLimit: 0,
   };
   const tabSwitchLimit = Math.max(0, Number(proctor.tabSwitchLimit ?? 0));
-  const violationLimits = proctor.violationLimits || {};
+  const violationLimits: Record<string, number | undefined> = proctor.violationLimits || {};
 
   lines.push(`Read all questions carefully. You have ${exam.durationMinutes} minutes to complete this exam.`);
   if (proctor.cameraRequired) {
@@ -306,11 +358,21 @@ const buildPreStartInstructions = (exam: Exam): string[] => {
     lines.push(`Copy/paste violations allowed: ${Number(violationLimits.copyPaste)}.`);
   }
 
-  lines.push(`Exam window: ${new Date(exam.startTime).toLocaleString()} to ${new Date(exam.endTime).toLocaleString()}.`);
+  const examTz = resolveExamTimezone(exam.timezone);
+  lines.push(`Exam window: ${formatScheduleShort(exam.startTime, examTz)} to ${formatScheduleShort(exam.endTime, examTz)}.`);
   return lines;
 };
 
-const AdminApp: React.FC = () => {
+const AdminAppInner: React.FC = () => {
+  const { settings, syncFromServer } = useSettings();
+  const branding = settings.branding;
+  const renderBrandMark = (sizeClass: string, textClass: string) => (
+    <div className={`${sizeClass} lsc-brand-mark ${textClass} overflow-hidden`}>
+      {branding.logoDataUrl
+        ? <img src={branding.logoDataUrl} alt="" className="h-full w-full object-contain bg-white" />
+        : (branding.shortName || 'LSC')}
+    </div>
+  );
   const initialSessionStart = getStoredAdminSession();
   const initialAuthed = initialSessionStart !== null && (Date.now() - initialSessionStart) < ADMIN_SESSION_TTL_MS;
   const initialRole = getStoredAdminRole();
@@ -322,16 +384,25 @@ const AdminApp: React.FC = () => {
   const [adminEmail, setAdminEmail] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
   const [adminSystemId, setAdminSystemId] = useState('3');
-  const [adminRole, setAdminRole] = useState<UserRole.ADMIN | UserRole.SUPER_ADMIN | UserRole.PROCTOR>(initialRole);
+  const [adminRole, setAdminRole] = useState<AdminConsoleRole>(initialRole);
   const [adminError, setAdminError] = useState('');
   const [adminLoading, setAdminLoading] = useState(false);
   const [currentView, setCurrentView] = useState(initialRole === UserRole.SUPER_ADMIN ? 'platform' : 'dashboard');
+  // Super-admin only: the company whose data every screen is currently scoped to. Persisted so it
+  // survives reloads and read by the API layer (services/api.ts) as the X-Company-Id header.
+  const [activeCompanyId, setActiveCompanyId] = useState<number | null>(
+    initialRole === UserRole.SUPER_ADMIN ? getStoredActiveCompanyId() : null
+  );
   const [students, setStudents] = useState<Student[]>(MOCK_STUDENTS);
   const [exams, setExams] = useState<Exam[]>(MOCK_EXAMS);
   const [sessions, setSessions] = useState<ExamSession[]>(MOCK_SESSIONS);
 
+  // A SUPER_ADMIN must pick a company before company-scoped data can load (the API requires a
+  // company). For a regular admin the company is pinned to their account, so this is always false.
+  const scopeReady = adminRole !== UserRole.SUPER_ADMIN || activeCompanyId !== null;
+
   useEffect(() => {
-    if (!isAuthed) return;
+    if (!isAuthed || !scopeReady) return;
     let cancelled = false;
     const loadStudents = async () => {
       try {
@@ -347,10 +418,10 @@ const AdminApp: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [isAuthed]);
+  }, [isAuthed, scopeReady, activeCompanyId]);
 
   useEffect(() => {
-    if (!isAuthed) return;
+    if (!isAuthed || !scopeReady) return;
     let cancelled = false;
     const loadExams = async () => {
       try {
@@ -366,10 +437,10 @@ const AdminApp: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [isAuthed]);
+  }, [isAuthed, scopeReady, activeCompanyId]);
 
   const refreshSessions = useCallback(async () => {
-    if (!isAuthed) return;
+    if (!isAuthed || !scopeReady) return;
     try {
       const data = await apiGet<{ sessions: ExamSession[] }>('sessions.php');
       if (data?.sessions) {
@@ -383,7 +454,7 @@ const AdminApp: React.FC = () => {
     } catch (e) {
       console.error('Failed to load sessions from API:', e);
     }
-  }, [isAuthed]);
+  }, [isAuthed, scopeReady, activeCompanyId]);
 
   useEffect(() => {
     if (!isAuthed) return;
@@ -396,6 +467,94 @@ const AdminApp: React.FC = () => {
     clearAdminSession();
     setCurrentView('dashboard');
     setAdminRole(UserRole.ADMIN);
+    setActiveCompanyId(null);
+    storeActiveCompanyId(null);
+  };
+
+  // Super-admin global company switch: persist the choice (so the API layer picks it up as the
+  // X-Company-Id header) and let the data-loading effects refetch every screen for that company.
+  const handleCompanyChange = (companyId: number) => {
+    storeActiveCompanyId(companyId);
+    setActiveCompanyId(companyId);
+  };
+
+  // The API layer clears the stored session and fires this when the server rejects our token (401)
+  // on an admin screen. Handle it as a soft logout — flip React state back to the login screen —
+  // rather than reloading, which would loop if a login keeps producing a token the server rejects.
+  useEffect(() => {
+    const onAuthExpired = () => {
+      // Reuse the full logout reset (view + role + company + session) so the two paths can't drift,
+      // then surface why the user landed back on the login screen.
+      handleLogout();
+      setAdminError('Your session has expired. Please sign in again.');
+    };
+    window.addEventListener('pg:auth-expired', onAuthExpired);
+    return () => window.removeEventListener('pg:auth-expired', onAuthExpired);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const finalizeAdminSession = (params: {
+    token: string;
+    name?: string;
+    email: string;
+    userId?: number;
+    companyId?: number;
+    companyName?: string;
+    systemId?: string | number;
+    role: AdminConsoleRole;
+  }) => {
+    // A fresh, server-verified token is in hand — re-arm the 401 handler so a later genuine expiry
+    // is caught again, and don't persist a session with an empty token (that would 401-loop).
+    resetAuthExpiryGuard();
+    const startedAt = Date.now();
+    setIsAuthed(true);
+    setSessionStartedAt(startedAt);
+    storeAdminSession(startedAt);
+    storeAdminAuth(params);
+    setAdminRole(params.role);
+    setCurrentView(params.role === UserRole.SUPER_ADMIN ? 'platform' : 'dashboard');
+  };
+
+  // Super admins authenticate against the external LSC auth service; company/role are then
+  // resolved from OUR database (platform_users), not from the auth response.
+  const loginViaExternalAuth = async (email: string) => {
+    // The server verifies the credentials against the external LSC auth service and mints OUR signed
+    // session token (deriving role/company from our directory). The browser no longer talks to the
+    // external service directly, and no privileged role is trusted from the client.
+    const res = await apiPost<{
+      ok?: boolean;
+      error?: string;
+      token?: string;
+      userId?: number;
+      role?: string;
+      companyId?: number | null;
+      companyName?: string | null;
+      fullName?: string;
+      email?: string;
+    }>('users.php', {
+      action: 'EXTERNAL_LOGIN',
+      email,
+      password: adminPassword,
+      systemId: adminSystemId.trim() || '3',
+    });
+
+    if (!res?.ok || !res.token) {
+      throw new Error(res?.error || 'Invalid email or password.');
+    }
+
+    const resolvedEmail = res.email ?? email;
+    const role = res.role === 'SUPER_ADMIN' ? UserRole.SUPER_ADMIN : normalizeAdminRole(res.role);
+    const companyId = typeof res.companyId === 'number' && res.companyId > 0 ? res.companyId : undefined;
+
+    finalizeAdminSession({
+      token: res.token,
+      name: res.fullName,
+      email: resolvedEmail,
+      userId: res.userId,
+      companyId,
+      companyName: res.companyName ?? undefined,
+      role,
+    });
   };
 
   const handleAdminLogin = async (event: React.FormEvent) => {
@@ -408,53 +567,53 @@ const AdminApp: React.FC = () => {
       return;
     }
 
+    const email = adminEmail.trim();
     try {
-      const formData = new FormData();
-      formData.append('email', adminEmail.trim());
-      formData.append('password', adminPassword);
-      formData.append('system_id', adminSystemId.trim() || '3');
-
-      const res = await fetch(ADMIN_AUTH_URL, {
-        method: 'POST',
-        body: formData,
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || `Login failed: ${res.status}`);
-      }
-      const payload = await res.json();
-      if (!payload?.success || !payload?.data?.token) {
-        throw new Error(payload?.message || 'Invalid login response.');
-      }
-      const resolvedEmail = String(payload.data.email ?? adminEmail).trim();
-      const rawCompanyId = payload.data.company_id ?? payload.data.companyId ?? payload.data.cid;
-      const parsedCompanyId = Number(rawCompanyId);
-      if (!Number.isFinite(parsedCompanyId) || parsedCompanyId <= 0) {
-        throw new Error('Login response missing a valid company id.');
+      // Known super admins go straight to the external LSC auth service.
+      if (isSuperAdminEmail(email)) {
+        await loginViaExternalAuth(email);
+        return;
       }
 
-      const startedAt = Date.now();
-      const nextRole = isSuperAdminEmail(resolvedEmail)
-        ? UserRole.SUPER_ADMIN
-        : normalizeAdminRole(
-            payload.data.role ?? payload.data.user_role ?? payload.data.account_role ?? payload.data.type
-          );
-      setIsAuthed(true);
-      setSessionStartedAt(startedAt);
-      storeAdminSession(startedAt);
-      storeAdminAuth({
-        token: payload.data.token,
-        name: payload.data.name,
-        email: resolvedEmail,
-        userId: payload.data.user_id,
-        companyId: parsedCompanyId,
-        companyName: payload.data.company_name ?? payload.data.companyName ?? payload.data.company,
-        systemId: payload.data.system_id,
-        role: nextRole,
-      });
-      setAdminRole(nextRole);
-      setCurrentView(nextRole === UserRole.SUPER_ADMIN ? 'platform' : 'dashboard');
-      return;
+      // Everyone else authenticates against our own database.
+      const dbRes = await apiPost<{
+        ok?: boolean;
+        external?: boolean;
+        error?: string;
+        token?: string;
+        userId?: number;
+        companyId?: number | null;
+        companyName?: string | null;
+        role?: string;
+        fullName?: string;
+        email?: string;
+      }>('users.php', { action: 'LOGIN', email, password: adminPassword });
+
+      // The DB may report this email is actually a super admin — route it externally.
+      if (dbRes?.external) {
+        await loginViaExternalAuth(email);
+        return;
+      }
+
+      if (dbRes?.ok) {
+        const role = normalizeAdminRole(dbRes.role);
+        const companyId = typeof dbRes.companyId === 'number' && dbRes.companyId > 0 ? dbRes.companyId : undefined;
+        if (role !== UserRole.SUPER_ADMIN && !companyId) {
+          throw new Error('This account is not mapped to a company. Please contact your administrator.');
+        }
+        finalizeAdminSession({
+          token: dbRes.token ?? '',
+          name: dbRes.fullName,
+          email: dbRes.email ?? email,
+          userId: dbRes.userId,
+          companyId,
+          companyName: dbRes.companyName ?? undefined,
+          role,
+        });
+        return;
+      }
+
+      throw new Error(dbRes?.error || 'Invalid email or password.');
     } catch (e: any) {
       setAdminError(e?.message || 'Login failed. Please try again.');
       return;
@@ -479,113 +638,138 @@ const AdminApp: React.FC = () => {
 
   useEffect(() => {
     if (adminRole !== UserRole.PROCTOR) return;
-    const allowed = new Set(['dashboard', 'monitoring', 'security', 'recordings', 'audit']);
+    const allowed = new Set(['dashboard', 'live', 'monitoring', 'security', 'recordings', 'audit', 'settings']);
     if (!allowed.has(currentView)) {
       setCurrentView('dashboard');
     }
   }, [adminRole, currentView]);
 
+  useEffect(() => {
+    if (adminRole !== UserRole.VIEWER) return;
+    // Read-only viewers may only reach the Dashboard and Results tabs (plus their own Settings).
+    const allowed = new Set(['dashboard', 'results', 'settings']);
+    if (!allowed.has(currentView)) {
+      setCurrentView('dashboard');
+    }
+  }, [adminRole, currentView]);
+
+  // Pull the company-shared workspace settings once authenticated.
+  useEffect(() => {
+    if (isAuthed) void syncFromServer();
+  }, [isAuthed, syncFromServer]);
+
   if (!isAuthed) {
     const requestedConsoleLabel = isSuperAdminEmail(adminEmail) ? 'Super Admin Console' : 'Admin Console';
     return (
-      <div className="min-h-screen relative overflow-hidden lsc-gradient-bg">
-        <div className="absolute -top-24 -left-24 h-64 w-64 rounded-full bg-blue-200/40 blur-3xl"></div>
-        <div className="absolute -bottom-32 -right-24 h-80 w-80 rounded-full bg-orange-200/30 blur-3xl"></div>
-        <div className="relative z-10 min-h-screen flex items-center justify-center p-6">
-          <div className="w-full max-w-lg space-y-6 lsc-card p-8">
-            <div className="flex items-start justify-between gap-4">
-              <div className="flex items-center gap-3">
-                <div className="h-12 w-12 lsc-brand-mark text-sm">
-                  LSC
-                </div>
-                <div>
-                  <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">{requestedConsoleLabel}</p>
-                  <h1 className="text-2xl font-semibold text-slate-900">LSC Exam Proctor Control</h1>
-                </div>
-              </div>
-            </div>
-
-            <div className="space-y-4">
-              <form onSubmit={handleAdminLogin} className="space-y-3">
-                <div className="space-y-2">
-                  <label className="text-xs font-semibold text-slate-500 uppercase tracking-[0.2em]">Email</label>
-                  <input
-                    type="email"
-                    value={adminEmail}
-                    onChange={(e) => setAdminEmail(e.target.value)}
-                    className="w-full px-4 py-3 border border-slate-200 rounded-xl outline-none text-slate-800 bg-white"
-                    placeholder="admin@example.com"
-                    autoComplete="username"
-                    required
-                  />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-xs font-semibold text-slate-500 uppercase tracking-[0.2em]">Password</label>
-                  <input
-                    type="password"
-                    value={adminPassword}
-                    onChange={(e) => setAdminPassword(e.target.value)}
-                    className="w-full px-4 py-3 border border-slate-200 rounded-xl outline-none text-slate-800 bg-white"
-                    placeholder="••••••••"
-                    autoComplete="current-password"
-                    required
-                  />
-                </div>
-                {adminError && (
-                  <div className="text-sm text-red-600 bg-red-50 p-3 rounded-lg border border-red-100">
-                    {adminError}
-                  </div>
-                )}
-                <button
-                  type="submit"
-                  disabled={adminLoading || !adminEmail.trim() || !adminPassword.trim()}
-                  className="w-full p-4 lsc-button-primary flex items-center justify-between disabled:opacity-60"
-                >
-                  <div className="flex items-center gap-4">
-                    <div className="bg-white/20 p-3 rounded-xl text-white">
-                      <Lock size={24} />
-                    </div>
-                    <div className="text-left">
-                      <h3 className="font-semibold">{adminLoading ? 'Signing in...' : 'Login'}</h3>
-                    </div>
-                  </div>
-                  <ArrowRight className="text-white/80" />
-                </button>
-              </form>
-            </div>
+      <div className="min-h-screen relative lsc-auth-bg flex items-center justify-center p-5">
+        <div className="w-full max-w-md">
+          <div className="flex flex-col items-center text-center mb-6">
+            <div className="mb-4">{renderBrandMark('h-12 w-12', 'text-[15px]')}</div>
+            <h1 className="text-[22px] font-semibold text-slate-900">Sign in</h1>
+            <p className="text-sm text-slate-500 mt-1">Continue to the {requestedConsoleLabel}</p>
           </div>
+
+          <div className="lsc-card p-7 sm:p-8">
+            <form onSubmit={handleAdminLogin} className="space-y-4">
+              <div className="space-y-1.5">
+                <label className="text-[13px] font-medium text-slate-700">Email</label>
+                <input
+                  type="email"
+                  value={adminEmail}
+                  onChange={(e) => setAdminEmail(e.target.value)}
+                  className="w-full px-3.5 py-2.5 border border-slate-300 rounded-lg outline-none text-slate-800 bg-white placeholder:text-slate-400"
+                  placeholder="you@company.com"
+                  autoComplete="username"
+                  required
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-[13px] font-medium text-slate-700">Password</label>
+                <input
+                  type="password"
+                  value={adminPassword}
+                  onChange={(e) => setAdminPassword(e.target.value)}
+                  className="w-full px-3.5 py-2.5 border border-slate-300 rounded-lg outline-none text-slate-800 bg-white placeholder:text-slate-400"
+                  placeholder="Enter your password"
+                  autoComplete="current-password"
+                  required
+                />
+              </div>
+              {adminError && (
+                <div className="flex items-start gap-2 text-sm text-red-700 bg-red-50 p-3 rounded-lg border border-red-100">
+                  <AlertCircle size={16} className="mt-0.5 shrink-0" />
+                  <span>{adminError}</span>
+                </div>
+              )}
+              <button
+                type="submit"
+                disabled={adminLoading || !adminEmail.trim() || !adminPassword.trim()}
+                className="w-full py-2.5 lsc-button-primary flex items-center justify-center gap-2 disabled:opacity-60"
+              >
+                {adminLoading ? 'Signing in…' : 'Sign in'}
+                {!adminLoading && <ArrowRight size={18} />}
+              </button>
+            </form>
+          </div>
+
+          <p className="text-center text-xs text-slate-400 mt-6">
+            Protected console · {branding.appName || 'LSC Exam Proctor'}
+          </p>
         </div>
       </div>
     );
   }
 
+  // Full admins (ADMIN / SUPER_ADMIN) manage tenant data; PROCTOR and read-only VIEWER cannot.
+  const isFullAdmin = adminRole === UserRole.ADMIN || adminRole === UserRole.SUPER_ADMIN;
+
   return (
-    <Layout role={adminRole} currentView={currentView} onNavigate={setCurrentView} onLogout={handleLogout}>
+    <Layout
+      role={adminRole}
+      currentView={currentView}
+      onNavigate={setCurrentView}
+      onLogout={handleLogout}
+      activeCompanyId={activeCompanyId}
+      onCompanyChange={handleCompanyChange}
+    >
       {adminRole === UserRole.SUPER_ADMIN && currentView === 'platform' && <SuperAdminControl />}
-      {adminRole !== UserRole.PROCTOR && currentView === 'users' && <UserDirectory role={adminRole} />}
+      {currentView === 'settings' && <Settings role={adminRole} />}
+      {isFullAdmin && currentView === 'users' && <UserDirectory role={adminRole} />}
       {currentView === 'dashboard' && <Dashboard exams={exams} students={students} sessions={sessions} />}
-      {adminRole !== UserRole.PROCTOR && currentView === 'exams' && (
-        <ExamManager students={students} exams={exams} onUpdateExams={setExams} onUpdateStudents={setStudents} />
+      {isFullAdmin && currentView === 'exams' && (
+        <ExamManager students={students} exams={exams} onUpdateExams={setExams} onUpdateStudents={setStudents} role={adminRole} />
       )}
-      {adminRole !== UserRole.PROCTOR && currentView === 'students' && <StudentManager students={students} onUpdateStudents={setStudents} />}
-      {currentView === 'monitoring' && (
+      {isFullAdmin && currentView === 'students' && <StudentManager students={students} onUpdateStudents={setStudents} role={adminRole} />}
+      {isFullAdmin && currentView === 'integrations' && <Integrations role={adminRole} />}
+      {isFullAdmin && currentView === 'certificates' && <Certificates role={adminRole} />}
+      {isFullAdmin && currentView === 'communications' && <Communications />}
+      {adminRole !== UserRole.VIEWER && currentView === 'live' && (
+        <LiveProctoring exams={exams} students={students} />
+      )}
+      {adminRole !== UserRole.VIEWER && currentView === 'monitoring' && (
         <Monitoring sessions={sessions} students={students} exams={exams} onRefreshSessions={refreshSessions} />
       )}
       {adminRole !== UserRole.PROCTOR && currentView === 'results' && (
         <Results exams={exams} students={students} />
       )}
-      {currentView === 'security' && (
+      {adminRole !== UserRole.VIEWER && currentView === 'security' && (
         <SecurityFeed exams={exams} students={students} />
       )}
-      {currentView === 'recordings' && (
+      {adminRole !== UserRole.VIEWER && currentView === 'recordings' && (
         <Recordings exams={exams} students={students} />
       )}
-      {currentView === 'audit' && (
-        <ActivityLogs students={students} />
+      {adminRole !== UserRole.VIEWER && currentView === 'audit' && (
+        <ActivityLogs students={students} role={adminRole} />
       )}
     </Layout>
   );
 };
+
+const AdminApp: React.FC = () => (
+  <SettingsProvider>
+    <AdminAppInner />
+  </SettingsProvider>
+);
 
 const StudentApp: React.FC = () => {
   const [accessRequestContext, setAccessRequestContext] = useState<{
@@ -614,7 +798,14 @@ const StudentApp: React.FC = () => {
     violations: ViolationLog[];
     questions: Question[];
   } | null>(null);
-  
+  // Whether the final 'complete' call has been confirmed by the server. The results screen
+  // renders from local state regardless (so the candidate isn't stuck on a spinner), but if this
+  // stays false the session never actually flips to COMPLETED server-side — surface that instead
+  // of silently losing the submission (see Nandhakumar S incident, 2026-07-28).
+  const [submissionSynced, setSubmissionSynced] = useState(true);
+  const [resubmittingSession, setResubmittingSession] = useState(false);
+  const pendingCompletePayloadRef = useRef<Record<string, unknown> | null>(null);
+
   const [tokenInput, setTokenInput] = useState('');
   const [tokenError, setTokenError] = useState('');
   const [pendingToken, setPendingToken] = useState<string | null>(null);
@@ -624,12 +815,40 @@ const StudentApp: React.FC = () => {
   const [preStartContext, setPreStartContext] = useState<{
     exam: Exam;
     student: Student;
+    // The raw signed access token from the link, forwarded to the server at exam start so it can
+    // verify the (exam, student, company) binding wasn't tampered with.
+    token: string;
   } | null>(null);
   const [isDirectLinkMode, setIsDirectLinkMode] = useState(false);
 
+  // Canonicalise a possibly-mangled ?token= value to the same clean base64url the server minted.
+  // Links get corrupted in transit, so normalise defensively:
+  //  • URLSearchParams turns '+' into a space → restore it
+  //  • standard-base64 links use '+'/'/'; base64url uses '-'/'_'
+  //  • users sometimes glue extra query junk onto the value (e.g. "...fQ==/?audiodebug=1")
+  //  • padding may be missing/mangled
+  // Returns UNPADDED base64url so the raw string can be forwarded to the server (its base64url_decode
+  // reproduces exactly these bytes) — the client and server must agree on what the token decodes to,
+  // otherwise a link the client accepts could 403 at exam start under EXAM_ENFORCE_TOKEN.
+  const normalizeAccessToken = (token: string): string => {
+    let t = String(token).trim().replace(/\s/g, '+');
+    t = t.replace(/-/g, '+').replace(/_/g, '/');   // fold base64url → standard so the run regex matches
+    const match = t.match(/^[A-Za-z0-9+/]+=*/);    // keep only the leading base64 run (drops '?...' junk)
+    if (match) t = match[0];
+    t = t.replace(/=+$/, '');                       // strip padding
+    if (t.length % 4 === 1) t = t.slice(0, -1);     // impossible base64 length → drop a stray char
+    return t.replace(/\+/g, '-').replace(/\//g, '_'); // back to canonical, unpadded base64url
+  };
+
   const parseTokenPayload = (token: string) => {
-    const jsonStr = atob(token);
-    return JSON.parse(jsonStr);
+    let t = normalizeAccessToken(token).replace(/-/g, '+').replace(/_/g, '/');
+    while (t.length % 4) t += '=';
+    const bin = atob(t);
+    // Extract the JSON object, tolerating any trailing bytes from an over-long/garbled base64 tail.
+    const start = bin.indexOf('{');
+    const end = bin.lastIndexOf('}');
+    if (start === -1 || end < start) throw new Error('Malformed token payload.');
+    return JSON.parse(bin.slice(start, end + 1));
   };
 
   const queueTokenLogin = (token: string, directLinkMode = false) => {
@@ -646,7 +865,13 @@ const StudentApp: React.FC = () => {
       setPreStartContext(null);
       setStudentCompanyId(parsedCompanyId);
       storeStudentCompanyId(parsedCompanyId);
-      setPendingToken(token);
+      // Store the CANONICAL token, not the raw (possibly URL-mangled) value — this is what gets sent
+      // as the X-Exam-Token header on every exams.php/students.php request. A mangled token fails
+      // server-side HMAC verification silently, exams.php falls through past the student-token
+      // check into require_staff(), and a perfectly valid student is 401'd with "Exam not found".
+      const cleanToken = normalizeAccessToken(token);
+      storeStudentExamToken(cleanToken);
+      setPendingToken(cleanToken);
     } catch (e: any) {
       setIsDirectLinkMode(directLinkMode);
       setTokenError(e?.message || 'Invalid or expired token. Please check your link.');
@@ -658,6 +883,17 @@ const StudentApp: React.FC = () => {
     const urlToken = params.get('token');
     if (urlToken) {
       queueTokenLogin(urlToken, true);
+      return;
+    }
+    // Restore from localStorage after a page reload (URL token was cleared by replaceState).
+    try {
+      const stored = localStorage.getItem(STUDENT_EXAM_TOKEN_KEY);
+      const storedCompanyId = getStoredStudentCompanyId();
+      if (stored && storedCompanyId) {
+        queueTokenLogin(stored, true);
+      }
+    } catch {
+      // ignore
     }
   }, []);
 
@@ -719,21 +955,6 @@ const StudentApp: React.FC = () => {
     setPendingToken(null);
   }, [pendingToken, studentsLoaded, examsLoaded, exams, students]);
 
-  const getNetworkIdentity = () => {
-      const mockIPs = [
-          "192.168.1.105", 
-          "10.0.0.45", 
-          "172.16.0.22", 
-          "203.0.113.89"
-      ];
-      const randomIp = Math.random() > 0.7 ? "203.0.113.89" : mockIPs[Math.floor(Math.random() * mockIPs.length)];
-      
-      return {
-          ip: randomIp,
-          userAgent: navigator.userAgent,
-          location: randomIp === "203.0.113.89" ? "Library Network (Suspicious Cluster)" : "Residential ISP"
-      };
-  };
 
   const handleTokenLogin = async (token: string) => {
     try {
@@ -757,14 +978,17 @@ const StudentApp: React.FC = () => {
       if (exam.status === 'ARCHIVED') throw new Error("This exam is archived.");
 
       const now = Date.now();
+      const examTz = resolveExamTimezone(exam.timezone);
       if (now < exam.startTime) {
-        throw new Error(`Exam has not started yet. Opens at: ${new Date(exam.startTime).toLocaleString()}`);
+        throw new Error(`Exam has not started yet. Opens at: ${formatScheduleShort(exam.startTime, examTz)}`);
       }
       if (now > exam.endTime) {
-        throw new Error(`Exam window has closed. Ended at: ${new Date(exam.endTime).toLocaleString()}`);
+        throw new Error(`Exam window has closed. Ended at: ${formatScheduleShort(exam.endTime, examTz)}`);
       }
 
-      setPreStartContext({ exam, student });
+      // Store the CANONICAL token (not the raw, possibly-mangled URL value) so the accessToken we
+      // later forward to sessions.php decodes server-side to exactly what we validated here.
+      setPreStartContext({ exam, student, token: normalizeAccessToken(token) });
       setSessionId(null);
       setExamResults(null);
       window.history.replaceState({}, document.title, window.location.pathname);
@@ -790,6 +1014,9 @@ const StudentApp: React.FC = () => {
         action: 'start',
         examId: exam.id,
         studentId: student.id,
+        // Signed access token — the server verifies this binds to (examId, studentId, companyId) so a
+        // tampered link can't start an exam as another student.
+        accessToken: preStartContext.token,
         location: geoLocation.label,
         geoLocation,
         deviceFingerprint,
@@ -909,16 +1136,20 @@ const StudentApp: React.FC = () => {
   }) => {
     if (data.terminated) {
       if (activeExam && currentStudent) {
-        try {
-          await apiPost('sessions.php', {
-            action: 'terminate',
-            examId: activeExam.id,
-            studentId: currentStudent.id,
-            reason: data.terminationReason || 'Violation threshold reached.',
-            violationSummary: data.violationSummary || null,
-          });
-        } catch (e) {
-          console.error('Failed to terminate session:', e);
+        const synced = await postSessionCompleteWithRetry({
+          action: 'terminate',
+          examId: activeExam.id,
+          studentId: currentStudent.id,
+          reason: data.terminationReason || 'Violation threshold reached.',
+          violationSummary: data.violationSummary || null,
+          // Send the answers gathered so far so the terminated attempt is scored on what the
+          // candidate actually attended (still a fail, but with a real score — not a blank row).
+          answers: data.answers,
+          questionIds: data.questions.map(q => q.id),
+          questionTimes: data.questionTimes || {},
+        });
+        if (!synced) {
+          console.error('Failed to terminate session after retries — the abandoned-session sweep will reconcile it later.');
         }
         setAccessRequestContext({
           examId: activeExam.id,
@@ -936,20 +1167,58 @@ const StudentApp: React.FC = () => {
     }
 
     setExamResults(data);
+    setSubmissionSynced(true);
 
     if (activeExam && currentStudent) {
-        try {
-          await apiPost('sessions.php', {
-            action: 'complete',
-            examId: activeExam.id,
-            studentId: currentStudent.id,
-            answers: data.answers,
-            questionIds: data.questions.map(q => q.id),
-            questionTimes: data.questionTimes || {}
-          });
-        } catch (e) {
-          console.error('Failed to complete session:', e);
+        const completePayload = {
+          action: 'complete',
+          examId: activeExam.id,
+          studentId: currentStudent.id,
+          answers: data.answers,
+          questionIds: data.questions.map(q => q.id),
+          questionTimes: data.questionTimes || {}
+        };
+        const synced = await postSessionCompleteWithRetry(completePayload);
+        if (!synced) {
+          // Keep the payload around so the student (or the "Retry" button on the results screen)
+          // can resend it without re-answering — the server never got the completion, so the
+          // session is still sitting IN_PROGRESS and won't show up in Results/Recordings.
+          pendingCompletePayloadRef.current = completePayload;
+          setSubmissionSynced(false);
         }
+    }
+  };
+
+  // A dropped 'complete' call used to strand a session as IN_PROGRESS forever — fully graded
+  // answers sitting in the DB, but invisible in Results and with its recording never finalized,
+  // while the student saw a normal-looking results screen. Retry transient failures a few times
+  // before giving up and telling the student their submission didn't register.
+  const postSessionCompleteWithRetry = async (payload: Record<string, unknown>, attempts = 4): Promise<boolean> => {
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        await apiPost('sessions.php', payload);
+        return true;
+      } catch (e) {
+        console.error(`Failed to complete session (attempt ${attempt}/${attempts}):`, e);
+        if (attempt < attempts) {
+          await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
+        }
+      }
+    }
+    return false;
+  };
+
+  const handleRetrySubmission = async () => {
+    if (!pendingCompletePayloadRef.current || resubmittingSession) return;
+    setResubmittingSession(true);
+    try {
+      const synced = await postSessionCompleteWithRetry(pendingCompletePayloadRef.current);
+      if (synced) {
+        pendingCompletePayloadRef.current = null;
+        setSubmissionSynced(true);
+      }
+    } finally {
+      setResubmittingSession(false);
     }
   };
 
@@ -958,6 +1227,8 @@ const StudentApp: React.FC = () => {
     setCurrentStudent(null);
     setExamResults(null);
     setSessionId(null);
+    storeStudentExamToken(null);
+    storeStudentCompanyId(null);
   };
 
   const renderAccessRequestAction = () => {
@@ -1009,7 +1280,7 @@ const StudentApp: React.FC = () => {
   if (activeExam && currentStudent) {
     if (examResults) {
       return (
-        <ExamResult 
+        <ExamResult
            exam={activeExam}
            student={currentStudent}
            answers={examResults.answers}
@@ -1017,6 +1288,9 @@ const StudentApp: React.FC = () => {
            questions={examResults.questions}
            sessionId={sessionId ?? undefined}
            onExit={handleExitStudent}
+           submissionSynced={submissionSynced}
+           resubmitting={resubmittingSession}
+           onRetrySubmission={handleRetrySubmission}
         />
       );
     }
@@ -1033,9 +1307,7 @@ const StudentApp: React.FC = () => {
   if (isDirectLinkMode) {
     const linkLoading = !preStartContext && !tokenError && (pendingToken !== null || !studentsLoaded || !examsLoaded);
     return (
-      <div className="min-h-screen relative overflow-hidden lsc-gradient-bg">
-        <div className="absolute -top-24 -left-16 h-72 w-72 rounded-full bg-blue-200/30 blur-3xl"></div>
-        <div className="absolute -bottom-28 -right-12 h-80 w-80 rounded-full bg-orange-200/30 blur-3xl"></div>
+      <div className="min-h-screen relative lsc-auth-bg">
         <div className="relative z-10 min-h-screen flex items-center justify-center p-6">
           <div className="w-full max-w-4xl lsc-card p-8 space-y-6">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -1119,17 +1391,15 @@ const StudentApp: React.FC = () => {
   }
 
   return (
-    <div className="min-h-screen relative overflow-hidden lsc-gradient-bg">
-      <div className="absolute -top-20 right-10 h-56 w-56 rounded-full bg-blue-200/30 blur-3xl"></div>
-      <div className="absolute -bottom-32 left-8 h-72 w-72 rounded-full bg-orange-200/30 blur-3xl"></div>
+    <div className="min-h-screen relative lsc-auth-bg">
       <div className="relative z-10 min-h-screen flex items-center justify-center p-6">
-        <div className="w-full max-w-lg space-y-8 lsc-card p-8">
+        <div className="w-full max-w-md space-y-7 lsc-card p-8">
           <div className="text-center space-y-2">
-            <div className="mx-auto h-14 w-14 lsc-brand-mark text-sm">
+            <div className="mx-auto h-14 w-14 lsc-brand-mark text-base">
               LSC
             </div>
-            <h1 className="text-3xl font-semibold text-slate-900">LSC Exam Proctor</h1>
-            <p className="text-slate-500">Student Exam Access</p>
+            <h1 className="text-2xl font-semibold text-slate-900">LSC Exam Proctor</h1>
+            <p className="text-slate-500 text-sm">Enter your exam access token to begin</p>
           </div>
 
           <div className="space-y-6">

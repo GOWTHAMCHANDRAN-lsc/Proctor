@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { DeliveryLog, NotificationTemplate } from '../../types';
 import { apiGet, apiPost } from '../../services/api';
+import { Pagination, usePagination } from './Pagination';
 import { Mail, MessageSquare, RefreshCcw, Save, Trash2, Search } from 'lucide-react';
 
 const emptyTemplate: Omit<NotificationTemplate, 'id' | 'createdAt' | 'updatedAt'> = {
@@ -87,6 +88,8 @@ export const Communications: React.FC = () => {
       ].filter(Boolean).join(' ').toLowerCase().includes(term);
     });
   }, [logs, search]);
+
+  const logPaging = usePagination(filteredLogs, search);
 
   return (
     <div className="space-y-6">
@@ -245,7 +248,7 @@ export const Communications: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {filteredLogs.map(log => (
+                  {logPaging.pageItems.map(log => (
                     <tr key={log.id} className="text-slate-700 hover:bg-slate-50/70">
                       <td className="px-4 py-3 text-xs text-slate-500 whitespace-nowrap">
                         {new Date(log.createdAt).toLocaleString()}
@@ -272,6 +275,7 @@ export const Communications: React.FC = () => {
               </table>
             </div>
           )}
+          {!loadingLogs && filteredLogs.length > 0 && <Pagination state={logPaging} label="deliveries" />}
         </div>
       </div>
     </div>

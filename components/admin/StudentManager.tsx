@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Upload, FileSpreadsheet, CheckCircle, AlertCircle, Search, UserPlus, X, XCircle, FileWarning, Loader2, Download, Layers3, Building2, Plus } from 'lucide-react';
-import { Batch, Student } from '../../types';
+import { Upload, FileSpreadsheet, CheckCircle, AlertCircle, Search, UserPlus, X, XCircle, FileWarning, Loader2, Download, Layers3, Building2, Plus, Trash2 } from 'lucide-react';
+import { Batch, Student, UserRole, CompanyDirectoryRecord } from '../../types';
 import { apiGet, apiPost } from '../../services/api';
+import { Pagination, usePagination } from './Pagination';
 
 interface CsvError {
   row: number;
@@ -11,6 +12,7 @@ interface CsvError {
 interface StudentManagerProps {
   students: Student[];
   onUpdateStudents: React.Dispatch<React.SetStateAction<Student[]>>;
+  role?: UserRole;
 }
 
 interface AdminCompanyContext {
@@ -91,8 +93,27 @@ const mergeStudents = (current: Student[], incoming: Student[]) => {
   return Array.from(map.values());
 };
 
-export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpdateStudents }) => {
+export const StudentManager: React.FC<StudentManagerProps> = ({ students: propStudents, onUpdateStudents: propOnUpdateStudents, role }) => {
   const companyContext = useMemo(() => getAdminCompanyContext(), []);
+  const isSuperAdmin = role === UserRole.SUPER_ADMIN;
+
+  // Super admin operates across every tenant: it maintains its own per-company student
+  // list and company selector. A regular admin stays bound to its own company via props.
+  const [companies, setCompanies] = useState<CompanyDirectoryRecord[]>([]);
+  const [selectedCompanyId, setSelectedCompanyId] = useState<number | ''>('');
+  const [superStudents, setSuperStudents] = useState<Student[]>([]);
+  const [superStudentsLoading, setSuperStudentsLoading] = useState(false);
+
+  // Effective bindings — the rest of the component uses these transparently.
+  const students = isSuperAdmin ? superStudents : propStudents;
+  const onUpdateStudents = isSuperAdmin ? setSuperStudents : propOnUpdateStudents;
+  const effectiveCompanyId = isSuperAdmin ? (selectedCompanyId === '' ? null : selectedCompanyId) : companyContext.companyId;
+  const effectiveCompanyLabel = isSuperAdmin
+    ? (companies.find(c => c.id === selectedCompanyId)?.name || 'Select a company')
+    : companyContext.companyLabel;
+  // Extra query string that pins super-admin requests to the chosen company.
+  const companyQuery = isSuperAdmin && effectiveCompanyId ? `?companyId=${effectiveCompanyId}` : '';
+
   const [isAddingStudent, setIsAddingStudent] = useState(false);
   const [isCreatingBatch, setIsCreatingBatch] = useState(false);
   const [search, setSearch] = useState('');
@@ -104,19 +125,49 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
   const [newBatch, setNewBatch] = useState({ name: '', description: '' });
   const [newStudent, setNewStudent] = useState({ fullName: '', email: '', registrationId: '' });
 
+  const [deleteStudentTarget, setDeleteStudentTarget] = useState<Student | null>(null);
+  const [deleteStudentBusy, setDeleteStudentBusy] = useState(false);
+  const [removeFromBatchBusyId, setRemoveFromBatchBusyId] = useState<string | null>(null);
+  const [confirmDeleteBatch, setConfirmDeleteBatch] = useState(false);
+  const [deleteBatchBusy, setDeleteBatchBusy] = useState(false);
+
   const [dragActive, setDragActive] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadStatus, setUploadStatus] = useState<'IDLE' | 'PROCESSING' | 'SUCCESS' | 'PARTIAL' | 'ERROR'>('IDLE');
   const [uploadMsg, setUploadMsg] = useState('');
   const [csvErrors, setCsvErrors] = useState<CsvError[]>([]);
 
+  // Super admin: load the company list for the selector.
   useEffect(() => {
+    if (!isSuperAdmin) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const data = await apiGet<{ companies: CompanyDirectoryRecord[] }>('companies.php');
+        if (cancelled) return;
+        const list = data?.companies || [];
+        setCompanies(list);
+        setSelectedCompanyId(current => (current === '' ? (list[0]?.id ?? '') : current));
+      } catch (e: any) {
+        if (!cancelled) setBatchError(e?.message || 'Failed to load companies.');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isSuperAdmin]);
+
+  useEffect(() => {
+    // A super admin must pick a company before any company-scoped data can be fetched.
+    if (isSuperAdmin && !effectiveCompanyId) {
+      setBatches([]);
+      setSelectedBatchId('');
+      return;
+    }
     let cancelled = false;
     const loadBatches = async () => {
       setBatchLoading(true);
       setBatchError('');
       try {
-        const data = await apiGet<{ batches: Batch[] }>('batches.php');
+        const data = await apiGet<{ batches: Batch[] }>(`batches.php${companyQuery}`);
         if (cancelled) return;
         const nextBatches = data?.batches || [];
         setBatches(nextBatches);
@@ -141,7 +192,29 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isSuperAdmin, effectiveCompanyId, companyQuery]);
+
+  // Super admin: (re)load the selected company's students.
+  useEffect(() => {
+    if (!isSuperAdmin) return;
+    if (!effectiveCompanyId) {
+      setSuperStudents([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      setSuperStudentsLoading(true);
+      try {
+        const data = await apiGet<{ students: Student[] }>(`students.php${companyQuery}`);
+        if (!cancelled) setSuperStudents(data?.students || []);
+      } catch {
+        if (!cancelled) setSuperStudents([]);
+      } finally {
+        if (!cancelled) setSuperStudentsLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isSuperAdmin, effectiveCompanyId, companyQuery]);
 
   const selectedBatch = useMemo(
     () => batches.find(batch => batch.id === selectedBatchId) || null,
@@ -153,10 +226,12 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
     if (!query) return students;
 
     return students.filter(student =>
-      [student.fullName, student.email, student.registrationId, student.company || '', student.batch || '']
+      [student.fullName, student.email, student.registrationId, student.company || '', ...(student.batches || []).map(b => b.name)]
         .some(value => value.toLowerCase().includes(query))
     );
   }, [search, students]);
+
+  const studentPaging = usePagination(filteredStudents, search);
 
   const batchCount = batches.length;
 
@@ -170,6 +245,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
       const result = await apiPost<{ batch: Batch; created: boolean }>('batches.php', {
         name: newBatch.name.trim(),
         description: newBatch.description.trim(),
+        companyId: effectiveCompanyId,
       });
 
       const batch = result.batch;
@@ -200,15 +276,16 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
       return;
     }
 
-    if (students.some(s => s.registrationId === newStudent.registrationId || s.email === newStudent.email)) {
-      alert('Student with this ID or Email already exists.');
+    const existingMatch = students.find(s => s.registrationId === newStudent.registrationId || s.email === newStudent.email);
+    if (existingMatch && existingMatch.batches.some(b => b.id === selectedBatch.id)) {
+      alert('This student is already in this batch.');
       return;
     }
 
     try {
       const result = await apiPost<{ students: Student[]; errors?: string[] }>('students.php', {
         ...newStudent,
-        companyId: companyContext.companyId,
+        companyId: effectiveCompanyId,
         batchId: selectedBatch.id,
         batch: selectedBatch.name,
       });
@@ -236,6 +313,101 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
     }
   };
 
+  const refreshBatches = async () => {
+    // Keep the company scope — for a super admin this must stay pinned to the selected company,
+    // otherwise the batch list gets clobbered with a different company's batches after an upload.
+    try {
+      const data = await apiGet<{ batches: Batch[] }>(`batches.php${companyQuery}`);
+      setBatches(data?.batches || []);
+    } catch (e) {
+      console.error('Failed to refresh batches:', e);
+    }
+  };
+
+  const handleDeleteStudent = async () => {
+    if (!deleteStudentTarget || deleteStudentBusy) return;
+    setDeleteStudentBusy(true);
+    try {
+      await apiPost<{ ok: boolean; id: string }>('students.php', {
+        action: 'delete',
+        id: deleteStudentTarget.id,
+        companyId: effectiveCompanyId,
+      });
+      const removed = deleteStudentTarget;
+      onUpdateStudents(prev => prev.filter(s => s.id !== removed.id));
+      // Keep the batch tally in sync with the removed student, across every batch they were in.
+      const removedBatchIds = new Set((removed.batches || []).map(b => b.id));
+      if (removedBatchIds.size > 0) {
+        setBatches(prev => prev.map(batch => (
+          removedBatchIds.has(batch.id) && typeof batch.studentCount === 'number'
+            ? { ...batch, studentCount: Math.max(0, batch.studentCount - 1) }
+            : batch
+        )));
+      }
+      setDeleteStudentTarget(null);
+    } catch (e: any) {
+      console.error(e);
+      alert(e?.message || 'Failed to delete student.');
+    } finally {
+      setDeleteStudentBusy(false);
+    }
+  };
+
+  const handleRemoveFromBatch = async (student: Student) => {
+    if (!selectedBatch || removeFromBatchBusyId) return;
+    setRemoveFromBatchBusyId(student.id);
+    try {
+      await apiPost<{ ok: boolean }>('students.php', {
+        action: 'unenroll',
+        studentId: student.id,
+        batchId: selectedBatch.id,
+        companyId: effectiveCompanyId,
+      });
+      const removedId = selectedBatch.id;
+      onUpdateStudents(prev => prev.map(s => (
+        s.id === student.id ? { ...s, batches: s.batches.filter(b => b.id !== removedId) } : s
+      )));
+      setBatches(prev => prev.map(batch => (
+        batch.id === removedId && typeof batch.studentCount === 'number'
+          ? { ...batch, studentCount: Math.max(0, batch.studentCount - 1) }
+          : batch
+      )));
+    } catch (e: any) {
+      console.error(e);
+      alert(e?.message || 'Failed to remove student from batch.');
+    } finally {
+      setRemoveFromBatchBusyId(null);
+    }
+  };
+
+  const handleDeleteBatch = async () => {
+    if (!selectedBatch || deleteBatchBusy) return;
+    setDeleteBatchBusy(true);
+    try {
+      await apiPost<{ ok: boolean; id: number }>('batches.php', {
+        action: 'delete',
+        id: selectedBatch.id,
+        companyId: effectiveCompanyId,
+      });
+      const removedId = selectedBatch.id;
+      // Students aren't deleted — they're just no longer enrolled in this batch (their
+      // other batch enrollments, if any, are untouched).
+      onUpdateStudents(prev => prev.map(s => (
+        s.batches.some(b => b.id === removedId)
+          ? { ...s, batches: s.batches.filter(b => b.id !== removedId) }
+          : s
+      )));
+      setBatches(prev => prev.filter(b => b.id !== removedId));
+      setSelectedBatchId(current => (current === removedId ? '' : current));
+      setConfirmDeleteBatch(false);
+    } catch (e: any) {
+      console.error(e);
+      alert(e?.message || 'Failed to delete batch.');
+    } finally {
+      setDeleteBatchBusy(false);
+    }
+  };
+
   const downloadTemplate = () => {
     const headers = 'Full Name,Registration ID,Email\n';
     const sample = 'John Doe,REG2024003,john.doe@example.com\nJane Smith,REG2024004,jane.smith@example.com';
@@ -253,8 +425,8 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
     const rows = [
       ['Company', 'Batch', 'Full Name', 'Registration ID', 'Email'],
       ...students.map(student => [
-        student.company || companyContext.companyLabel,
-        student.batch || '',
+        student.company || effectiveCompanyLabel,
+        student.batches.map(b => b.name).join(', '),
         student.fullName,
         student.registrationId,
         student.email,
@@ -277,28 +449,44 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
     URL.revokeObjectURL(url);
   };
 
+  const HEADER_ALIASES: Record<'name' | 'regId' | 'email', string[]> = {
+    name: ['full name', 'fullname', 'name', 'student name'],
+    regId: ['registration id', 'registrationid', 'reg id', 'reg no', 'registration no', 'id', 'student id'],
+    email: ['email', 'email address', 'e-mail'],
+  };
+
+  const findHeaderIndex = (headerCols: string[], aliases: string[]) =>
+    headerCols.findIndex(h => aliases.includes(h.replace(/^"|"$/g, '').trim().toLowerCase()));
+
   const parseCSV = (text: string) => {
-    const lines = text.split(/\r?\n/);
+    const lines = text.replace(/^﻿/, '').split(/\r?\n/);
     const newStudents: Student[] = [];
     const errors: CsvError[] = [];
+
+    const headerLine = lines[0]?.trim();
+    if (!headerLine) {
+      errors.push({ row: 1, message: 'Missing header row. Use Full Name,Registration ID,Email.' });
+      return { newStudents, errors };
+    }
+
+    const headerCols = parseCsvLine(headerLine);
+    const nameIdx = findHeaderIndex(headerCols, HEADER_ALIASES.name);
+    const regIdIdx = findHeaderIndex(headerCols, HEADER_ALIASES.regId);
+    const emailIdx = findHeaderIndex(headerCols, HEADER_ALIASES.email);
+
+    if (nameIdx === -1 || regIdIdx === -1 || emailIdx === -1) {
+      errors.push({ row: 1, message: 'Missing columns. Use headers: Full Name,Registration ID,Email.' });
+      return { newStudents, errors };
+    }
 
     for (let i = 1; i < lines.length; i += 1) {
       const line = lines[i].trim();
       if (!line) continue;
 
-      const cols = parseCsvLine(line);
-      let name = '';
-      let regId = '';
-      let email = '';
-
-      if (cols.length >= 5) {
-        [, , name, regId, email] = cols.map(value => value.replace(/^"|"$/g, '').trim());
-      } else if (cols.length >= 3) {
-        [name, regId, email] = cols.map(value => value.replace(/^"|"$/g, '').trim());
-      } else {
-        errors.push({ row: i + 1, message: 'Missing columns. Use Full Name,Registration ID,Email.' });
-        continue;
-      }
+      const cols = parseCsvLine(line).map(value => value.replace(/^"|"$/g, '').trim());
+      const name = cols[nameIdx] ?? '';
+      const regId = cols[regIdIdx] ?? '';
+      const email = cols[emailIdx] ?? '';
 
       if (!name || !regId || !email) {
         errors.push({ row: i + 1, message: 'Empty fields detected.' });
@@ -318,6 +506,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
         fullName: name,
         registrationId: regId,
         email,
+        batches: [],
       });
     }
 
@@ -355,7 +544,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
             const result = await apiPost<{ students: Student[]; errors?: string[] }>('students.php', {
               students: newStudents.map(student => ({
                 ...student,
-                companyId: companyContext.companyId,
+                companyId: effectiveCompanyId,
                 batchId: selectedBatch.id,
                 batch: selectedBatch.name,
               })),
@@ -364,11 +553,8 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
             const saved = result.students || [];
             if (saved.length > 0) {
               onUpdateStudents(prev => mergeStudents(prev, saved));
-              setBatches(prev => prev.map(batch => (
-                batch.id === selectedBatch.id
-                  ? { ...batch, studentCount: undefined }
-                  : batch
-              )));
+              // Pull authoritative batch counts back from the server.
+              refreshBatches();
             }
 
             const serverErrors = (result.errors || []).map(message => ({
@@ -442,11 +628,24 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
           <p className="lsc-subtitle mt-1">Admins create batches first, then assign students into the selected batch.</p>
         </div>
         <div className="flex flex-wrap gap-2">
+          {isSuperAdmin && (
+            <select
+              value={selectedCompanyId}
+              onChange={e => setSelectedCompanyId(e.target.value === '' ? '' : Number(e.target.value))}
+              className="px-3 py-2 border border-slate-200 rounded-lg bg-white text-sm outline-none min-w-[200px]"
+              title="Select a company to manage its students"
+            >
+              <option value="">Select a company…</option>
+              {companies.map(company => (
+                <option key={company.id} value={company.id}>{company.name}</option>
+              ))}
+            </select>
+          )}
           <button onClick={downloadTemplate} className="px-4 py-2 lsc-button-ghost flex items-center gap-2 text-sm">
-            <Download size={16} className="text-[#3558ff]" /> Template
+            <Download size={16} className="text-[var(--lsc-primary)]" /> Template
           </button>
           <button onClick={exportStudents} className="px-4 py-2 lsc-button-ghost flex items-center gap-2 text-sm">
-            <Download size={16} className="text-[#0f9f8c]" /> Export
+            <Download size={16} className="text-[#1e8e3e]" /> Export
           </button>
           <button onClick={() => setIsCreatingBatch(true)} className="px-4 py-2 lsc-button-ghost flex items-center gap-2 text-sm">
             <Plus size={16} /> Create Batch
@@ -473,8 +672,12 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
           </div>
           <div>
             <p className="text-xs uppercase tracking-[0.2em] text-slate-400">Company Scope</p>
-            <p className="text-sm font-semibold text-slate-900">{companyContext.companyLabel}</p>
-            <p className="text-xs text-slate-500 mt-1">Only the current authenticated company scope is used here.</p>
+            <p className="text-sm font-semibold text-slate-900">{effectiveCompanyLabel}</p>
+            <p className="text-xs text-slate-500 mt-1">
+              {isSuperAdmin
+                ? 'Super admin — pick a company above to manage its students.'
+                : 'Only the current authenticated company scope is used here.'}
+            </p>
           </div>
         </div>
         <div className="lsc-panel p-4 flex items-start gap-3">
@@ -488,7 +691,18 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
           </div>
         </div>
         <div className="lsc-panel p-4">
-          <label className="block text-xs font-semibold text-gray-500 uppercase mb-2">Selected Batch</label>
+          <div className="flex items-center justify-between mb-2">
+            <label className="block text-xs font-semibold text-slate-500 uppercase">Selected Batch</label>
+            <button
+              type="button"
+              onClick={() => setConfirmDeleteBatch(true)}
+              disabled={!selectedBatch}
+              className="inline-flex items-center gap-1 text-xs font-medium text-slate-400 hover:text-red-600 disabled:opacity-40 disabled:hover:text-slate-400"
+              title={selectedBatch ? `Delete batch ${selectedBatch.name}` : 'Select a batch to delete'}
+            >
+              <Trash2 size={13} /> Delete
+            </button>
+          </div>
           <select
             value={selectedBatchId}
             onChange={e => setSelectedBatchId(e.target.value ? Number(e.target.value) : '')}
@@ -511,7 +725,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
 
       {isCreatingBatch && (
         <div className="lsc-panel p-4 sm:p-6 animate-in fade-in slide-in-from-top-4 relative overflow-hidden">
-          <div className="absolute top-0 left-0 w-1 h-full bg-[#0f9f8c]"></div>
+          <div className="absolute top-0 left-0 w-1 h-full bg-[#1e8e3e]"></div>
           <div className="flex justify-between mb-6">
             <div>
               <h3 className="font-bold text-slate-900 text-lg">Create Batch</h3>
@@ -523,11 +737,11 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
             <div>
-              <label className="block text-xs font-semibold text-gray-500 uppercase mb-1">Company</label>
-              <input type="text" className="w-full p-2.5 border border-slate-200 rounded-lg bg-slate-50 text-slate-600" value={companyContext.companyLabel} readOnly />
+              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Company</label>
+              <input type="text" className="w-full p-2.5 border border-slate-200 rounded-lg bg-slate-50 text-slate-600" value={effectiveCompanyLabel} readOnly />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-gray-500 uppercase mb-1">Batch Name</label>
+              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Batch Name</label>
               <input
                 type="text"
                 placeholder="e.g. Batch A"
@@ -537,7 +751,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-gray-500 uppercase mb-1">Description</label>
+              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Description</label>
               <input
                 type="text"
                 placeholder="Optional notes"
@@ -558,7 +772,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
 
       {isAddingStudent && (
         <div className="lsc-panel p-4 sm:p-6 animate-in fade-in slide-in-from-top-4 relative overflow-hidden">
-          <div className="absolute top-0 left-0 w-1 h-full bg-[#3558ff]"></div>
+          <div className="absolute top-0 left-0 w-1 h-full bg-[var(--lsc-primary)]"></div>
           <div className="flex justify-between mb-6">
             <div>
               <h3 className="font-bold text-slate-900 text-lg">Add New Student</h3>
@@ -570,15 +784,15 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
           </div>
           <div className="grid grid-cols-1 md:grid-cols-5 gap-5">
             <div>
-              <label className="block text-xs font-semibold text-gray-500 uppercase mb-1">Company</label>
-              <input type="text" className="w-full p-2.5 border border-slate-200 rounded-lg bg-slate-50 text-slate-600" value={companyContext.companyLabel} readOnly />
+              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Company</label>
+              <input type="text" className="w-full p-2.5 border border-slate-200 rounded-lg bg-slate-50 text-slate-600" value={effectiveCompanyLabel} readOnly />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-gray-500 uppercase mb-1">Batch</label>
+              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Batch</label>
               <input type="text" className="w-full p-2.5 border border-slate-200 rounded-lg bg-slate-50 text-slate-600" value={selectedBatch?.name || ''} readOnly />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-gray-500 uppercase mb-1">Full Name</label>
+              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Full Name</label>
               <input
                 type="text"
                 placeholder="e.g. John Doe"
@@ -588,7 +802,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-gray-500 uppercase mb-1">Registration ID</label>
+              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Registration ID</label>
               <input
                 type="text"
                 placeholder="e.g. REG-2024-001"
@@ -598,7 +812,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-gray-500 uppercase mb-1">Email Address</label>
+              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Email Address</label>
               <input
                 type="email"
                 placeholder="john@example.com"
@@ -646,7 +860,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
               <div className="flex flex-col items-center animate-in fade-in zoom-in duration-300 z-10">
                 <div className="relative">
                   <div className="absolute inset-0 bg-blue-200 rounded-full blur-xl opacity-50 animate-pulse"></div>
-                  <Loader2 size={48} className="text-[#3558ff] animate-spin relative z-10" />
+                  <Loader2 size={48} className="text-[var(--lsc-primary)] animate-spin relative z-10" />
                 </div>
                 <p className="text-blue-900 font-bold mt-6 text-lg">{uploadMsg}</p>
                 <p className="text-blue-700/70 text-sm mt-1">Current batch: {selectedBatch?.name || 'Not selected'}</p>
@@ -739,7 +953,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
               <span className="ml-2 text-xs font-medium bg-slate-200 text-slate-600 px-2 py-0.5 rounded-full">{filteredStudents.length}</span>
             </h3>
             <div className="relative group">
-              <Search className="absolute left-3 top-2.5 text-gray-400 group-focus-within:text-blue-500 transition-colors" size={15} />
+              <Search className="absolute left-3 top-2.5 text-slate-400 group-focus-within:text-blue-500 transition-colors" size={15} />
               <input
                 type="text"
                 value={search}
@@ -749,47 +963,111 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
               />
             </div>
           </div>
-          <div className="overflow-y-auto flex-1 scrollbar-thin scrollbar-thumb-gray-200 hover:scrollbar-thumb-gray-300">
+          <div className="overflow-y-auto flex-1 scrollbar-thin scrollbar-thumb-slate-200 hover:scrollbar-thumb-slate-300">
             <div className="lsc-table-wrap">
-              <table className="w-full min-w-[980px] text-left">
-                <thead className="bg-white border-b border-gray-100 sticky top-0 z-10 shadow-sm">
+              <table className="w-full min-w-[1080px] text-left">
+                <thead className="bg-white border-b border-slate-100 sticky top-0 z-10 shadow-sm">
                   <tr>
-                    <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-wider bg-gray-50/80 backdrop-blur">Company</th>
-                    <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-wider bg-gray-50/80 backdrop-blur">Batch</th>
-                    <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-wider bg-gray-50/80 backdrop-blur">Registration ID</th>
-                    <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-wider bg-gray-50/80 backdrop-blur">Full Name</th>
-                    <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-wider bg-gray-50/80 backdrop-blur">Email Address</th>
-                    <th className="px-6 py-4 text-xs font-bold text-gray-400 uppercase tracking-wider bg-gray-50/80 backdrop-blur text-center">Status</th>
+                    <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur">Company</th>
+                    <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur">Batch</th>
+                    <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur">Registration ID</th>
+                    <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur">Full Name</th>
+                    <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur">Email Address</th>
+                    <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur text-center">Status</th>
+                    <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur text-right">Actions</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-gray-50">
-                  {filteredStudents.map(student => (
+                <tbody className="divide-y divide-slate-50">
+                  {studentPaging.pageItems.map(student => (
                     <tr key={student.id} className="hover:bg-blue-50/30 transition-colors group">
-                      <td className="px-6 py-4 text-sm text-gray-600 font-medium">{student.company || companyContext.companyLabel}</td>
+                      <td className="px-6 py-4 text-sm text-slate-600 font-medium">{student.company || effectiveCompanyLabel}</td>
                       <td className="px-6 py-4 text-sm">
-                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-blue-100 text-blue-700 text-[11px] font-semibold border border-blue-200">
-                          <Layers3 size={12} /> {student.batch || 'Unassigned'}
-                        </span>
+                        <div className="flex flex-wrap gap-1">
+                          {student.batches.length > 0 ? student.batches.map(b => (
+                            <span key={b.id} className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-blue-100 text-blue-700 text-[11px] font-semibold border border-blue-200">
+                              <Layers3 size={12} /> {b.name}
+                            </span>
+                          )) : (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-slate-100 text-slate-500 text-[11px] font-semibold border border-slate-200">
+                              Unassigned
+                            </span>
+                          )}
+                        </div>
                       </td>
-                      <td className="px-6 py-4 text-sm text-gray-500 font-mono group-hover:text-blue-600 transition-colors">{student.registrationId}</td>
-                      <td className="px-6 py-4 text-sm text-gray-900 font-semibold">{student.fullName}</td>
-                      <td className="px-6 py-4 text-sm text-gray-500">{student.email}</td>
+                      <td className="px-6 py-4 text-sm text-slate-500 font-mono group-hover:text-blue-600 transition-colors">{student.registrationId}</td>
+                      <td className="px-6 py-4 text-sm text-slate-900 font-semibold">
+                        <div className="flex items-center gap-2">
+                          <span>{student.fullName}</span>
+                          {student.enrolled ? (
+                            <span
+                              title={student.enrolledAt ? `Face enrolled ${student.enrolledAt}` : 'Face enrolled'}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 text-[9px] font-bold uppercase tracking-wide border border-indigo-200"
+                            >
+                              <CheckCircle size={9} /> Face ID
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 text-[9px] font-bold uppercase tracking-wide border border-slate-200">
+                              No Face ID
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-6 py-4 text-sm text-slate-500">{student.email}</td>
                       <td className="px-6 py-4 text-center">
-                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-teal-100 text-teal-700 text-[10px] font-bold uppercase tracking-wide border border-teal-200">
-                          <CheckCircle size={10} /> Verified
-                        </span>
+                        {student.enrolled ? (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-teal-100 text-teal-700 text-[10px] font-bold uppercase tracking-wide border border-teal-200">
+                            <CheckCircle size={10} /> Enrolled
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-amber-100 text-amber-700 text-[10px] font-bold uppercase tracking-wide border border-amber-200">
+                            <AlertCircle size={10} /> Pending
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-6 py-4 text-right">
+                        <div className="inline-flex items-center gap-1">
+                          {selectedBatch && student.batches.some(b => b.id === selectedBatch.id) && (
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveFromBatch(student)}
+                              disabled={removeFromBatchBusyId === student.id}
+                              className="inline-flex items-center justify-center h-8 w-8 rounded-lg text-slate-400 hover:text-amber-600 hover:bg-amber-50 transition-colors disabled:opacity-50"
+                              title={`Remove ${student.fullName} from ${selectedBatch.name} (keeps their other batches)`}
+                              aria-label={`Remove ${student.fullName} from ${selectedBatch.name}`}
+                            >
+                              {removeFromBatchBusyId === student.id ? <Loader2 size={16} className="animate-spin" /> : <X size={16} />}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => setDeleteStudentTarget(student)}
+                            className="inline-flex items-center justify-center h-8 w-8 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors"
+                            title={`Delete ${student.fullName} entirely (all batches)`}
+                            aria-label={`Delete ${student.fullName} entirely`}
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
                   {filteredStudents.length === 0 && (
                     <tr>
-                      <td colSpan={6} className="py-20 text-center text-gray-400">
+                      <td colSpan={7} className="py-20 text-center text-slate-400">
                         <div className="flex flex-col items-center justify-center">
-                          <div className="bg-gray-100 p-4 rounded-full mb-3">
-                            <UserPlus size={24} className="text-gray-300" />
+                          <div className="bg-slate-100 p-4 rounded-full mb-3">
+                            <UserPlus size={24} className="text-slate-300" />
                           </div>
-                          <p>No students found for this company or filter.</p>
-                          <p className="text-xs mt-1">Create a batch first, then add or upload students into it.</p>
+                          {isSuperAdmin && superStudentsLoading ? (
+                            <p className="flex items-center gap-2"><Loader2 size={16} className="animate-spin" /> Loading students…</p>
+                          ) : isSuperAdmin && !effectiveCompanyId ? (
+                            <p>Select a company above to view its students.</p>
+                          ) : (
+                            <>
+                              <p>No students found for this company or filter.</p>
+                              <p className="text-xs mt-1">Create a batch first, then add or upload students into it.</p>
+                            </>
+                          )}
                         </div>
                       </td>
                     </tr>
@@ -798,11 +1076,85 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students, onUpda
               </table>
             </div>
           </div>
-          <div className="bg-gray-50 p-3 border-t border-gray-200 text-xs text-center text-gray-400">
-            Showing {filteredStudents.length} of {students.length} records
-          </div>
+          {studentPaging.totalPages > 1 ? (
+            <Pagination state={studentPaging} label="students" />
+          ) : (
+            <div className="bg-slate-50 p-3 border-t border-slate-200 text-xs text-center text-slate-400">
+              Showing {filteredStudents.length} of {students.length} records
+            </div>
+          )}
         </div>
       </div>
+
+      {deleteStudentTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40" onClick={() => !deleteStudentBusy && setDeleteStudentTarget(null)}>
+          <div className="lsc-card w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
+            <div className="flex items-start gap-3">
+              <div className="lsc-icon-tile-danger p-2.5 shrink-0">
+                <Trash2 size={18} />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-lg font-semibold text-slate-900">Delete student?</h3>
+                <p className="text-sm text-slate-500 mt-1">
+                  This permanently removes <span className="font-medium text-slate-800">{deleteStudentTarget.fullName}</span> ({deleteStudentTarget.registrationId}) and all of their exam sessions and results. This can't be undone.
+                </p>
+              </div>
+            </div>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={() => setDeleteStudentTarget(null)}
+                disabled={deleteStudentBusy}
+                className="px-5 py-2 lsc-button-ghost text-sm"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteStudent}
+                disabled={deleteStudentBusy}
+                className="px-5 py-2 rounded-lg bg-red-600 text-white text-sm font-semibold hover:bg-red-700 disabled:opacity-60 flex items-center gap-2"
+              >
+                {deleteStudentBusy && <Loader2 size={15} className="animate-spin" />}
+                {deleteStudentBusy ? 'Deleting…' : 'Delete student'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDeleteBatch && selectedBatch && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40" onClick={() => !deleteBatchBusy && setConfirmDeleteBatch(false)}>
+          <div className="lsc-card w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
+            <div className="flex items-start gap-3">
+              <div className="lsc-icon-tile-danger p-2.5 shrink-0">
+                <Trash2 size={18} />
+              </div>
+              <div className="min-w-0">
+                <h3 className="text-lg font-semibold text-slate-900">Delete batch?</h3>
+                <p className="text-sm text-slate-500 mt-1">
+                  This deletes <span className="font-medium text-slate-800">{selectedBatch.name}</span>. Students in this batch are kept but moved to <span className="font-medium text-slate-800">Unassigned</span>, and any exam links to this batch are removed.
+                </p>
+              </div>
+            </div>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={() => setConfirmDeleteBatch(false)}
+                disabled={deleteBatchBusy}
+                className="px-5 py-2 lsc-button-ghost text-sm"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDeleteBatch}
+                disabled={deleteBatchBusy}
+                className="px-5 py-2 rounded-lg bg-red-600 text-white text-sm font-semibold hover:bg-red-700 disabled:opacity-60 flex items-center gap-2"
+              >
+                {deleteBatchBusy && <Loader2 size={15} className="animate-spin" />}
+                {deleteBatchBusy ? 'Deleting…' : 'Delete batch'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

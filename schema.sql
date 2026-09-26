@@ -8,14 +8,22 @@ CREATE DATABASE IF NOT EXISTS proctorguard
 USE proctorguard;
 
 -- Students
+-- email / registration_id are unique per company (not globally) — the same real person can be
+-- enrolled as a separate student record under two different companies. See
+-- ensure_student_company_scoped_uniqueness() in api/_bootstrap.php for the live-DB migration.
 CREATE TABLE IF NOT EXISTS students (
   id              VARCHAR(64) PRIMARY KEY,
   company_id      INT NOT NULL DEFAULT 1,
   full_name       VARCHAR(255) NOT NULL,
-  email           VARCHAR(255) NOT NULL UNIQUE,
-  registration_id VARCHAR(128) NOT NULL UNIQUE,
+  email           VARCHAR(255) NOT NULL,
+  registration_id VARCHAR(128) NOT NULL,
+  face_descriptor TEXT NULL,
+  face_photo      MEDIUMTEXT NULL,
+  enrolled_at     TIMESTAMP NULL DEFAULT NULL,
   batch_id        BIGINT UNSIGNED NULL,
-  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_students_company_email (company_id, email),
+  UNIQUE KEY uq_students_company_regid (company_id, registration_id)
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS batches (
@@ -27,6 +35,26 @@ CREATE TABLE IF NOT EXISTS batches (
   UNIQUE KEY uq_batches_company_name (company_id, name)
 ) ENGINE=InnoDB;
 
+-- Many-to-many: a student can be enrolled in more than one batch. students.batch_id
+-- above is legacy/unused (kept only so no historical data is lost) — batch membership
+-- is authoritative here.
+CREATE TABLE IF NOT EXISTS student_batches (
+  student_id  VARCHAR(64) NOT NULL,
+  batch_id    BIGINT UNSIGNED NOT NULL,
+  created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (student_id, batch_id),
+  INDEX idx_student_batches_batch (batch_id),
+  CONSTRAINT fk_student_batches_student FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE,
+  CONSTRAINT fk_student_batches_batch FOREIGN KEY (batch_id) REFERENCES batches(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- Company-scoped app settings (branding, exam defaults, UI prefs) as one JSON blob
+CREATE TABLE IF NOT EXISTS app_settings (
+  company_id    INT UNSIGNED NOT NULL PRIMARY KEY,
+  settings_json LONGTEXT NOT NULL,
+  updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
 -- Exams
 CREATE TABLE IF NOT EXISTS exams (
   id                    VARCHAR(64) PRIMARY KEY,
@@ -35,6 +63,7 @@ CREATE TABLE IF NOT EXISTS exams (
   duration_minutes      INT NOT NULL,
   start_time            DATETIME(3) NOT NULL,
   end_time              DATETIME(3) NOT NULL,
+  timezone              VARCHAR(64) NULL,
   question_count        INT NULL,
   shuffle_questions     TINYINT(1) NOT NULL DEFAULT 1,
   show_results          TINYINT(1) NOT NULL DEFAULT 0,
@@ -50,6 +79,8 @@ CREATE TABLE IF NOT EXISTS exams (
   fullscreen_enforced   TINYINT(1) NOT NULL DEFAULT 0,
   tab_switch_limit      INT NOT NULL DEFAULT 3,
   violation_limits_json JSON NULL,
+  allowed_device_types_json JSON NULL,
+  certificate_enabled   TINYINT(1) NOT NULL DEFAULT 0,
 
   -- Notification config
   notification_enabled  TINYINT(1) NOT NULL DEFAULT 0,
@@ -236,6 +267,46 @@ PREPARE violation_limits_stmt FROM @violation_limits_sql;
 EXECUTE violation_limits_stmt;
 DEALLOCATE PREPARE violation_limits_stmt;
 
+-- Ensure timezone exists for existing databases
+SET @exam_timezone_exists = (
+  SELECT COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = 'proctorguard' AND TABLE_NAME = 'exams' AND COLUMN_NAME = 'timezone'
+);
+SET @exam_timezone_sql = IF(@exam_timezone_exists = 0,
+  'ALTER TABLE exams ADD COLUMN timezone VARCHAR(64) NULL AFTER end_time',
+  'SELECT 1'
+);
+PREPARE exam_timezone_stmt FROM @exam_timezone_sql;
+EXECUTE exam_timezone_stmt;
+DEALLOCATE PREPARE exam_timezone_stmt;
+
+-- Ensure allowed_device_types_json exists for existing databases
+SET @allowed_devices_exists = (
+  SELECT COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = 'proctorguard' AND TABLE_NAME = 'exams' AND COLUMN_NAME = 'allowed_device_types_json'
+);
+SET @allowed_devices_sql = IF(@allowed_devices_exists = 0,
+  'ALTER TABLE exams ADD COLUMN allowed_device_types_json JSON NULL',
+  'SELECT 1'
+);
+PREPARE allowed_devices_stmt FROM @allowed_devices_sql;
+EXECUTE allowed_devices_stmt;
+DEALLOCATE PREPARE allowed_devices_stmt;
+
+-- Ensure certificate_enabled exists for existing databases. Certificate issuance is on-demand
+-- only (never automatic on pass) and is gated per-exam by this flag, set on exam creation.
+SET @cert_enabled_exists = (
+  SELECT COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = 'proctorguard' AND TABLE_NAME = 'exams' AND COLUMN_NAME = 'certificate_enabled'
+);
+SET @cert_enabled_sql = IF(@cert_enabled_exists = 0,
+  'ALTER TABLE exams ADD COLUMN certificate_enabled TINYINT(1) NOT NULL DEFAULT 0',
+  'SELECT 1'
+);
+PREPARE cert_enabled_stmt FROM @cert_enabled_sql;
+EXECUTE cert_enabled_stmt;
+DEALLOCATE PREPARE cert_enabled_stmt;
+
 -- Ensure device_fingerprint exists for existing databases
 SET @device_fp_exists = (
   SELECT COUNT(*) FROM information_schema.COLUMNS
@@ -282,11 +353,17 @@ DEALLOCATE PREPARE section_lock_stmt;
 -- Questions
 CREATE TABLE IF NOT EXISTS questions (
   id                    VARCHAR(64) PRIMARY KEY,
-  type                  ENUM('MCQ','TEXT') NOT NULL,
+  -- One of: MCQ, MULTI_SELECT, TRUE_FALSE, YES_NO, SHORT_TEXT, LONG_TEXT, FILL_BLANK,
+  -- NUMERIC, DATE, TIME, MATCHING, ORDERING, DRAG_DROP (legacy: TEXT). Validated in PHP.
+  type                  VARCHAR(32) NOT NULL,
   text                  TEXT NOT NULL,
-  options_json          JSON NULL,
-  correct_option_index  INT NULL,
-  marks                 INT NOT NULL DEFAULT 1
+  options_json          JSON NULL,           -- string[] options for MCQ / MULTI_SELECT
+  correct_option_index  INT NULL,            -- MCQ / TRUE_FALSE / YES_NO
+  answer_key_json       JSON NULL,           -- structured correct-answer spec (see AnswerKey)
+  match_options_json    JSON NULL,           -- left/right/items/buckets for MATCHING/ORDERING/DRAG_DROP
+  marks                 INT NOT NULL DEFAULT 1,
+  negative_marks        DECIMAL(8,2) NOT NULL DEFAULT 0, -- deducted on a wrong auto-graded answer; supports fractions (0.25, 0.5); 0 = off
+  word_limit            INT NULL             -- SHORT_TEXT / LONG_TEXT word cap (NULL = no limit)
 ) ENGINE=InnoDB;
 
 -- Exam <-> Question linkage (with optional ordering)
@@ -356,6 +433,16 @@ CREATE TABLE IF NOT EXISTS exam_batch_assignments (
   INDEX idx_exam_batch_assignments_batch (batch_id)
 ) ENGINE=InnoDB;
 
+-- One row per student who has been sent an access link for an exam. Lets a later send target only
+-- the students assigned since the last invitation, instead of re-mailing candidates mid-exam.
+CREATE TABLE IF NOT EXISTS exam_invitations (
+  exam_id    VARCHAR(64) NOT NULL,
+  student_id VARCHAR(64) NOT NULL,
+  sent_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (exam_id, student_id),
+  INDEX idx_exam_invitations_student (student_id)
+) ENGINE=InnoDB;
+
 -- Exam sessions (attempts)
 CREATE TABLE IF NOT EXISTS exam_sessions (
   id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -375,8 +462,8 @@ CREATE TABLE IF NOT EXISTS exam_sessions (
   location_lat DECIMAL(10,7) NULL,
   location_lng DECIMAL(10,7) NULL,
   location_accuracy_m INT NULL,
-  total_score  INT NULL,
-  max_score    INT NULL,
+  total_score  DECIMAL(8,2) NULL,
+  max_score    DECIMAL(8,2) NULL,
   passed       TINYINT(1) NULL,
   INDEX idx_sessions_exam_student (exam_id, student_id),
   CONSTRAINT fk_sessions_exam
@@ -393,8 +480,9 @@ CREATE TABLE IF NOT EXISTS session_answers (
   question_id          VARCHAR(64) NOT NULL,
   answer_text          TEXT NULL,
   answer_option_index  INT NULL,
+  answer_json          JSON NULL,   -- structured response (arrays/maps) for non-option-index types
   is_correct           TINYINT(1) NULL,
-  awarded_marks        INT NULL,
+  awarded_marks        DECIMAL(8,2) NULL,
   created_at           TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (session_id, question_id),
   CONSTRAINT fk_session_answers_session
@@ -424,8 +512,8 @@ CREATE TABLE IF NOT EXISTS result_audit_logs (
   id                    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   session_id            BIGINT UNSIGNED NOT NULL,
   question_id           VARCHAR(64) NULL,
-  previous_awarded_marks INT NULL,
-  new_awarded_marks     INT NULL,
+  previous_awarded_marks DECIMAL(8,2) NULL,
+  new_awarded_marks     DECIMAL(8,2) NULL,
   previous_is_correct   TINYINT(1) NULL,
   new_is_correct        TINYINT(1) NULL,
   actor                VARCHAR(128) NULL,
@@ -446,7 +534,7 @@ CREATE TABLE IF NOT EXISTS violation_logs (
   company_id    INT NOT NULL DEFAULT 1,
   session_id    BIGINT UNSIGNED NOT NULL,
   occurred_at   DATETIME(3) NOT NULL,
-  type          ENUM('TAB_SWITCH','NO_FACE','MULTIPLE_FACES','GAZE_AWAY','AUDIO_DETECTED','FULLSCREEN_EXIT','COPY_PASTE','PHONE_DETECTED','ANOMALY_OBJECT','LOCATION_CHANGE') NOT NULL,
+  type          ENUM('TAB_SWITCH','NO_FACE','MULTIPLE_FACES','GAZE_AWAY','AUDIO_DETECTED','FULLSCREEN_EXIT','COPY_PASTE','PHONE_DETECTED','ANOMALY_OBJECT','LOCATION_CHANGE','IDENTITY_CHANGE','SUSPICIOUS_BEHAVIOR') NOT NULL,
   category      VARCHAR(32) NULL,
   confidence    DECIMAL(5,4) NULL,
   description   TEXT NOT NULL,
@@ -476,7 +564,7 @@ SET @vlog_exists = (
   WHERE TABLE_SCHEMA = 'proctorguard' AND TABLE_NAME = 'violation_logs' AND COLUMN_NAME = 'type'
 );
 SET @vlog_sql = IF(@vlog_exists = 1,
-  'ALTER TABLE violation_logs MODIFY type ENUM(''TAB_SWITCH'',''NO_FACE'',''MULTIPLE_FACES'',''GAZE_AWAY'',''AUDIO_DETECTED'',''FULLSCREEN_EXIT'',''COPY_PASTE'',''PHONE_DETECTED'',''ANOMALY_OBJECT'',''LOCATION_CHANGE'') NOT NULL',
+  'ALTER TABLE violation_logs MODIFY type ENUM(''TAB_SWITCH'',''NO_FACE'',''MULTIPLE_FACES'',''GAZE_AWAY'',''AUDIO_DETECTED'',''FULLSCREEN_EXIT'',''COPY_PASTE'',''PHONE_DETECTED'',''ANOMALY_OBJECT'',''LOCATION_CHANGE'',''IDENTITY_CHANGE'',''SUSPICIOUS_BEHAVIOR'') NOT NULL',
   'SELECT 1'
 );
 PREPARE vlog_stmt FROM @vlog_sql;
@@ -1058,7 +1146,7 @@ CREATE PROCEDURE sp_add_violation(
   IN p_company_id INT,
   IN p_exam_id VARCHAR(64),
   IN p_student_id VARCHAR(64),
-  IN p_type ENUM('TAB_SWITCH','NO_FACE','MULTIPLE_FACES','GAZE_AWAY','AUDIO_DETECTED','FULLSCREEN_EXIT','COPY_PASTE','PHONE_DETECTED','ANOMALY_OBJECT','LOCATION_CHANGE'),
+  IN p_type ENUM('TAB_SWITCH','NO_FACE','MULTIPLE_FACES','GAZE_AWAY','AUDIO_DETECTED','FULLSCREEN_EXIT','COPY_PASTE','PHONE_DETECTED','ANOMALY_OBJECT','LOCATION_CHANGE','IDENTITY_CHANGE','SUSPICIOUS_BEHAVIOR'),
   IN p_description TEXT,
   IN p_snapshot LONGTEXT
 )

@@ -9,9 +9,11 @@ import {
   PlatformStudentReportRow,
 } from '../../types';
 import { apiGet, apiPost } from '../../services/api';
+import { Pagination, usePagination } from './Pagination';
 
 interface PlatformReportResponse {
   overview: PlatformOverview;
+  dateFilter: { from: string; to: string } | null;
   companyRows: PlatformCompanyRollup[];
   examRows: PlatformExamReportRow[];
   batchRows: PlatformBatchReportRow[];
@@ -55,6 +57,9 @@ export const SuperAdminControl: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [selectedCompanyId, setSelectedCompanyId] = useState<number | 'ALL'>('ALL');
+  const [dateFilter, setDateFilter] = useState<{ from: string; to: string } | null>(null);
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate] = useState('');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [companyForm, setCompanyForm] = useState({
@@ -77,13 +82,18 @@ export const SuperAdminControl: React.FC = () => {
     }
   };
 
-  const loadReports = async () => {
+  const loadReports = async (from = fromDate, to = toDate) => {
     setLoading(true);
     setError('');
     try {
-      const query = selectedCompanyId === 'ALL' ? '' : `?companyId=${selectedCompanyId}`;
-      const result = await apiGet<PlatformReportResponse>(`platform_reports.php${query}`);
+      const params = new URLSearchParams();
+      if (selectedCompanyId !== 'ALL') params.set('companyId', String(selectedCompanyId));
+      if (from) params.set('from', from);
+      if (to) params.set('to', to);
+      const query = params.toString();
+      const result = await apiGet<PlatformReportResponse>(`platform_reports.php${query ? `?${query}` : ''}`);
       setOverview(result?.overview || emptyOverview);
+      setDateFilter(result?.dateFilter || null);
       setCompanyRows(result?.companyRows || []);
       setExamRows(result?.examRows || []);
       setBatchRows(result?.batchRows || []);
@@ -102,7 +112,18 @@ export const SuperAdminControl: React.FC = () => {
 
   useEffect(() => {
     loadReports();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedCompanyId]);
+
+  const handleApplyDateFilter = () => {
+    loadReports(fromDate, toDate);
+  };
+
+  const handleClearDateFilter = () => {
+    setFromDate('');
+    setToDate('');
+    loadReports('', '');
+  };
 
   const handleCreateCompany = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -145,11 +166,11 @@ export const SuperAdminControl: React.FC = () => {
       <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <h2 className="lsc-title flex items-center gap-2">
-            <Shield size={20} className="text-[#3558ff]" /> Super Admin Control Center
+            <Shield size={20} className="text-[var(--lsc-primary)]" /> Super Admin Control Center
           </h2>
           <p className="lsc-subtitle mt-1">Global tenant governance, cross-company analytics, and platform-wide reporting.</p>
         </div>
-        <div className="flex flex-wrap gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <select
             value={selectedCompanyId}
             onChange={e => setSelectedCompanyId(e.target.value === 'ALL' ? 'ALL' : Number(e.target.value))}
@@ -160,8 +181,42 @@ export const SuperAdminControl: React.FC = () => {
               <option key={company.id} value={company.id}>{company.name}</option>
             ))}
           </select>
+          <div className="flex items-center gap-1.5">
+            <label className="text-[11px] font-medium text-slate-500">From</label>
+            <input
+              type="date"
+              value={fromDate}
+              max={toDate || undefined}
+              onChange={e => setFromDate(e.target.value)}
+              className="px-2.5 py-2 border border-slate-200 rounded-xl text-xs outline-none bg-white"
+            />
+            <label className="text-[11px] font-medium text-slate-500">To</label>
+            <input
+              type="date"
+              value={toDate}
+              min={fromDate || undefined}
+              onChange={e => setToDate(e.target.value)}
+              className="px-2.5 py-2 border border-slate-200 rounded-xl text-xs outline-none bg-white"
+            />
+          </div>
           <button
-            onClick={() => downloadCsv('exam-report.csv', examRows)}
+            onClick={handleApplyDateFilter}
+            disabled={loading || (!fromDate && !toDate)}
+            className="px-3 py-2.5 rounded-xl border border-[var(--lsc-primary-50)] bg-[var(--lsc-primary-50)] text-xs font-semibold text-[var(--lsc-primary-700)] hover:bg-[var(--lsc-primary-50)]/70 disabled:opacity-50"
+          >
+            Apply
+          </button>
+          {(fromDate || toDate) && (
+            <button
+              onClick={handleClearDateFilter}
+              disabled={loading}
+              className="px-3 py-2.5 rounded-xl border border-slate-200 text-xs font-semibold text-slate-500 hover:bg-slate-50 disabled:opacity-50"
+            >
+              Clear
+            </button>
+          )}
+          <button
+            onClick={() => downloadCsv('exam-report.csv', examRows as unknown as Array<Record<string, unknown>>)}
             className="px-4 py-2.5 rounded-xl border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2"
           >
             <Download size={15} /> Export Exam Report
@@ -171,19 +226,24 @@ export const SuperAdminControl: React.FC = () => {
 
       {message && <div className="text-sm text-emerald-700 bg-emerald-50 border border-emerald-100 rounded-xl px-4 py-3">{message}</div>}
       {error && <div className="text-sm text-rose-700 bg-rose-50 border border-rose-100 rounded-xl px-4 py-3">{error}</div>}
+      {dateFilter && (
+        <div className="text-xs text-slate-500">
+          Showing exams and students with activity from <strong>{dateFilter.from}</strong> to <strong>{dateFilter.to}</strong>.
+        </div>
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
-        <MetricCard title="Companies" value={overview.companyCount} accent="text-[#3558ff]" icon={<Building2 size={18} />} />
-        <MetricCard title="Platform Users" value={overview.platformUserCount} accent="text-[#0f9f8c]" icon={<Users size={18} />} />
-        <MetricCard title="Live Sessions" value={overview.liveSessionCount} accent="text-[#d94f34]" icon={<Globe2 size={18} />} />
-        <MetricCard title="Violations" value={overview.violationCount} accent="text-[#c98911]" icon={<Shield size={18} />} />
+        <MetricCard title="Companies" value={overview.companyCount} accent="text-[var(--lsc-primary)]" icon={<Building2 size={18} />} />
+        <MetricCard title="Platform Users" value={overview.platformUserCount} accent="text-[#1e8e3e]" icon={<Users size={18} />} />
+        <MetricCard title="Live Sessions" value={overview.liveSessionCount} accent="text-[#d93025]" icon={<Globe2 size={18} />} />
+        <MetricCard title="Violations" value={overview.violationCount} accent="text-[#e37400]" icon={<Shield size={18} />} />
         <MetricCard title="Pending Requests" value={overview.pendingRequestCount} accent="text-[#7c3aed]" icon={<FileBarChart2 size={18} />} />
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-[1.05fr,1.95fr] gap-6">
         <div className="lsc-panel p-6">
           <div className="flex items-center gap-2 mb-4">
-            <Building2 size={18} className="text-[#3558ff]" />
+            <Building2 size={18} className="text-[var(--lsc-primary)]" />
             <h3 className="text-lg font-semibold text-slate-900">Create Company</h3>
           </div>
           <form onSubmit={handleCreateCompany} className="space-y-4">
@@ -343,41 +403,51 @@ const Stat = ({ label, value }: { label: string; value: number }) => (
   </div>
 );
 
-const ReportTable = ({ title, rows, onDownload }: { title: string; rows: Array<Record<string, unknown>>; onDownload: () => void }) => (
-  <div className="lsc-panel overflow-hidden">
-    <div className="p-4 lsc-panel-header border-b border-slate-200/70 flex items-center justify-between gap-3">
-      <div>
-        <div className="font-semibold text-slate-900">{title}</div>
-        <div className="text-xs text-slate-500 mt-1">Filtered export-ready summary</div>
+const REPORT_TABLE_PAGE_SIZE = 8;
+
+const ReportTable = ({ title, rows, onDownload }: { title: string; rows: Array<Record<string, unknown>>; onDownload: () => void }) => {
+  // Report tables sit several to a screen, so they keep a small fixed page size rather than following
+  // the global "Rows per page" preference.
+  const paging = usePagination(rows, title, REPORT_TABLE_PAGE_SIZE);
+
+  return (
+    <div className="lsc-panel overflow-hidden">
+      <div className="p-4 lsc-panel-header border-b border-slate-200/70 flex items-center justify-between gap-3">
+        <div>
+          <div className="font-semibold text-slate-900">{title}</div>
+          <div className="text-xs text-slate-500 mt-1">{rows.length} row{rows.length === 1 ? '' : 's'} for the current filter</div>
+        </div>
+        <button onClick={onDownload} className="text-xs px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 flex items-center gap-2">
+          <Download size={14} /> CSV
+        </button>
       </div>
-      <button onClick={onDownload} className="text-xs px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 flex items-center gap-2">
-        <Download size={14} /> CSV
-      </button>
-    </div>
-    <div className="overflow-x-auto">
-      <table className="w-full text-sm">
-        <thead className="bg-white border-b border-slate-200 text-xs uppercase tracking-[0.16em] text-slate-400">
-          <tr>
-            {rows[0] ? Object.keys(rows[0]).map(key => <th key={key} className="px-4 py-3 text-left">{key}</th>) : <th className="px-4 py-3 text-left">No Data</th>}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.length === 0 && (
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-white border-b border-slate-200 text-xs uppercase tracking-[0.16em] text-slate-400">
             <tr>
-              <td className="px-4 py-8 text-slate-400">No report rows for the current filter.</td>
+              {rows[0] ? Object.keys(rows[0]).map(key => <th key={key} className="px-4 py-3 text-left">{key}</th>) : <th className="px-4 py-3 text-left">No Data</th>}
             </tr>
-          )}
-          {rows.slice(0, 8).map((row, index) => (
-            <tr key={`${title}-${index}`} className="border-b border-slate-100 last:border-b-0">
-              {Object.values(row).map((value, cellIndex) => (
-                <td key={`${title}-${index}-${cellIndex}`} className="px-4 py-3 text-slate-700">
-                  {String(value)}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr>
+                <td className="px-4 py-8 text-slate-400">No report rows for the current filter.</td>
+              </tr>
+            )}
+            {paging.pageItems.map((row, index) => (
+              <tr key={`${title}-${paging.page}-${index}`} className="border-b border-slate-100 last:border-b-0">
+                {Object.values(row).map((value, cellIndex) => (
+                  <td key={`${title}-${paging.page}-${index}-${cellIndex}`} className="px-4 py-3 text-slate-700">
+                    {String(value)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <Pagination state={paging} label="rows" hidePageSize />
     </div>
-  </div>
-);
+  );
+};
+

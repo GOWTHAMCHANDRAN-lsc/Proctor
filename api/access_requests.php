@@ -121,6 +121,7 @@ try {
 }
 
 if ($method === 'GET') {
+    require_staff();
     $companyId = require_company_id();
     if (!$accessRequestSchemaReady) {
         json_response(['requests' => []]);
@@ -344,7 +345,7 @@ if ($method === 'POST') {
         if (($request['request_type'] ?? '') === 'DEVICE_CHANGE' && $actorRole !== 'SUPER_ADMIN') {
             json_response(['error' => 'Only super admin can review device change requests.'], 403);
         }
-        if (($request['request_type'] ?? '') !== 'DEVICE_CHANGE' && !in_array($actorRole, ['SUPER_ADMIN', 'ADMIN'], true)) {
+        if (($request['request_type'] ?? '') !== 'DEVICE_CHANGE' && !in_array($actorRole, ['SUPER_ADMIN', 'ADMIN', 'PROCTOR'], true)) {
             json_response(['error' => 'Only admin roles can review this request.'], 403);
         }
 

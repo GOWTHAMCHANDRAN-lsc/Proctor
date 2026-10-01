@@ -63,6 +63,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel
@@ -219,10 +220,22 @@ RISK_WEIGHT_PATTERN_MEDIUM = 14.0
 app = FastAPI(title="ProctorGuard AI", version="7.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[o.strip() for o in os.getenv("PG_AI_CORS_ORIGINS", "https://proctor.lsc-crm.in").split(",") if o.strip()],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
+
+# Only the inference endpoints are served. The ported business API below trusts X-User-Role /
+# X-Company-Id headers with no session-token check, so it must never be reachable - it stays
+# unmounted unless explicitly enabled, and this guard rejects every other path regardless.
+_PUBLIC_AI_PATHS = {"/health", "/analyze", "/enroll", "/verify"}
+
+
+@app.middleware("http")
+async def _only_inference_paths(request: Request, call_next):  # noqa: ANN001
+    if request.url.path not in _PUBLIC_AI_PATHS:
+        return JSONResponse({"error": "Not found."}, status_code=404)
+    return await call_next(request)
 
 # ── Business API (Python port of api/*.php) ──────────────────────────────────
 # Ported endpoints keep the exact request/response contract of their PHP originals
@@ -251,10 +264,10 @@ from business import (
     violations as _biz_violations,
 )
 
-for _mod in (_biz_violations, _biz_settings, _biz_enrollment, _biz_deliveries,
+for _mod in (() if os.getenv("PG_ENABLE_BUSINESS_API") != "1" else (_biz_violations, _biz_settings, _biz_enrollment, _biz_deliveries,
              _biz_audit, _biz_templates, _biz_feedback, _biz_batches, _biz_companies,
              _biz_students, _biz_notify, _biz_users, _biz_results, _biz_recordings,
-             _biz_reports, _biz_live, _biz_access_requests, _biz_exams, _biz_sessions):
+             _biz_reports, _biz_live, _biz_access_requests, _biz_exams, _biz_sessions)):
     app.include_router(_mod.router)
 
 

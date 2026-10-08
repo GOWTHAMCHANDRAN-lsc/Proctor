@@ -2,6 +2,7 @@
 declare(strict_types=1);
 
 require __DIR__ . '/_bootstrap.php';
+require_once __DIR__ . '/exam_mail_render.php';
 
 function ms_to_datetime(?int $ms): ?string {
     if ($ms === null) return null;
@@ -138,12 +139,141 @@ function ensure_exam_mail_template_schema(PDO $pdo): void {
       kind       ENUM('INVITE','REMINDER') NOT NULL,
       subject    VARCHAR(255) NOT NULL DEFAULT '',
       message    TEXT NULL,
+      options_json JSON NULL,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (exam_id, kind),
       CONSTRAINT fk_exam_mail_templates_exam
         FOREIGN KEY (exam_id) REFERENCES exams(id)
         ON DELETE CASCADE
     ) ENGINE=InnoDB");
+    // Per-exam email design (header title, button text, accent colour, block switches, closing note)
+    // from the exam editor's Emails section. NULL = the built-in design.
+    db_add_column_if_missing($pdo, 'exam_mail_templates', 'options_json', 'JSON NULL AFTER message');
+}
+
+/**
+ * Fresh check for options_json, made once per request AFTER ensure_exam_mail_template_schema(). Not
+ * db_column_exists(): that caches the "missing" answer it gave db_add_column_if_missing(), so on the
+ * request that added the column it would still say false.
+ */
+function exam_mail_options_ready(PDO $pdo): bool {
+    static $ready = null;
+    if ($ready !== null) {
+        return $ready;
+    }
+    try {
+        $stmt = $pdo->query("SHOW COLUMNS FROM exam_mail_templates LIKE 'options_json'");
+        $ready = (bool)$stmt->fetch();
+        $stmt->closeCursor();
+    } catch (Throwable $e) {
+        $ready = false;
+    }
+    return $ready;
+}
+
+/** Decode a stored options_json value into a normalised options array ([] when none / unreadable). */
+function exam_mail_decode_options($raw): array {
+    if ($raw === null || $raw === '') return [];
+    $decoded = json_decode((string)$raw, true);
+    if (!is_array($decoded)) return [];
+    return exam_mail_normalize_options($decoded) ?? [];
+}
+
+/** Stored templates of one exam as the API shape: [kind => {subject, message, options}] (object when empty). */
+function fetch_exam_mail_templates(PDO $pdo, string $examId) {
+    $cols = exam_mail_options_ready($pdo) ? 'kind, subject, message, options_json' : 'kind, subject, message';
+    $stmt = $pdo->prepare("SELECT {$cols} FROM exam_mail_templates WHERE exam_id = ?");
+    $stmt->execute([$examId]);
+    $out = [];
+    foreach ($stmt->fetchAll() as $row) {
+        $out[(string)$row['kind']] = exam_mail_template_payload($row);
+    }
+    $stmt->closeCursor();
+    return $out ?: new stdClass();
+}
+
+/** One exam_mail_templates row → {subject, message, options}; options is always an object. */
+function exam_mail_template_payload(array $row): array {
+    $options = exam_mail_decode_options($row['options_json'] ?? null);
+    return [
+        'subject' => (string)($row['subject'] ?? ''),
+        'message' => (string)($row['message'] ?? ''),
+        'options' => $options ?: new stdClass(),
+    ];
+}
+
+/**
+ * Validate one posted template ({subject, message, options?}) into what gets stored. `options`
+ * absent = keep the stored design ($hasOptions false). Returns null and sets $error when invalid.
+ */
+function exam_mail_validate_template($raw, ?string &$error = null): ?array {
+    $error = null;
+    $raw = is_object($raw) ? (array)$raw : $raw;
+    if (!is_array($raw)) {
+        $error = 'Each mail template must be an object.';
+        return null;
+    }
+    foreach (['subject', 'message'] as $field) {
+        if (array_key_exists($field, $raw) && $raw[$field] !== null && !is_string($raw[$field])) {
+            $error = "{$field} must be text.";
+            return null;
+        }
+    }
+    $hasOptions = array_key_exists('options', $raw);
+    $options = [];
+    if ($hasOptions) {
+        $options = exam_mail_normalize_options($raw['options'], $optionsError);
+        if ($options === null) {
+            $error = (string)$optionsError;
+            return null;
+        }
+    }
+    return [
+        'subject' => mb_substr(trim((string)($raw['subject'] ?? '')), 0, EXAM_MAIL_LIMITS['subject']),
+        'message' => mb_substr((string)($raw['message'] ?? ''), 0, EXAM_MAIL_LIMITS['message']),
+        'hasOptions' => $hasOptions,
+        'options' => $options,
+    ];
+}
+
+/**
+ * Upsert (or clear) one exam's template for one kind. An empty subject + message + design clears the
+ * override, so the built-in email applies again; options not posted keep the stored design. Returns
+ * the stored template payload, or null when the override was cleared.
+ */
+function save_exam_mail_template(PDO $pdo, string $examId, string $kind, array $tpl): ?array {
+    $optionsReady = exam_mail_options_ready($pdo);
+    $options = $tpl['options'];
+    if (!$tpl['hasOptions'] && $optionsReady) {
+        $curStmt = $pdo->prepare('SELECT options_json FROM exam_mail_templates WHERE exam_id = ? AND kind = ? LIMIT 1');
+        $curStmt->execute([$examId, $kind]);
+        $cur = $curStmt->fetch();
+        $curStmt->closeCursor();
+        $options = $cur ? exam_mail_decode_options($cur['options_json'] ?? null) : [];
+    }
+
+    if ($tpl['subject'] === '' && trim($tpl['message']) === '' && count($options) === 0) {
+        $delStmt = $pdo->prepare('DELETE FROM exam_mail_templates WHERE exam_id = ? AND kind = ?');
+        $delStmt->execute([$examId, $kind]);
+        $delStmt->closeCursor();
+        return null;
+    }
+
+    if ($optionsReady) {
+        $optionsJson = count($options) > 0 ? json_encode($options, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null;
+        $saveStmt = $pdo->prepare('INSERT INTO exam_mail_templates (exam_id, kind, subject, message, options_json)
+                                   VALUES (?, ?, ?, ?, ?)
+                                   ON DUPLICATE KEY UPDATE subject = VALUES(subject), message = VALUES(message), options_json = VALUES(options_json)');
+        $saveStmt->execute([$examId, $kind, $tpl['subject'], $tpl['message'], $optionsJson]);
+    } else {
+        $saveStmt = $pdo->prepare('INSERT INTO exam_mail_templates (exam_id, kind, subject, message)
+                                   VALUES (?, ?, ?, ?)
+                                   ON DUPLICATE KEY UPDATE subject = VALUES(subject), message = VALUES(message)');
+        $saveStmt->execute([$examId, $kind, $tpl['subject'], $tpl['message']]);
+        $options = [];
+    }
+    $saveStmt->closeCursor();
+    return ['subject' => $tpl['subject'], 'message' => $tpl['message'], 'options' => $options ?: new stdClass()];
 }
 
 function fetch_assigned_batch_ids(PDO $pdo, string $examId): array {
@@ -653,19 +783,17 @@ if ($method === 'GET') {
     }
     $notAttemptedStmt->closeCursor();
 
-    // Per-exam mail overrides composed in the Mail Composer. Absent kinds fall back to the built-in
-    // default body on the client.
-    $tplStmt = $pdo->prepare('SELECT t.exam_id, t.kind, t.subject, t.message
+    // Per-exam mail overrides (exam editor Emails section / Mail Composer): {subject, message, options}.
+    // Absent kinds fall back to the built-in email on the client.
+    $tplCols = exam_mail_options_ready($pdo) ? 't.exam_id, t.kind, t.subject, t.message, t.options_json' : 't.exam_id, t.kind, t.subject, t.message';
+    $tplStmt = $pdo->prepare("SELECT {$tplCols}
                               FROM exam_mail_templates t
                               JOIN exams e ON e.id = t.exam_id
-                              WHERE e.company_id = ?');
+                              WHERE e.company_id = ?");
     $tplStmt->execute([$companyId]);
     $mailTemplates = [];
     foreach ($tplStmt->fetchAll() as $tplRow) {
-        $mailTemplates[(string)$tplRow['exam_id']][(string)$tplRow['kind']] = [
-            'subject' => (string)($tplRow['subject'] ?? ''),
-            'message' => (string)($tplRow['message'] ?? ''),
-        ];
+        $mailTemplates[(string)$tplRow['exam_id']][(string)$tplRow['kind']] = exam_mail_template_payload($tplRow);
     }
     $tplStmt->closeCursor();
 
@@ -688,16 +816,23 @@ if ($method === 'POST') {
     if (isset($payload['action'])) {
         $action = strtoupper(trim((string)$payload['action']));
         if ($action === 'SAVE_MAIL_TEMPLATE') {
-            // Persist the subject/message an admin composed for this exam so the next send (and the
-            // next admin) starts from it instead of the built-in default. An empty subject AND message
-            // clears the override and restores the default body.
+            // Persist the subject/message (and, when posted, the design `options`) an admin set for
+            // this exam so the next send (and the next admin) starts from it instead of the built-in
+            // default. `options` absent keeps the stored design (the Mail Composer edits text only).
+            // An empty subject, message AND design clears the override and restores the default.
             $examId = trim((string)($payload['examId'] ?? ''));
             $kind = strtoupper(trim((string)($payload['kind'] ?? '')));
-            $subject = trim((string)($payload['subject'] ?? ''));
-            $message = (string)($payload['message'] ?? '');
 
             if ($examId === '' || !in_array($kind, ['INVITE', 'REMINDER'], true)) {
                 json_response(['error' => 'examId and a valid kind (INVITE|REMINDER) are required.'], 400);
+            }
+            $tplInput = ['subject' => $payload['subject'] ?? '', 'message' => $payload['message'] ?? ''];
+            if (array_key_exists('options', $payload)) {
+                $tplInput['options'] = $payload['options'];
+            }
+            $tpl = exam_mail_validate_template($tplInput, $tplError);
+            if ($tpl === null) {
+                json_response(['error' => $tplError], 400);
             }
 
             if (get_actor_role($payload) === 'SUPER_ADMIN') {
@@ -713,20 +848,11 @@ if ($method === 'POST') {
                 json_response(['error' => 'Exam not found.'], 404);
             }
 
-            if ($subject === '' && trim($message) === '') {
-                $delStmt = $pdo->prepare('DELETE FROM exam_mail_templates WHERE exam_id = ? AND kind = ?');
-                $delStmt->execute([$examId, $kind]);
-                $delStmt->closeCursor();
+            $stored = save_exam_mail_template($pdo, $examId, $kind, $tpl);
+            if ($stored === null) {
                 json_response(['ok' => true, 'cleared' => true]);
             }
-
-            $saveStmt = $pdo->prepare('INSERT INTO exam_mail_templates (exam_id, kind, subject, message)
-                                       VALUES (?, ?, ?, ?)
-                                       ON DUPLICATE KEY UPDATE subject = VALUES(subject), message = VALUES(message)');
-            $saveStmt->execute([$examId, $kind, mb_substr($subject, 0, 255), $message]);
-            $saveStmt->closeCursor();
-
-            json_response(['ok' => true, 'template' => ['kind' => $kind, 'subject' => $subject, 'message' => $message]]);
+            json_response(['ok' => true, 'template' => ['kind' => $kind] + $stored]);
         }
 
         if ($action === 'MARK_INVITED') {
@@ -1118,6 +1244,26 @@ if ($method === 'POST') {
         }
     }
 
+    // Per-exam emails edited in the exam editor's Emails section, saved with the exam (so a brand-new
+    // exam's emails can be set before its first save). Only kinds present in the payload are touched;
+    // an empty kind ({subject:'', message:'', options:{}}) clears that override. Validated up front so
+    // a bad colour rejects the whole save before anything is written.
+    $mailTemplatesInput = [];
+    if (array_key_exists('mailTemplates', $exam) && $exam['mailTemplates'] !== null) {
+        $rawTemplates = is_object($exam['mailTemplates']) ? (array)$exam['mailTemplates'] : $exam['mailTemplates'];
+        if (!is_array($rawTemplates) || ($rawTemplates !== [] && array_is_list($rawTemplates))) {
+            json_response(['error' => 'mailTemplates must be an object keyed by INVITE / REMINDER.'], 400);
+        }
+        foreach (['INVITE', 'REMINDER'] as $mailKind) {
+            if (!array_key_exists($mailKind, $rawTemplates) || $rawTemplates[$mailKind] === null) continue;
+            $validated = exam_mail_validate_template($rawTemplates[$mailKind], $tplError);
+            if ($validated === null) {
+                json_response(['error' => "mailTemplates.{$mailKind}: {$tplError}"], 400);
+            }
+            $mailTemplatesInput[$mailKind] = $validated;
+        }
+    }
+
     try {
         $pdo->beginTransaction();
 
@@ -1345,6 +1491,10 @@ if ($method === 'POST') {
             }
         }
 
+        foreach ($mailTemplatesInput as $mailKind => $mailTemplate) {
+            save_exam_mail_template($pdo, (string)$id, $mailKind, $mailTemplate);
+        }
+
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) {
@@ -1369,10 +1519,13 @@ if ($method === 'POST') {
             'assignedBatchCount' => count($assignedBatchIds),
             'proctoringMode' => $proctoringMode,
             'bankQuestionCount' => count($bankOwnedIds),
+            'mailTemplateKinds' => array_keys($mailTemplatesInput),
         ]
     ]);
 
     $exam['id'] = $id;
+    // Echo the templates as stored (normalised, cleared kinds gone), not whatever the client sent.
+    $exam['mailTemplates'] = fetch_exam_mail_templates($pdo, (string)$id);
     $exam['assignedStudentIds'] = is_array($assignedIds) ? array_values(array_unique($assignedIds)) : [];
     $exam['assignedBatchIds'] = $assignedBatchIds;
     $exam['allowedDeviceTypes'] = $allowedDevices;

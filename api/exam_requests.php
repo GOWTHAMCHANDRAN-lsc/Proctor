@@ -25,6 +25,8 @@ require_once __DIR__ . '/notify.php';
 // WhatsApp copies of the invitation and of the requester's status emails. Guarded like notify.php
 // (requiring it only defines functions); every send is a no-op until WhatsApp is configured in .env.
 require_once __DIR__ . '/whatsapp.php';
+// Per-exam invitation email (the same HTML the admin console previews and sends).
+require_once __DIR__ . '/exam_mail_render.php';
 
 const ER_CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'; // no 0/O/1/I/L
 const ER_MAX_STUDENTS = 2000;
@@ -1141,6 +1143,7 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
         $result['error'] = 'Exam not found.';
         return $result;
     }
+    $mailExam = exam_mail_exam_by_id($pdo, $examId);
     $cfg = er_smtp_config($env);
     $countRemaining = static function (string $cursor) use ($pdo, $examId): int {
         return db_scalar_int($pdo, 'SELECT COUNT(*) FROM exam_assignments ea
@@ -1196,7 +1199,13 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
             }
             // Short "/x/<code>" link (falls back to the long signed ?token= link if a code can't be made).
             $link = exam_access_link($pdo, $origin, $examId, $studentId, $studentCompany);
-            [$subject, $html] = er_invitation_email($exam, $companyNames[$studentCompany], $fullName, $link);
+            if ($mailExam !== null) {
+                // Same per-exam invitation (incl. any template the admin customised) as console sends.
+                $rendered = exam_mail_render($mailExam, $fullName, $link, 'INVITE');
+                [$subject, $html] = [$rendered['subject'], $rendered['html']];
+            } else {
+                [$subject, $html] = er_invitation_email($exam, $companyNames[$studentCompany], $fullName, $link);
+            }
 
             if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
                 add_delivery_log($pdo, $studentCompany, 'EMAIL', $email, $subject, $html, 'FAILED', 'Invalid recipient email address.');

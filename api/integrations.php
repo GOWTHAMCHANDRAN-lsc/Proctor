@@ -8,6 +8,8 @@ require_once __DIR__ . '/_bootstrap.php';
 // Reused for smtp_send()/smtp_open()/smtp_deliver(): the $isIncluded guard inside notify.php means
 // requiring it from here only defines those functions — it does not run notify.php's own HTTP handler.
 require_once __DIR__ . '/notify.php';
+// Per-exam invitation email, used when the admin customised this exam's invitation.
+require_once __DIR__ . '/exam_mail_render.php';
 // WhatsApp copy of the invitation (whatsapp_send_invite_for_student). Same $isIncluded-style guard:
 // requiring it only defines the functions. A no-op until WhatsApp is configured in .env.
 require_once __DIR__ . '/whatsapp.php';
@@ -301,6 +303,17 @@ function send_exam_invitation_locked(PDO $pdo, array $env, int $companyId, array
 </div>
 </body></html>
 HTML;
+
+    // An exam whose invitation was customised (Exams → edit → Emails) sends that design here too, so
+    // LMS-triggered invitations match the console's. Otherwise keep the course-completion copy above.
+    if (exam_mail_load_template($pdo, (string)$exam['id'], 'INVITE') !== null) {
+        $mailExam = exam_mail_exam_by_id($pdo, (string)$exam['id']);
+        if ($mailExam !== null) {
+            $rendered = exam_mail_render($mailExam, $fullName !== '' ? $fullName : $email, $link, 'INVITE');
+            $subject = $rendered['subject'];
+            $body = $rendered['html'];
+        }
+    }
 
     $smtpHost = $env['SMTP_HOST'] ?? '';
     $smtpPort = (int)($env['SMTP_PORT'] ?? 0);

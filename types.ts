@@ -137,6 +137,15 @@ export interface Exam {
   // Which device classes may take this exam. Empty/undefined means all devices allowed.
   allowedDeviceTypes?: DeviceType[];
   proctoringConfig: {
+    /**
+     * PROCTORED (default) runs the checks below. UNPROCTORED switches ALL monitoring off: no camera,
+     * microphone, screen recording, fullscreen, tab-switch / copy-paste tracking or AI analysis.
+     */
+    mode?: ProctoringMode;
+    /** Show violation alerts to the candidate (default true). When false, violations are still recorded silently. */
+    showAlerts?: boolean;
+    /** End the attempt when a violation limit is reached (default true). When false, limits only flag the attempt. */
+    autoTerminate?: boolean;
     cameraRequired: boolean;
     microphoneRequired: boolean;
     fullScreenEnforced: boolean;
@@ -164,6 +173,90 @@ export interface Exam {
   // built-in default body is used for that mail.
   mailTemplates?: Partial<Record<ExamMailKind, ExamMailTemplate>>;
   notificationConfig?: NotificationConfig;
+}
+
+export type ProctoringMode = 'PROCTORED' | 'UNPROCTORED';
+
+/** A reusable, company-owned collection of questions (Question Bank tab). */
+export interface QuestionBank {
+  id: number;
+  companyId: number;
+  name: string;
+  description?: string | null;
+  questionCount: number;
+  /** Exams that use at least one question from this bank. */
+  examCount: number;
+  createdBy?: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface QuestionBankDetail extends QuestionBank {
+  questions: Question[];
+}
+
+export type ExamRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'INVALID';
+
+export interface ExamRequestStudent {
+  fullName: string;
+  email: string;
+  registrationId: string;
+}
+
+/** The exam an employee asked for by email (editable by the super admin before approval). */
+export interface ExamRequestDetails {
+  title: string;
+  questionBankId: number | null;
+  questionBankName: string;
+  /** Questions each candidate gets, drawn at random from the bank. 0 = the whole bank. */
+  questionCount: number;
+  durationMinutes: number;
+  passPercent: number;
+  startTime: number | null; // UTC ms
+  endTime: number | null;   // UTC ms
+  timezone: string;         // IANA zone the Start/End were written in
+  proctoringMode: ProctoringMode;
+  cameraRequired: boolean;
+  microphoneRequired: boolean;
+  showAlerts: boolean;
+  autoTerminate: boolean;
+  /** Existing batch to invite, when the email named one instead of attaching a student CSV. */
+  batchName: string | null;
+  notes: string;
+}
+
+export interface ExamRequest {
+  id: number;
+  companyId: number | null;
+  companyName?: string | null;
+  requesterId: number | null;
+  requesterName?: string | null;
+  senderEmail: string;
+  subject: string;
+  status: ExamRequestStatus;
+  details: ExamRequestDetails;
+  students: ExamRequestStudent[];
+  /** Validation problems found at intake (an INVALID request) or that still block approval. */
+  errors: string[];
+  receivedAt: number;
+  reviewedBy?: string | null;
+  reviewedAt?: number | null;
+  reviewNote?: string | null;
+  createdExamId?: string | null;
+}
+
+/** An employee allowed to request exams by email, with their own security code. */
+export interface ExamRequester {
+  id: number;
+  companyId: number;
+  companyName?: string | null;
+  name: string;
+  email: string;
+  status: 'ACTIVE' | 'DISABLED';
+  /** Last 4 characters of the code, for recognising which code an employee holds. */
+  codeHint?: string | null;
+  createdAt: number;
+  lastRequestAt?: number | null;
 }
 
 export type ExamMailKind = 'INVITE' | 'REMINDER';

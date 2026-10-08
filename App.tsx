@@ -10,6 +10,8 @@ import { LiveProctoring } from './components/admin/LiveProctoring';
 import { Integrations } from './components/admin/Integrations';
 import { Certificates } from './components/admin/Certificates';
 import { Communications } from './components/admin/Communications';
+import { QuestionBank } from './components/admin/QuestionBank';
+import { ExamRequests } from './components/admin/ExamRequests';
 import { Results } from './components/admin/Results';
 import { ActivityLogs } from './components/admin/ActivityLogs';
 import { UserDirectory } from './components/admin/UserDirectory';
@@ -828,6 +830,8 @@ const AdminAppInner: React.FC = () => {
       {isFullAdmin && currentView === 'integrations' && <Integrations role={adminRole} />}
       {isFullAdmin && currentView === 'certificates' && <Certificates role={adminRole} />}
       {isFullAdmin && currentView === 'communications' && <Communications />}
+      {isFullAdmin && currentView === 'question-bank' && <QuestionBank role={adminRole} />}
+      {adminRole === UserRole.SUPER_ADMIN && currentView === 'exam-requests' && <ExamRequests />}
       {adminRole !== UserRole.VIEWER && currentView === 'live' && (
         <LiveProctoring exams={exams} students={students} />
       )}

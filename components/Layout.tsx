@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { CompanyDirectoryRecord, UserRole } from '../types';
-import { ShieldCheck, ShieldAlert, UserCog, LogOut, LayoutDashboard, FileText, Users, AlertTriangle, Radio, ClipboardList, Activity, Menu, X, Film, Building2, Settings as SettingsIcon, Webhook, Award, Mail } from 'lucide-react';
+import { ShieldCheck, ShieldAlert, UserCog, LogOut, LayoutDashboard, FileText, Users, AlertTriangle, Radio, ClipboardList, Activity, Menu, X, Film, Building2, Settings as SettingsIcon, Webhook, Award, Mail, Library, Inbox } from 'lucide-react';
 import { apiGet, getApiErrorMessage } from '../services/api';
 import { useSettings } from '../services/appSettings';
 
@@ -238,6 +238,22 @@ export const Layout: React.FC<LayoutProps> = ({ children, role, currentView, onN
               label="Exams"
               active={currentView === 'exams'}
               onClick={() => handleNavigate('exams')}
+            />
+          )}
+          {isFullAdmin && (
+            <NavItem
+              icon={<Library size={18} />}
+              label="Question Bank"
+              active={currentView === 'question-bank'}
+              onClick={() => handleNavigate('question-bank')}
+            />
+          )}
+          {isSuperAdmin && (
+            <NavItem
+              icon={<Inbox size={18} />}
+              label="Exam Requests"
+              active={currentView === 'exam-requests'}
+              onClick={() => handleNavigate('exam-requests')}
             />
           )}
           {isFullAdmin && (

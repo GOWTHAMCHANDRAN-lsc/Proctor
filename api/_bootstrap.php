@@ -1022,6 +1022,111 @@ function humanize_identifier(string $value): string {
     return ucwords(strtolower($normalized));
 }
 
+/**
+ * Question banks: reusable, company-owned collections of questions. Bank questions are ordinary rows
+ * in the shared `questions` table (global ids) and are linked into any number of exams through
+ * exam_questions, so one upload serves many exams. Exams never copy a bank question; editing it in the
+ * bank changes it everywhere it is used. Idempotent — call from every endpoint that touches banks.
+ */
+function ensure_question_bank_schema(PDO $pdo): void {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS question_banks (
+      id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      company_id  INT UNSIGNED NOT NULL,
+      name        VARCHAR(255) NOT NULL,
+      description TEXT NULL,
+      created_by  VARCHAR(255) NULL,
+      created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_question_banks_company_name (company_id, name),
+      INDEX idx_question_banks_company (company_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS question_bank_items (
+      bank_id       BIGINT UNSIGNED NOT NULL,
+      question_id   VARCHAR(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+      display_order INT NOT NULL DEFAULT 0,
+      added_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (bank_id, question_id),
+      INDEX idx_question_bank_items_question (question_id),
+      CONSTRAINT fk_question_bank_items_bank FOREIGN KEY (bank_id) REFERENCES question_banks(id) ON DELETE CASCADE,
+      CONSTRAINT fk_question_bank_items_question FOREIGN KEY (question_id) REFERENCES questions(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+}
+
+/** Ids (subset of $questionIds) that belong to any question bank — the exam editor must not rewrite these. */
+function question_bank_owned_ids(PDO $pdo, array $questionIds): array {
+    $questionIds = array_values(array_unique(array_filter(array_map('strval', $questionIds), static fn($id) => $id !== '')));
+    if (count($questionIds) === 0 || !db_table_exists($pdo, 'question_bank_items')) {
+        return [];
+    }
+    $ph = implode(',', array_fill(0, count($questionIds), '?'));
+    $stmt = $pdo->prepare("SELECT DISTINCT question_id FROM question_bank_items WHERE question_id IN ($ph)");
+    $stmt->execute($questionIds);
+    $ids = array_map(static fn($r) => (string)$r['question_id'], $stmt->fetchAll());
+    $stmt->closeCursor();
+    return $ids;
+}
+
+/**
+ * Per-exam proctoring switches (Exam.proctoringConfig.mode / showAlerts / autoTerminate). The
+ * defaults reproduce the behaviour every existing exam already has: proctored, alerts shown to the
+ * candidate, and the attempt ended when a violation limit is reached.
+ */
+function ensure_exam_proctoring_mode_columns(PDO $pdo): void {
+    db_add_column_if_missing($pdo, 'exams', 'proctoring_mode', "VARCHAR(16) NOT NULL DEFAULT 'PROCTORED'");
+    db_add_column_if_missing($pdo, 'exams', 'show_violation_alerts', 'TINYINT(1) NOT NULL DEFAULT 1');
+    db_add_column_if_missing($pdo, 'exams', 'auto_terminate', 'TINYINT(1) NOT NULL DEFAULT 1');
+}
+
+/**
+ * Email-driven exam requests. An authorised employee (exam_requesters: one per email address, each
+ * with its own security code, stored only as a password_hash) emails a filled-in template to the
+ * platform mailbox; scripts/mail_intake.py hands each message to scripts/exam_request_intake.php,
+ * which records it here as PENDING (or INVALID with reasons). A SUPER_ADMIN reviews, edits and
+ * approves it in the Exam Requests tab, which creates the exam. Idempotent.
+ */
+function ensure_exam_request_schema(PDO $pdo): void {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS exam_requesters (
+      id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      company_id      INT UNSIGNED NOT NULL,
+      name            VARCHAR(255) NOT NULL,
+      email           VARCHAR(255) NOT NULL,
+      code_hash       VARCHAR(255) NOT NULL,
+      code_hint       VARCHAR(16) NULL,
+      status          ENUM('ACTIVE','DISABLED') NOT NULL DEFAULT 'ACTIVE',
+      created_by      VARCHAR(255) NULL,
+      created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      last_request_at TIMESTAMP NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_exam_requesters_email (email),
+      INDEX idx_exam_requesters_company (company_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+    $pdo->exec("CREATE TABLE IF NOT EXISTS exam_requests (
+      id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      company_id      INT UNSIGNED NULL,
+      requester_id    BIGINT UNSIGNED NULL,
+      sender_email    VARCHAR(255) NOT NULL,
+      sender_name     VARCHAR(255) NULL,
+      subject         VARCHAR(512) NULL,
+      message_hash    CHAR(64) NOT NULL,
+      status          ENUM('PENDING','APPROVED','REJECTED','INVALID') NOT NULL DEFAULT 'PENDING',
+      details_json    JSON NULL,
+      students_json   JSON NULL,
+      errors_json     JSON NULL,
+      body_redacted   MEDIUMTEXT NULL,
+      received_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      reviewed_by     VARCHAR(255) NULL,
+      reviewed_at     TIMESTAMP NULL,
+      review_note     TEXT NULL,
+      created_exam_id VARCHAR(64) NULL,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_exam_requests_message (message_hash),
+      INDEX idx_exam_requests_status (status, received_at),
+      INDEX idx_exam_requests_company (company_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+}
+
 function ensure_company_directory_schema(PDO $pdo): void {
     try {
         $pdo->exec("CREATE TABLE IF NOT EXISTS companies (

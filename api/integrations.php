@@ -8,6 +8,9 @@ require_once __DIR__ . '/_bootstrap.php';
 // Reused for smtp_send()/smtp_open()/smtp_deliver(): the $isIncluded guard inside notify.php means
 // requiring it from here only defines those functions — it does not run notify.php's own HTTP handler.
 require_once __DIR__ . '/notify.php';
+// WhatsApp copy of the invitation (whatsapp_send_invite_for_student). Same $isIncluded-style guard:
+// requiring it only defines the functions. A no-op until WhatsApp is configured in .env.
+require_once __DIR__ . '/whatsapp.php';
 
 /**
  * V1 automation, Phase 1 (Ingest & Schedule): a generic, per-tenant signed webhook connector that
@@ -276,9 +279,9 @@ function send_exam_invitation_locked(PDO $pdo, array $env, int $companyId, array
     $companyName = (string)($companyStmt->fetchColumn() ?: 'ProctorGuard');
     $companyStmt->closeCursor();
 
-    $token = mint_exam_access_token((string)$exam['id'], $studentId, $companyId);
+    // Short "/x/<code>" link (falls back to the long signed ?token= link if a code can't be made).
     $origin = rtrim((string)pg_env('APP_ORIGIN', 'https://proctor.lsc-crm.in'), '/');
-    $link = $origin . '/?token=' . $token;
+    $link = exam_access_link($pdo, $origin, (string)$exam['id'], $studentId, $companyId);
 
     $safeCompanyName = htmlspecialchars($companyName, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     $safeExamTitle = htmlspecialchars((string)$exam['title'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
@@ -335,6 +338,17 @@ HTML;
     $inv = $pdo->prepare('INSERT IGNORE INTO exam_invitations (exam_id, student_id) VALUES (?, ?)');
     $inv->execute([$exam['id'], $studentId]);
     $inv->closeCursor();
+
+    // WhatsApp copy of the invitation, with the same signed link, when the student has a mobile number
+    // and WhatsApp invitations are configured (otherwise this returns at once without logging). Sent
+    // only once the email side is settled and exam_invitations is written, so the retry sweep — which
+    // skips invited students — never sends a second copy. Strictly best-effort: a WhatsApp failure is
+    // logged in delivery_logs and never fails, retries or rolls back the invitation.
+    try {
+        whatsapp_send_invite_for_student($pdo, $env, $companyId, (string)$exam['id'], $studentId);
+    } catch (Throwable $e) {
+        error_log('[integrations] WhatsApp invitation failed: ' . $e->getMessage());
+    }
 }
 
 /** The whole enroll->exam pipeline for one stored event. Never throws — failures are captured on the

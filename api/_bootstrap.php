@@ -1127,6 +1127,255 @@ function ensure_exam_request_schema(PDO $pdo): void {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
 }
 
+/**
+ * Short exam links: "<origin>/x/<code>" instead of the ~170-character "<origin>/?token=<signed token>"
+ * (the long link is unwieldy in WhatsApp/SMS and gets mangled by mail clients). The code is an opaque,
+ * random, case-sensitive 10-char base62 handle on (exam, student, company); api/link.php swaps it for
+ * the SAME signed token the long link carries (mint_exam_access_token() is deterministic), so the
+ * student page then runs the unchanged ?token= flow and every server-side check still applies.
+ * One code per (exam, student, company) — get-or-create, so every resend reuses the same link.
+ */
+function ensure_exam_short_link_schema(PDO $pdo): void {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS exam_short_links (
+      code         VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+      exam_id      VARCHAR(64) NOT NULL,
+      student_id   VARCHAR(64) NOT NULL,
+      company_id   INT UNSIGNED NOT NULL,
+      created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      last_used_at TIMESTAMP NULL,
+      use_count    INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (code),
+      UNIQUE KEY uq_exam_short_links_target (exam_id, student_id, company_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+}
+
+function exam_short_link_schema_once(PDO $pdo): void {
+    static $done = false;
+    if (!$done) {
+        ensure_exam_short_link_schema($pdo);
+        $done = true;
+    }
+}
+
+function exam_short_random_code(int $length = 10): string {
+    $alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+    $code = '';
+    for ($i = 0; $i < $length; $i++) {
+        $code .= $alphabet[random_int(0, 61)];
+    }
+    return $code;
+}
+
+/**
+ * Get-or-create the short code for one (exam, student, company). Race-safe: two concurrent callers
+ * may both try to insert, the unique key lets exactly one win, and the loser re-reads the winner's
+ * code. A (vanishingly rare) random collision on the code itself just retries with a new one.
+ */
+function exam_short_code(PDO $pdo, string $eid, string $sid, int $cid): string {
+    exam_short_link_schema_once($pdo);
+    $select = $pdo->prepare('SELECT code FROM exam_short_links WHERE exam_id = ? AND student_id = ? AND company_id = ? LIMIT 1');
+    $find = static function () use ($select, $eid, $sid, $cid): ?string {
+        $select->execute([$eid, $sid, $cid]);
+        $code = $select->fetchColumn();
+        $select->closeCursor();
+        return $code !== false && $code !== null ? (string)$code : null;
+    };
+    $existing = $find();
+    if ($existing !== null) {
+        return $existing;
+    }
+    $insert = $pdo->prepare('INSERT INTO exam_short_links (code, exam_id, student_id, company_id) VALUES (?, ?, ?, ?)');
+    for ($attempt = 0; $attempt < 6; $attempt++) {
+        $code = exam_short_random_code();
+        try {
+            $insert->execute([$code, $eid, $sid, $cid]);
+            $insert->closeCursor();
+            return $code;
+        } catch (PDOException $e) {
+            $insert->closeCursor();
+            if ((int)($e->errorInfo[1] ?? 0) !== 1062) {
+                throw $e;
+            }
+            $existing = $find(); // someone else created this target's code first
+            if ($existing !== null) {
+                return $existing;
+            }
+            // otherwise the random code itself collided — try another
+        }
+    }
+    throw new RuntimeException('Could not allocate a short exam link.');
+}
+
+/**
+ * Bulk get-or-create for one exam: [studentId => companyId] in, [studentId => code] out. Two queries
+ * per 500 students instead of two per student, for invitation batches and the Links CSV. Students
+ * that still have no code after the retries are simply missing from the result (callers fall back to
+ * the long ?token= link).
+ */
+function exam_short_codes(PDO $pdo, string $eid, array $studentCompanies): array {
+    exam_short_link_schema_once($pdo);
+    $codes = [];
+    foreach (array_chunk($studentCompanies, 500, true) as $chunk) {
+        for ($attempt = 0; $attempt < 4 && count($chunk) > 0; $attempt++) {
+            $sids = array_map('strval', array_keys($chunk));
+            $ph = implode(',', array_fill(0, count($sids), '?'));
+            $stmt = $pdo->prepare("SELECT code, student_id, company_id FROM exam_short_links WHERE exam_id = ? AND student_id IN ($ph)");
+            $stmt->execute(array_merge([$eid], $sids));
+            foreach ($stmt->fetchAll() as $row) {
+                $sid = (string)$row['student_id'];
+                if (isset($chunk[$sid]) && (int)$chunk[$sid] === (int)$row['company_id']) {
+                    $codes[$sid] = (string)$row['code'];
+                    unset($chunk[$sid]);
+                }
+            }
+            $stmt->closeCursor();
+            if (count($chunk) === 0) {
+                break;
+            }
+            // INSERT IGNORE: a row that loses a race (target already coded) or hits a code collision
+            // is skipped silently, and the re-read on the next pass picks up whatever won.
+            $values = [];
+            $params = [];
+            foreach ($chunk as $sid => $cid) {
+                $values[] = '(?, ?, ?, ?)';
+                array_push($params, exam_short_random_code(), $eid, (string)$sid, (int)$cid);
+            }
+            $ins = $pdo->prepare('INSERT IGNORE INTO exam_short_links (code, exam_id, student_id, company_id) VALUES ' . implode(',', $values));
+            $ins->execute($params);
+            $ins->closeCursor();
+        }
+    }
+    return $codes;
+}
+
+/** The long, always-valid fallback link: "<origin>/?token=<signed token>". */
+function exam_token_link(string $origin, string $eid, string $sid, int $cid): string {
+    return rtrim($origin, '/') . '/?token=' . mint_exam_access_token($eid, $sid, $cid);
+}
+
+/**
+ * The candidate's exam link: "<origin>/x/<code>", or — if the short code can't be created for any
+ * reason — the long "<origin>/?token=..." link, so a link is always produced.
+ */
+function exam_access_link(PDO $pdo, string $origin, string $eid, string $sid, int $cid): string {
+    try {
+        return rtrim($origin, '/') . '/x/' . exam_short_code($pdo, $eid, $sid, $cid);
+    } catch (Throwable $e) {
+        error_log('[short-link] falling back to token link: ' . $e->getMessage());
+        return exam_token_link($origin, $eid, $sid, $cid);
+    }
+}
+
+/**
+ * Normalise a phone number for WhatsApp to bare international digits (e.g. "919876543210"), or null
+ * when it can't be a valid number. Accepts the usual ways people type numbers: "+91 98765 43210",
+ * "0091-98765-43210", "098765 43210" (national trunk 0) and a bare 10-digit number, which gets
+ * $defaultCc prefixed. A number written with an explicit "+" or "00" is already international and is
+ * never given the default country code. Letters (e.g. Excel's "9.18E+11") make it invalid.
+ */
+function normalize_mobile(?string $raw, string $defaultCc = '91'): ?string {
+    if ($raw === null) {
+        return null;
+    }
+    $value = trim($raw);
+    if ($value === '' || preg_match('/^\+?[0-9\s\-().\/]+$/', $value) !== 1) {
+        return null;
+    }
+    $international = $value[0] === '+';
+    $digits = (string)preg_replace('/\D+/', '', $value);
+    if (!$international && strncmp($digits, '00', 2) === 0) {
+        $international = true;
+        $digits = substr($digits, 2);
+    } elseif (!$international && strncmp($digits, '0', 1) === 0) {
+        $digits = substr($digits, 1); // a single national trunk prefix
+    }
+    $cc = (string)preg_replace('/\D+/', '', $defaultCc);
+    if (!$international && strlen($digits) === 10 && $cc !== '') {
+        $digits = $cc . $digits;
+    }
+    $len = strlen($digits);
+    if ($len < 8 || $len > 15 || $digits[0] === '0') {
+        return null;
+    }
+    return $digits;
+}
+
+/**
+ * WhatsApp notifications (api/whatsapp.php). Adds the optional mobile columns and lets delivery_logs
+ * record channel WHATSAPP. Returns which pieces are available, checked fresh (db_column_exists()
+ * caches, so it can't be used to confirm a column added in this same request). Idempotent and cheap:
+ * the enum is only altered when 'WHATSAPP' is missing, and appending an enum member is a
+ * metadata-only change. sp_add_delivery_log still only takes EMAIL/SMS and is deliberately left
+ * alone — WhatsApp rows are written with a direct INSERT (see whatsapp_log_delivery()).
+ */
+function ensure_whatsapp_schema(PDO $pdo): array {
+    $hasColumn = static function (string $table, string $column) use ($pdo): bool {
+        try {
+            $stmt = $pdo->prepare("SHOW COLUMNS FROM {$table} LIKE ?");
+            $stmt->execute([$column]);
+            $exists = (bool)$stmt->fetch();
+            $stmt->closeCursor();
+            return $exists;
+        } catch (Throwable $e) {
+            return false;
+        }
+    };
+    $state = ['studentsMobile' => false, 'requestersMobile' => false, 'deliveryChannel' => false];
+
+    $state['studentsMobile'] = $hasColumn('students', 'mobile');
+    if (!$state['studentsMobile']) {
+        try {
+            $pdo->exec('ALTER TABLE students ADD COLUMN mobile VARCHAR(20) NULL');
+        } catch (Throwable $e) {
+            // Best effort; re-checked below (a concurrent request may have added it first).
+        }
+        $state['studentsMobile'] = $hasColumn('students', 'mobile');
+    }
+
+    if (db_table_exists($pdo, 'exam_requesters')) {
+        $state['requestersMobile'] = $hasColumn('exam_requesters', 'mobile');
+        if (!$state['requestersMobile']) {
+            try {
+                $pdo->exec('ALTER TABLE exam_requesters ADD COLUMN mobile VARCHAR(20) NULL');
+            } catch (Throwable $e) {
+                // Best effort.
+            }
+            $state['requestersMobile'] = $hasColumn('exam_requesters', 'mobile');
+        }
+    }
+
+    try {
+        $stmt = $pdo->query("SHOW FULL COLUMNS FROM delivery_logs LIKE 'channel'");
+        $col = $stmt ? $stmt->fetch() : null;
+        if ($stmt) $stmt->closeCursor();
+        $type = is_array($col) ? (string)($col['Type'] ?? '') : '';
+        if (stripos($type, "'WHATSAPP'") !== false) {
+            $state['deliveryChannel'] = true;
+        } elseif (preg_match('/^enum\((.*)\)$/i', $type, $m) === 1) {
+            // Keep every existing member (in order) and append WHATSAPP, with the same collation and
+            // nullability, so the change stays metadata-only.
+            preg_match_all("/'((?:[^']|'')*)'/", $m[1], $members);
+            $list = array_map(static fn($v) => "'" . str_replace("'", "''", str_replace("''", "'", $v)) . "'", $members[1]);
+            $list[] = "'WHATSAPP'";
+            $collation = (string)($col['Collation'] ?? '');
+            $collateSql = preg_match('/^[A-Za-z0-9_]+$/', $collation) === 1
+                ? ' CHARACTER SET ' . explode('_', $collation)[0] . ' COLLATE ' . $collation
+                : '';
+            $nullSql = strtoupper((string)($col['Null'] ?? 'NO')) === 'YES' ? ' NULL' : ' NOT NULL';
+            $sql = 'ALTER TABLE delivery_logs MODIFY channel ENUM(' . implode(',', $list) . ')' . $collateSql . $nullSql;
+            try {
+                $pdo->exec($sql . ', ALGORITHM=INSTANT');
+            } catch (Throwable $e) {
+                $pdo->exec($sql);
+            }
+            $state['deliveryChannel'] = true;
+        }
+    } catch (Throwable $e) {
+        // Best effort: whatsapp_log_delivery() swallows its own failure if the enum is still missing.
+    }
+    return $state;
+}
+
 function ensure_company_directory_schema(PDO $pdo): void {
     try {
         $pdo->exec("CREATE TABLE IF NOT EXISTS companies (

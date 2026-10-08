@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { DeliveryLog, NotificationTemplate } from '../../types';
 import { apiGet, apiPost } from '../../services/api';
 import { Pagination, usePagination } from './Pagination';
-import { Mail, MessageSquare, RefreshCcw, Save, Trash2, Search } from 'lucide-react';
+import { Mail, MessageSquare, MessageCircle, RefreshCcw, Save, Trash2, Search } from 'lucide-react';
 
 const emptyTemplate: Omit<NotificationTemplate, 'id' | 'createdAt' | 'updatedAt'> = {
   name: '',
@@ -307,7 +307,21 @@ export const Communications: React.FC = () => {
                       <td className="px-4 py-3 text-xs text-slate-500 whitespace-nowrap">
                         {new Date(log.createdAt).toLocaleString()}
                       </td>
-                      <td className="px-4 py-3 text-xs text-slate-500">{log.channel}</td>
+                      <td className="px-4 py-3 text-xs text-slate-500">
+                        {log.channel === 'WHATSAPP' ? (
+                          <span
+                            className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-1 rounded-full border bg-emerald-50 text-emerald-700 border-emerald-200"
+                            title={log.subject ? `WhatsApp template: ${log.subject}` : 'WhatsApp'}
+                          >
+                            <MessageCircle size={11} aria-hidden="true" /> WHATSAPP
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1">
+                            {log.channel === 'EMAIL' ? <Mail size={11} aria-hidden="true" /> : <MessageSquare size={11} aria-hidden="true" />}
+                            {log.channel}
+                          </span>
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-xs text-slate-500">{log.recipient}</td>
                       <td className="px-4 py-3">
                         <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-1 rounded-full border ${

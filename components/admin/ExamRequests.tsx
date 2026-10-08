@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Inbox, Users, FileText, RefreshCw, Loader2, AlertCircle, AlertTriangle, Check, Copy, X, Plus, Trash2,
   KeyRound, Ban, Send, ShieldCheck, Mail, Download, Search, ChevronDown, ChevronRight, UserPlus, Info,
-  CalendarClock, ClipboardList,
+  CalendarClock, ClipboardList, Pencil,
 } from 'lucide-react';
 import { apiGet, apiPost, getApiErrorMessage } from '../../services/api';
 import { parseCsvLine } from '../../services/questionCsv';
@@ -1021,7 +1021,10 @@ const EmployeesTab: React.FC<{
   const [companies, setCompanies] = useState<CompanyDirectoryRecord[]>([]);
   const [companiesError, setCompaniesError] = useState('');
   const [addOpen, setAddOpen] = useState(false);
-  const [form, setForm] = useState({ companyId: '', name: '', email: '' });
+  const [form, setForm] = useState({ companyId: '', name: '', email: '', mobile: '' });
+  // Edit name + optional WhatsApp mobile (the email is the employee's identity and isn't editable).
+  const [edit, setEdit] = useState<{ requester: ExamRequester; name: string; mobile: string } | null>(null);
+  const [editError, setEditError] = useState('');
   const [busy, setBusy] = useState(false);
   const [rowBusy, setRowBusy] = useState<number | null>(null);
   const [formError, setFormError] = useState('');
@@ -1039,12 +1042,12 @@ const EmployeesTab: React.FC<{
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
     if (!term) return requesters;
-    return requesters.filter(r => [r.name, r.email, r.companyName].filter(Boolean).join(' ').toLowerCase().includes(term));
+    return requesters.filter(r => [r.name, r.email, r.companyName, r.mobile].filter(Boolean).join(' ').toLowerCase().includes(term));
   }, [requesters, search]);
   const paging = usePagination(filtered, search);
 
   const openAdd = () => {
-    setForm({ companyId: companies.length === 1 ? String(companies[0].id) : '', name: '', email: '' });
+    setForm({ companyId: companies.length === 1 ? String(companies[0].id) : '', name: '', email: '', mobile: '' });
     setFormError('');
     setAddOpen(true);
   };
@@ -1053,8 +1056,10 @@ const EmployeesTab: React.FC<{
     setBusy(true);
     setFormError('');
     try {
+      const mobile = form.mobile.trim();
       const res = await apiPost<{ requester: ExamRequester; code: string }>(API, {
         action: 'CREATE_REQUESTER', companyId: Number(form.companyId), name: form.name.trim(), email: form.email.trim(),
+        ...(mobile ? { mobile } : {}),
       });
       setAddOpen(false);
       setReveal({ name: res.requester.name, email: res.requester.email, code: res.code });
@@ -1083,6 +1088,23 @@ const EmployeesTab: React.FC<{
     } catch (e) {
       setConfirm(null);
       setNotice({ tone: 'error', text: getApiErrorMessage(e, kind === 'regenerate' ? 'Could not regenerate the code.' : 'Could not delete the employee.') });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveEdit = async () => {
+    if (!edit) return;
+    setBusy(true);
+    setEditError('');
+    try {
+      // mobile '' clears the number; the server validates and normalises it.
+      await apiPost(API, { action: 'UPDATE_REQUESTER', id: edit.requester.id, name: edit.name.trim(), mobile: edit.mobile.trim() });
+      setEdit(null);
+      setNotice({ tone: 'success', text: `${edit.name.trim()} updated.` });
+      onChanged();
+    } catch (e) {
+      setEditError(getApiErrorMessage(e, 'Could not update the employee.'));
     } finally {
       setBusy(false);
     }
@@ -1135,6 +1157,7 @@ const EmployeesTab: React.FC<{
                 <tr>
                   <th className="px-4 py-3">Name</th>
                   <th className="px-4 py-3">Email</th>
+                  <th className="px-4 py-3">WhatsApp</th>
                   <th className="px-4 py-3">Company</th>
                   <th className="px-4 py-3">Status</th>
                   <th className="px-4 py-3">Code</th>
@@ -1147,12 +1170,21 @@ const EmployeesTab: React.FC<{
                   <tr key={r.id}>
                     <td className="px-4 py-3 font-medium text-slate-800">{r.name}</td>
                     <td className="px-4 py-3 text-slate-600 break-all">{r.email}</td>
+                    <td className="px-4 py-3 text-slate-500 font-mono text-xs whitespace-nowrap">{r.mobile ? `+${r.mobile}` : <span className="text-slate-300 font-sans">—</span>}</td>
                     <td className="px-4 py-3 text-slate-600">{r.companyName || `#${r.companyId}`}</td>
                     <td className="px-4 py-3"><span className={r.status === 'ACTIVE' ? 'lsc-chip-success' : 'lsc-chip-neutral'}>{r.status === 'ACTIVE' ? 'Active' : 'Disabled'}</span></td>
                     <td className="px-4 py-3 font-mono text-xs text-slate-500 whitespace-nowrap">{r.codeHint ? `••••-${r.codeHint}` : '—'}</td>
                     <td className="px-4 py-3 text-slate-500 whitespace-nowrap">{r.lastRequestAt ? fmtDateTime(r.lastRequestAt) : 'Never'}</td>
                     <td className="px-4 py-3">
                       <div className="flex flex-wrap justify-end gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => { setEditError(''); setEdit({ requester: r, name: r.name, mobile: r.mobile ? `+${r.mobile}` : '' }); }}
+                          className="px-2.5 py-1.5 lsc-button-ghost text-xs inline-flex items-center gap-1.5"
+                          aria-label={`Edit ${r.name}`}
+                        >
+                          <Pencil size={13} /> Edit
+                        </button>
                         <button type="button" onClick={() => setConfirm({ kind: 'regenerate', requester: r })} className="px-2.5 py-1.5 lsc-button-ghost text-xs inline-flex items-center gap-1.5">
                           <KeyRound size={13} /> New code
                         </button>
@@ -1206,6 +1238,45 @@ const EmployeesTab: React.FC<{
             <div>
               <label className={labelCls} htmlFor="er-emp-email">Email address they send from</label>
               <input id="er-emp-email" type="email" className={inputCls} maxLength={255} value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} />
+            </div>
+            <div>
+              <label className={labelCls} htmlFor="er-emp-mobile">WhatsApp mobile <span className="text-slate-400 font-normal">(optional)</span></label>
+              <input id="er-emp-mobile" type="tel" inputMode="tel" autoComplete="tel" className={inputCls} maxLength={30} placeholder="+91 98765 43210" value={form.mobile} onChange={e => setForm(f => ({ ...f, mobile: e.target.value }))} />
+              <p className="text-[11px] text-slate-400 mt-1">For WhatsApp copies of the request status emails (received, approved, rejected), once WhatsApp is configured.</p>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {edit && (
+        <Modal
+          title="Edit employee"
+          onClose={() => setEdit(null)}
+          busy={busy}
+          footer={(
+            <>
+              <button type="button" onClick={() => setEdit(null)} disabled={busy} className="px-4 py-2 text-sm rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-60">Cancel</button>
+              <button type="button" onClick={() => { void saveEdit(); }} disabled={busy || edit.name.trim() === ''} className="px-4 py-2 lsc-button-primary text-sm inline-flex items-center gap-2 disabled:opacity-60">
+                {busy ? <Loader2 size={15} className="animate-spin" /> : <Check size={15} />} Save
+              </button>
+            </>
+          )}
+        >
+          <div className="space-y-3">
+            {editError && <Notice tone="error">{editError}</Notice>}
+            <div>
+              <label className={labelCls} htmlFor="er-edit-email">Email address</label>
+              <input id="er-edit-email" className={inputCls} value={edit.requester.email} disabled readOnly />
+              <p className="text-[11px] text-slate-400 mt-1">The sending address is the employee's identity. To change it, delete and re-add them.</p>
+            </div>
+            <div>
+              <label className={labelCls} htmlFor="er-edit-name">Name</label>
+              <input id="er-edit-name" className={inputCls} maxLength={255} value={edit.name} onChange={e => setEdit(v => (v ? { ...v, name: e.target.value } : v))} />
+            </div>
+            <div>
+              <label className={labelCls} htmlFor="er-edit-mobile">WhatsApp mobile <span className="text-slate-400 font-normal">(optional)</span></label>
+              <input id="er-edit-mobile" type="tel" inputMode="tel" autoComplete="tel" className={inputCls} maxLength={30} placeholder="+91 98765 43210" value={edit.mobile} onChange={e => setEdit(v => (v ? { ...v, mobile: e.target.value } : v))} />
+              <p className="text-[11px] text-slate-400 mt-1">10 digits get the default country code; otherwise start with + and the country code. Leave empty to remove.</p>
             </div>
           </div>
         </Modal>

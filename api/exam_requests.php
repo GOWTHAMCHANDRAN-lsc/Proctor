@@ -22,6 +22,9 @@ require_once __DIR__ . '/_bootstrap.php';
 // smtp_open/smtp_deliver/smtp_send/add_delivery_log/html_to_plain. notify.php's own $isIncluded
 // guard means requiring it here only defines those functions.
 require_once __DIR__ . '/notify.php';
+// WhatsApp copies of the invitation and of the requester's status emails. Guarded like notify.php
+// (requiring it only defines functions); every send is a no-op until WhatsApp is configured in .env.
+require_once __DIR__ . '/whatsapp.php';
 
 const ER_CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'; // no 0/O/1/I/L
 const ER_MAX_STUDENTS = 2000;
@@ -43,6 +46,8 @@ const ER_DEFAULT_RECONNECT_LIMIT = 3;
 
 function er_ensure_schema(PDO $pdo): void {
     ensure_exam_request_schema($pdo);
+    // exam_requesters.mobile (optional WhatsApp number) + students.mobile + the WHATSAPP log channel.
+    whatsapp_schema_once($pdo);
     ensure_question_bank_schema($pdo);
     ensure_exam_proctoring_mode_columns($pdo);
     ensure_student_batches_schema($pdo);
@@ -276,11 +281,31 @@ function er_requester_public(array $row): array {
         'companyName' => $row['company_name'] ?? null,
         'name' => (string)$row['name'],
         'email' => (string)$row['email'],
+        'mobile' => isset($row['mobile']) && trim((string)$row['mobile']) !== '' ? (string)$row['mobile'] : null,
         'status' => (string)$row['status'],
         'codeHint' => $row['code_hint'] !== null ? (string)$row['code_hint'] : null,
         'createdAt' => er_ts_ms($row['created_at']) ?? 0,
         'lastRequestAt' => er_ts_ms($row['last_request_at'] ?? null),
     ];
+}
+
+/**
+ * Optional WhatsApp mobile from a requester payload: [provided, normalised digits|null, error|null].
+ * Absent/null = not provided (leave as is); '' = clear; otherwise must be a valid number.
+ */
+function er_requester_mobile_input(array $payload, array $env): array {
+    if (!array_key_exists('mobile', $payload) || $payload['mobile'] === null) {
+        return [false, null, null];
+    }
+    $raw = is_scalar($payload['mobile']) ? trim((string)$payload['mobile']) : '[invalid]';
+    if ($raw === '') {
+        return [true, null, null];
+    }
+    $mobile = normalize_mobile($raw, (string)whatsapp_config($env)['countryCode']);
+    if ($mobile === null) {
+        return [true, null, 'Enter a valid mobile number (10 digits, or + and the country code), or leave it blank.'];
+    }
+    return [true, $mobile, null];
 }
 
 function er_request_public(array $row, bool $withStudents = true): array {
@@ -1169,7 +1194,8 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
             if (!isset($companyNames[$studentCompany])) {
                 $companyNames[$studentCompany] = er_company_name($pdo, $studentCompany);
             }
-            $link = $origin . '/?token=' . mint_exam_access_token($examId, $studentId, $studentCompany);
+            // Short "/x/<code>" link (falls back to the long signed ?token= link if a code can't be made).
+            $link = exam_access_link($pdo, $origin, $examId, $studentId, $studentCompany);
             [$subject, $html] = er_invitation_email($exam, $companyNames[$studentCompany], $fullName, $link);
 
             if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
@@ -1220,6 +1246,15 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
                     $mark->execute([$examId, $studentId]);
                     $mark->closeCursor();
                     $result['invited']++;
+                    // WhatsApp copy (same link) for students with a mobile number — only after the
+                    // email went out and the "invited" marker is written, so a later run never
+                    // repeats it. Best-effort: logged in delivery_logs, never fails this run. Returns
+                    // at once (no logging) while WhatsApp invitations aren't configured.
+                    try {
+                        whatsapp_send_exam_notice($pdo, $env, $studentCompany, $exam, $row, 'INVITE');
+                    } catch (Throwable $e) {
+                        error_log('[exam_requests] WhatsApp invitation failed: ' . $e->getMessage());
+                    }
                 } else {
                     $result['failures'][] = ['email' => $email, 'error' => (string)($send['error'] ?? 'Send failed')];
                 }
@@ -1258,6 +1293,12 @@ function er_notify_approved(PDO $pdo, array $env, array $request, string $examId
     er_send_mail($pdo, $env, $request['company_id'] !== null ? (int)$request['company_id'] : null, er_requester_address($pdo, $request),
         '[ProctorGuard] Exam request #' . (int)$request['id'] . ' approved — ' . $details['title'] . ' scheduled',
         er_email_html('Exam request approved', $inner));
+    // WhatsApp copy for the employee (when they have a mobile and WhatsApp is configured; never throws).
+    $candidates = static fn(int $n): string => $n . ' candidate' . ($n === 1 ? '' : 's');
+    whatsapp_notify_requester($pdo, $env, (int)($request['requester_id'] ?? 0), (int)$request['id'], (string)$details['title'],
+        $invited >= $assigned
+            ? 'approved — ' . $candidates($invited) . ' invited'
+            : 'approved — ' . $invited . ' of ' . $candidates($assigned) . ' invited so far');
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1485,6 +1526,10 @@ if ($action === 'CREATE_REQUESTER') {
     if (db_scalar_int($pdo, 'SELECT COUNT(*) FROM exam_requesters WHERE email = ?', [$email]) > 0) {
         json_response(['error' => 'An employee with this email is already registered.'], 409);
     }
+    [$mobileProvided, $mobile, $mobileError] = er_requester_mobile_input($payload, $env);
+    if ($mobileError !== null) {
+        json_response(['error' => $mobileError], 400);
+    }
     $code = er_generate_code();
     try {
         $stmt = $pdo->prepare('INSERT INTO exam_requesters (company_id, name, email, code_hash, code_hint, status, created_by) VALUES (?, ?, ?, ?, ?, \'ACTIVE\', ?)');
@@ -1497,6 +1542,11 @@ if ($action === 'CREATE_REQUESTER') {
         throw $e;
     }
     $id = (int)$pdo->lastInsertId();
+    if ($mobileProvided && $mobile !== null && !empty(whatsapp_schema_once($pdo)['requestersMobile'])) {
+        $stmt = $pdo->prepare('UPDATE exam_requesters SET mobile = ? WHERE id = ?');
+        $stmt->execute([$mobile, $id]);
+        $stmt->closeCursor();
+    }
     audit_log($pdo, [
         'companyId' => $companyId, 'actorRole' => $actorRole, 'actorId' => $actorId,
         'action' => 'EXAM_REQUESTER_CREATE', 'targetType' => 'exam_requester', 'targetId' => (string)$id,
@@ -1506,7 +1556,7 @@ if ($action === 'CREATE_REQUESTER') {
     json_response(['ok' => true, 'requester' => er_requester_public(er_fetch_requester($pdo, $id)), 'code' => $code['display']]);
 }
 
-if (in_array($action, ['REGENERATE_CODE', 'SET_REQUESTER_STATUS', 'DELETE_REQUESTER'], true)) {
+if (in_array($action, ['REGENERATE_CODE', 'SET_REQUESTER_STATUS', 'DELETE_REQUESTER', 'UPDATE_REQUESTER'], true)) {
     $id = (int)($payload['id'] ?? 0);
     $requester = $id > 0 ? er_fetch_requester($pdo, $id) : null;
     if (!$requester) {
@@ -1514,6 +1564,46 @@ if (in_array($action, ['REGENERATE_CODE', 'SET_REQUESTER_STATUS', 'DELETE_REQUES
     }
     $companyId = (int)$requester['company_id'];
     $label = "{$requester['name']} <{$requester['email']}>";
+
+    if ($action === 'UPDATE_REQUESTER') {
+        // Edits the display name and the optional WhatsApp mobile. The email address is the
+        // employee's identity for the security-code check, so it is not editable here (delete and
+        // re-register instead).
+        $sets = [];
+        $params = [];
+        if (array_key_exists('name', $payload) && $payload['name'] !== null) {
+            $name = trim((string)$payload['name']);
+            if ($name === '' || mb_strlen($name, 'UTF-8') > 255) {
+                json_response(['error' => 'Name is required (at most 255 characters).'], 400);
+            }
+            $sets[] = 'name = ?';
+            $params[] = $name;
+        }
+        [$mobileProvided, $mobile, $mobileError] = er_requester_mobile_input($payload, $env);
+        if ($mobileError !== null) {
+            json_response(['error' => $mobileError], 400);
+        }
+        if ($mobileProvided) {
+            if (empty(whatsapp_schema_once($pdo)['requestersMobile'])) {
+                json_response(['error' => 'Mobile numbers are not available on this database yet.'], 409);
+            }
+            $sets[] = 'mobile = ?';
+            $params[] = $mobile;
+        }
+        if ($sets !== []) {
+            $params[] = $id;
+            $stmt = $pdo->prepare('UPDATE exam_requesters SET ' . implode(', ', $sets) . ' WHERE id = ?');
+            $stmt->execute($params);
+            $stmt->closeCursor();
+            audit_log($pdo, [
+                'companyId' => $companyId, 'actorRole' => $actorRole, 'actorId' => $actorId,
+                'action' => 'EXAM_REQUESTER_UPDATE', 'targetType' => 'exam_requester', 'targetId' => (string)$id,
+                'message' => "Exam requester updated: {$label}",
+                'metadata' => ['nameChanged' => in_array('name = ?', $sets, true), 'mobileChanged' => $mobileProvided],
+            ]);
+        }
+        json_response(['ok' => true, 'requester' => er_requester_public(er_fetch_requester($pdo, $id))]);
+    }
 
     if ($action === 'REGENERATE_CODE') {
         $code = er_generate_code();
@@ -1755,6 +1845,9 @@ if ($action === 'REJECT') {
         . '<p style="margin:0;color:#475569;">You can send a corrected request with the usual template and your security code.</p>';
     er_send_mail($pdo, $env, $request['company_id'] !== null ? (int)$request['company_id'] : null, er_requester_address($pdo, $request),
         '[ProctorGuard] Exam request #' . $requestId . ' was not approved', er_email_html('Exam request not approved', $inner));
+    // WhatsApp copy with the approver's note (trimmed to fit a template variable; the email has it in full).
+    $shortNote = mb_strlen($note, 'UTF-8') > 300 ? rtrim(mb_substr($note, 0, 297, 'UTF-8')) . '…' : $note;
+    whatsapp_notify_requester($pdo, $env, (int)($request['requester_id'] ?? 0), $requestId, (string)$details['title'], 'rejected: ' . $shortNote);
     audit_log($pdo, [
         'companyId' => $request['company_id'] !== null ? (int)$request['company_id'] : null, 'actorRole' => $actorRole, 'actorId' => $actorId,
         'action' => 'EXAM_REQUEST_REJECT', 'targetType' => 'exam_request', 'targetId' => (string)$requestId,

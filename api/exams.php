@@ -807,11 +807,22 @@ if ($method === 'POST') {
             $sStmt->closeCursor();
 
             $tokens = [];
+            $studentCompanies = [];
             foreach ($sRows as $r) {
                 $sid = (string)$r['id'];
                 $tokens[$sid] = mint_exam_access_token((string)$examId, $sid, (int)$r['company_id']);
+                $studentCompanies[$sid] = (int)$r['company_id'];
             }
-            json_response(['tokens' => $tokens]);
+            // Short-link codes ("<origin>/x/<code>") for the same (exam, student, company) — get-or-
+            // create, so a resend or a Links CSV reuses each student's existing code. A student with no
+            // code (allocation failed) is just absent from `codes`; the client then uses the token link.
+            $codes = [];
+            try {
+                $codes = exam_short_codes($pdo, (string)$examId, $studentCompanies);
+            } catch (Throwable $e) {
+                error_log('[exams] short link allocation failed: ' . $e->getMessage());
+            }
+            json_response(['tokens' => $tokens, 'codes' => (object)$codes]);
         }
         if ($action === 'DELETE' || $action === 'ARCHIVE') {
             $id = trim((string)($payload['id'] ?? ''));

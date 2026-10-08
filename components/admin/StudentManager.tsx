@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Upload, FileSpreadsheet, CheckCircle, AlertCircle, Search, UserPlus, X, XCircle, FileWarning, Loader2, Download, Layers3, Building2, Plus, Trash2 } from 'lucide-react';
+import { Upload, FileSpreadsheet, CheckCircle, AlertCircle, Search, UserPlus, X, XCircle, FileWarning, Loader2, Download, Layers3, Building2, Plus, Trash2, Phone } from 'lucide-react';
 import { Batch, Student, UserRole, CompanyDirectoryRecord } from '../../types';
-import { apiGet, apiPost } from '../../services/api';
+import { apiGet, apiPost, getApiErrorMessage } from '../../services/api';
 import { Pagination, usePagination } from './Pagination';
 
 interface CsvError {
@@ -88,6 +88,17 @@ const parseCsvLine = (line: string): string[] => {
 // front rather than letting the server's bare "contains @" check store them.
 const isValidEmail = (value: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 
+// Optional WhatsApp number. A quick shape check only — the server normalises it (10 digits get the
+// default country code, "+"/"00" mean international) and has the final say.
+const isPlausibleMobile = (value: string) => {
+  const v = value.trim();
+  if (!/^\+?[0-9\s\-().\/]+$/.test(v)) return false;
+  const digits = v.replace(/\D/g, '').length;
+  return digits >= 8 && digits <= 17;
+};
+// Stored as bare international digits ("919876543210"); shown with a leading +.
+const formatMobile = (value?: string | null) => (value ? `+${value}` : '');
+
 // Spreadsheet apps run a cell starting with = + - @ (or tab/CR) as a formula; prefix those with an
 // apostrophe, then quote anything containing a delimiter, quote or line break.
 const csvCell = (value: unknown) => {
@@ -148,10 +159,16 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
   const [selectedBatchId, setSelectedBatchId] = useState<number | ''>('');
 
   const [newBatch, setNewBatch] = useState({ name: '', description: '' });
-  const [newStudent, setNewStudent] = useState({ fullName: '', email: '', registrationId: '' });
+  const [newStudent, setNewStudent] = useState({ fullName: '', email: '', registrationId: '', mobile: '' });
   // In-flight guards so a double-click can't fire the same create twice.
   const [createBatchBusy, setCreateBatchBusy] = useState(false);
   const [addStudentBusy, setAddStudentBusy] = useState(false);
+
+  // Per-row "WhatsApp number" editor (the only student field editable in place).
+  const [mobileEditTarget, setMobileEditTarget] = useState<Student | null>(null);
+  const [mobileDraft, setMobileDraft] = useState('');
+  const [mobileSaveBusy, setMobileSaveBusy] = useState(false);
+  const [mobileSaveError, setMobileSaveError] = useState('');
 
   const [deleteStudentTarget, setDeleteStudentTarget] = useState<Student | null>(null);
   const [deleteStudentBusy, setDeleteStudentBusy] = useState(false);
@@ -251,15 +268,16 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
 
   // Escape dismisses whichever delete confirmation is open — never while its request is running.
   useEffect(() => {
-    if (!deleteStudentTarget && !confirmDeleteBatch) return;
+    if (!deleteStudentTarget && !confirmDeleteBatch && !mobileEditTarget) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       if (deleteStudentTarget && !deleteStudentBusy) setDeleteStudentTarget(null);
       if (confirmDeleteBatch && !deleteBatchBusy) setConfirmDeleteBatch(false);
+      if (mobileEditTarget && !mobileSaveBusy) setMobileEditTarget(null);
     };
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
-  }, [deleteStudentTarget, confirmDeleteBatch, deleteStudentBusy, deleteBatchBusy]);
+  }, [deleteStudentTarget, confirmDeleteBatch, deleteStudentBusy, deleteBatchBusy, mobileEditTarget, mobileSaveBusy]);
 
   const selectedBatch = useMemo(
     () => batches.find(batch => batch.id === selectedBatchId) || null,
@@ -271,7 +289,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
     if (!query) return students;
 
     return students.filter(student =>
-      [student.fullName, student.email, student.registrationId, student.company || '', ...(student.batches || []).map(b => b.name)]
+      [student.fullName, student.email, student.registrationId, student.mobile || '', student.company || '', ...(student.batches || []).map(b => b.name)]
         .some(value => value.toLowerCase().includes(query))
     );
   }, [search, students]);
@@ -336,6 +354,11 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
       alert(`"${email}" is not a valid email address.`);
       return;
     }
+    const mobile = newStudent.mobile.trim();
+    if (mobile && !isPlausibleMobile(mobile)) {
+      alert(`"${mobile}" is not a valid mobile number. Use 10 digits, or + and the country code — or leave it blank.`);
+      return;
+    }
 
     // The server matches existing students case-insensitively (emails are stored lowercase), so
     // compare the same way here.
@@ -353,6 +376,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
         fullName,
         email,
         registrationId,
+        // Only sent when filled in, so adding an existing student to another batch never clears a
+        // number they already have.
+        ...(mobile ? { mobile } : {}),
         companyId: effectiveCompanyId,
         batchId: selectedBatch.id,
         batch: selectedBatch.name,
@@ -366,7 +392,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
       if (result.students?.length) {
         onUpdateStudents(prev => mergeStudents(prev, result.students));
         setIsAddingStudent(false);
-        setNewStudent({ fullName: '', email: '', registrationId: '' });
+        setNewStudent({ fullName: '', email: '', registrationId: '', mobile: '' });
         setBatches(prev => prev.map(batch => (
           batch.id === selectedBatch.id
             ? { ...batch, studentCount: (batch.studentCount || 0) + result.students.length }
@@ -392,6 +418,46 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
       setBatches(data?.batches || []);
     } catch (e) {
       console.error('Failed to refresh batches:', e);
+    }
+  };
+
+  const openMobileEditor = (student: Student) => {
+    setMobileEditTarget(student);
+    setMobileDraft(formatMobile(student.mobile));
+    setMobileSaveError('');
+  };
+
+  // Saves through the normal upsert (matched by registration ID); '' clears the number.
+  const handleSaveMobile = async () => {
+    if (!mobileEditTarget || mobileSaveBusy) return;
+    const value = mobileDraft.trim();
+    if (value && !isPlausibleMobile(value)) {
+      setMobileSaveError('Enter 10 digits, or + and the country code — or leave it empty to remove the number.');
+      return;
+    }
+    setMobileSaveBusy(true);
+    setMobileSaveError('');
+    try {
+      const result = await apiPost<{ students: Student[]; errors?: string[] }>('students.php', {
+        fullName: mobileEditTarget.fullName,
+        email: mobileEditTarget.email,
+        registrationId: mobileEditTarget.registrationId,
+        mobile: value,
+        companyId: effectiveCompanyId,
+      });
+      if (result.errors?.length) {
+        setMobileSaveError(result.errors.join(' '));
+        return;
+      }
+      if (result.students?.length) {
+        onUpdateStudents(prev => mergeStudents(prev, result.students));
+      }
+      setMobileEditTarget(null);
+    } catch (e) {
+      console.error(e);
+      setMobileSaveError(getApiErrorMessage(e, 'Could not save the mobile number.'));
+    } finally {
+      setMobileSaveBusy(false);
     }
   };
 
@@ -480,8 +546,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
   };
 
   const downloadTemplate = () => {
-    const headers = 'Full Name,Registration ID,Email\n';
-    const sample = 'John Doe,REG2024003,john.doe@example.com\nJane Smith,REG2024004,jane.smith@example.com';
+    // Mobile is optional (used for WhatsApp notifications); 3-column files without it still work.
+    const headers = 'Full Name,Registration ID,Email,Mobile\n';
+    const sample = 'John Doe,REG2024003,john.doe@example.com,+91 98765 43210\nJane Smith,REG2024004,jane.smith@example.com,';
     const csvContent = `data:text/csv;charset=utf-8,${headers}${sample}`;
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
@@ -494,13 +561,14 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
 
   const exportStudents = () => {
     const rows = [
-      ['Company', 'Batch', 'Full Name', 'Registration ID', 'Email'],
+      ['Company', 'Batch', 'Full Name', 'Registration ID', 'Email', 'Mobile'],
       ...students.map(student => [
         student.company || effectiveCompanyLabel,
         student.batches.map(b => b.name).join(', '),
         student.fullName,
         student.registrationId,
         student.email,
+        formatMobile(student.mobile),
       ]),
     ];
     const csv = rows
@@ -518,10 +586,12 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
     URL.revokeObjectURL(url);
   };
 
-  const HEADER_ALIASES: Record<'name' | 'regId' | 'email', string[]> = {
+  const HEADER_ALIASES: Record<'name' | 'regId' | 'email' | 'mobile', string[]> = {
     name: ['full name', 'fullname', 'name', 'student name'],
     regId: ['registration id', 'registrationid', 'reg id', 'reg no', 'registration no', 'id', 'student id'],
     email: ['email', 'email address', 'e-mail'],
+    // Optional 4th column.
+    mobile: ['mobile', 'phone', 'whatsapp', 'mobile number', 'phone number', 'whatsapp number', 'mobile no', 'phone no'],
   };
 
   const findHeaderIndex = (headerCols: string[], aliases: string[]) =>
@@ -547,6 +617,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
     const nameIdx = findHeaderIndex(headerCols, HEADER_ALIASES.name);
     const regIdIdx = findHeaderIndex(headerCols, HEADER_ALIASES.regId);
     const emailIdx = findHeaderIndex(headerCols, HEADER_ALIASES.email);
+    const mobileIdx = findHeaderIndex(headerCols, HEADER_ALIASES.mobile); // -1 = no Mobile column
 
     if (nameIdx === -1 || regIdIdx === -1 || emailIdx === -1) {
       errors.push({ row: 1, message: 'Missing columns. Use headers: Full Name,Registration ID,Email.' });
@@ -570,6 +641,13 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
         errors.push({ row: i + 1, message: `Invalid email format: ${email}` });
         continue;
       }
+      // A blank mobile is fine (and leaves any number already on file untouched).
+      // Our own export writes "+91…" as "'+91…" (csvCell's formula guard), so drop that apostrophe.
+      const mobile = mobileIdx === -1 ? '' : (cols[mobileIdx] ?? '').replace(/^'/, '').trim();
+      if (mobile && !isPlausibleMobile(mobile)) {
+        errors.push({ row: i + 1, message: `Invalid mobile number: ${mobile} (use 10 digits or + and the country code, or leave it blank)` });
+        continue;
+      }
       const regKey = regId.toLowerCase();
       const emailKey = email.toLowerCase();
       if (seenRegIds.has(regKey) || seenEmails.has(emailKey)) {
@@ -584,6 +662,8 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
         fullName: name,
         registrationId: regId,
         email,
+        // Omitted (not sent) when blank, so re-uploading a file never wipes stored numbers.
+        ...(mobile ? { mobile } : {}),
         batches: [],
       });
     }
@@ -859,7 +939,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               <X size={18} className="text-slate-500 hover:text-slate-700" />
             </button>
           </div>
-          <div className="grid grid-cols-1 md:grid-cols-5 gap-5">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-5">
             <div>
               <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Company</label>
               <input type="text" className="w-full p-2.5 border border-slate-200 rounded-lg bg-slate-50 text-slate-600" value={effectiveCompanyLabel} readOnly />
@@ -899,6 +979,21 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
                 className="w-full p-2.5 border border-slate-200 rounded-lg outline-none transition-all bg-white"
                 value={newStudent.email}
                 onChange={e => setNewStudent({ ...newStudent, email: e.target.value })}
+              />
+            </div>
+            <div>
+              <label htmlFor="new-student-mobile" className="block text-xs font-semibold text-slate-500 uppercase mb-1">
+                Mobile <span className="normal-case font-normal text-slate-400">(optional, WhatsApp)</span>
+              </label>
+              <input
+                id="new-student-mobile"
+                type="tel"
+                inputMode="tel"
+                autoComplete="tel"
+                placeholder="+91 98765 43210"
+                className="w-full p-2.5 border border-slate-200 rounded-lg outline-none transition-all bg-white"
+                value={newStudent.mobile}
+                onChange={e => setNewStudent({ ...newStudent, mobile: e.target.value })}
               />
             </div>
           </div>
@@ -970,7 +1065,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
                   {dragActive ? 'Drop file here' : 'Upload Student Data'}
                 </h4>
                 <p className="text-slate-500 text-sm max-w-[220px] mx-auto leading-relaxed">
-                  Select a batch first, then upload CSV with student name, registration ID, and email.
+                  Select a batch first, then upload CSV with student name, registration ID, email and (optionally) mobile.
                 </p>
                 <div className="mt-6 flex items-center gap-2 text-xs font-medium text-slate-400 bg-slate-100 px-3 py-1 rounded-full group-hover:bg-blue-50 group-hover:text-blue-500 transition-colors">
                   <FileSpreadsheet size={12} />
@@ -1062,7 +1157,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
           </div>
           <div className="overflow-y-auto flex-1 scrollbar-thin scrollbar-thumb-slate-200 hover:scrollbar-thumb-slate-300">
             <div className="lsc-table-wrap">
-              <table className="w-full min-w-[1080px] text-left">
+              <table className="w-full min-w-[1220px] text-left">
                 <thead className="bg-white border-b border-slate-100 sticky top-0 z-10 shadow-sm">
                   <tr>
                     <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur">Company</th>
@@ -1070,6 +1165,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
                     <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur">Registration ID</th>
                     <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur">Full Name</th>
                     <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur">Email Address</th>
+                    <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur">Mobile</th>
                     <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur text-center">Status</th>
                     <th className="px-6 py-4 text-xs font-bold text-slate-400 uppercase tracking-wider bg-slate-50/80 backdrop-blur text-right">Actions</th>
                   </tr>
@@ -1110,6 +1206,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
                         </div>
                       </td>
                       <td className="px-6 py-4 text-sm text-slate-500">{student.email}</td>
+                      <td className="px-6 py-4 text-sm text-slate-500 whitespace-nowrap font-mono">
+                        {student.mobile ? formatMobile(student.mobile) : <span className="text-slate-300 font-sans">—</span>}
+                      </td>
                       <td className="px-6 py-4 text-center">
                         {student.enrolled ? (
                           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-teal-100 text-teal-700 text-[10px] font-bold uppercase tracking-wide border border-teal-200">
@@ -1137,6 +1236,15 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
                           )}
                           <button
                             type="button"
+                            onClick={() => openMobileEditor(student)}
+                            className="inline-flex items-center justify-center h-8 w-8 rounded-lg text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 transition-colors"
+                            title={`${student.mobile ? 'Change' : 'Add'} WhatsApp mobile for ${student.fullName}`}
+                            aria-label={`${student.mobile ? 'Change' : 'Add'} mobile number for ${student.fullName}`}
+                          >
+                            <Phone size={16} />
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => setDeleteStudentTarget(student)}
                             className="inline-flex items-center justify-center h-8 w-8 rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors"
                             title={`Delete ${student.fullName} entirely (all batches)`}
@@ -1150,7 +1258,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
                   ))}
                   {filteredStudents.length === 0 && (
                     <tr>
-                      <td colSpan={7} className="py-20 text-center text-slate-400">
+                      <td colSpan={8} className="py-20 text-center text-slate-400">
                         <div className="flex flex-col items-center justify-center">
                           <div className="bg-slate-100 p-4 rounded-full mb-3">
                             <UserPlus size={24} className="text-slate-300" />
@@ -1184,6 +1292,65 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
           )}
         </div>
       </div>
+
+      {mobileEditTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40" onClick={() => !mobileSaveBusy && setMobileEditTarget(null)}>
+          <form
+            className="lsc-card w-full max-w-md p-6 max-h-[90vh] overflow-y-auto"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="edit-mobile-title"
+            onClick={e => e.stopPropagation()}
+            onSubmit={e => { e.preventDefault(); handleSaveMobile(); }}
+          >
+            <div className="flex items-start gap-3">
+              <div className="lsc-icon-tile-primary p-2.5 shrink-0">
+                <Phone size={18} />
+              </div>
+              <div className="min-w-0">
+                <h3 id="edit-mobile-title" className="text-lg font-semibold text-slate-900">WhatsApp mobile</h3>
+                <p className="text-sm text-slate-500 mt-1">
+                  For <span className="font-medium text-slate-800">{mobileEditTarget.fullName}</span> ({mobileEditTarget.registrationId}). Used only for WhatsApp exam notifications.
+                </p>
+              </div>
+            </div>
+            <div className="mt-5">
+              <label htmlFor="edit-student-mobile" className="block text-xs font-semibold text-slate-500 uppercase mb-1">Mobile number</label>
+              <input
+                id="edit-student-mobile"
+                type="tel"
+                inputMode="tel"
+                autoComplete="tel"
+                autoFocus
+                placeholder="+91 98765 43210"
+                className="w-full p-2.5 border border-slate-200 rounded-lg outline-none transition-all bg-white"
+                value={mobileDraft}
+                onChange={e => { setMobileDraft(e.target.value); setMobileSaveError(''); }}
+              />
+              <p className="text-xs text-slate-400 mt-1.5">10 digits get the default country code; otherwise start with + and the country code. Leave empty to remove the number.</p>
+              {mobileSaveError && <p role="alert" className="text-xs text-red-600 mt-2">{mobileSaveError}</p>}
+            </div>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setMobileEditTarget(null)}
+                disabled={mobileSaveBusy}
+                className="px-5 py-2 lsc-button-ghost text-sm"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={mobileSaveBusy}
+                className="px-5 py-2 lsc-button-primary text-sm disabled:opacity-60 flex items-center gap-2"
+              >
+                {mobileSaveBusy && <Loader2 size={15} className="animate-spin" />}
+                {mobileSaveBusy ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {deleteStudentTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40" onClick={() => !deleteStudentBusy && setDeleteStudentTarget(null)}>

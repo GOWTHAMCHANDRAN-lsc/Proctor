@@ -212,6 +212,12 @@ try {
     er_send_mail($pdo, $env, $companyId, (string)$requester['email'],
         '[ProctorGuard] Exam request #' . $id . ' received — pending super-admin approval',
         er_email_html('Exam request #' . $id . ' received', $inner));
+    // WhatsApp copy for the employee (only for an authenticated, stored request — never for unknown
+    // senders or failed security codes). No-op until WhatsApp is configured; never throws.
+    whatsapp_notify_requester($pdo, $env, $requesterId, (int)$id, (string)($details['title'] ?? ''),
+        $errors
+            ? 'received, needs attention (' . count($errors) . ' problem' . (count($errors) === 1 ? '' : 's') . ' to fix) — pending approval'
+            : 'received, pending approval');
 
     intake_out(['ok' => true, 'requestId' => $id, 'status' => 'PENDING', 'errors' => count($errors)]);
 } catch (Throwable $e) {

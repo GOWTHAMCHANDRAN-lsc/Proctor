@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Batch, Exam, ExamMailKind, Question, QuestionType, Student, NotificationTemplate, UserRole, CompanyDirectoryRecord } from '../../types';
-import { Plus, Trash2, Save, FileSpreadsheet, Upload, Download, CheckCircle, AlertCircle, Share2, Calendar, Clock, XCircle, FileWarning, Users, Search, Lock, Mail, Send, Loader2, Shuffle, Bell, ListOrdered, Eye, Copy, Monitor, Tablet, Smartphone, Pencil, Award, Library, Camera, Mic, Maximize, ShieldCheck, ShieldOff, Info } from 'lucide-react';
-import type { DeviceType, ProctoringMode, QuestionBank, QuestionBankDetail } from '../../types';
+import { Plus, Trash2, Save, FileSpreadsheet, Upload, Download, CheckCircle, AlertCircle, Share2, Calendar, Clock, XCircle, FileWarning, Users, Search, Lock, Mail, Send, Loader2, Shuffle, Bell, ListOrdered, Eye, Copy, Monitor, Tablet, Smartphone, Pencil, Award, Library, Camera, Mic, Maximize, ShieldCheck, ShieldOff, Info, MessageCircle } from 'lucide-react';
+import type { DeviceType, ProctoringMode, QuestionBank, QuestionBankDetail, WhatsAppSendSummary, WhatsAppStatus } from '../../types';
 import { ExamTake } from '../student/ExamTake';
 import { ApiError, apiGet, apiPost, getApiErrorMessage } from '../../services/api';
 import { Pagination, usePagination } from './Pagination';
@@ -30,6 +30,8 @@ const formatDuration = (mins: number): string => {
 type ExamRecipient = {
   id: string; fullName: string; email: string; registrationId: string; companyId: number;
   invitedAt?: number | null; token?: string;
+  // Short-link code: the student's link is `${origin}/x/${code}` (falls back to ?token= without one).
+  code?: string;
   attemptCount?: number;
   attemptStatus?: 'NOT_STARTED' | 'IN_PROGRESS' | 'COMPLETED' | 'TERMINATED';
   completed?: boolean;
@@ -60,6 +62,13 @@ const filterByAudience = (recipients: ExamRecipient[], audience: MailAudience): 
       return recipients;
   }
 };
+
+// A student's personal exam link: the short `/x/<code>` form when the server allocated a code, else
+// the long signed `?token=` link (both open the same exam; codes and tokens are minted server-side).
+const examLinkFor = (r: Pick<ExamRecipient, 'code' | 'token'>): string =>
+  r.code ? `${window.location.origin}/x/${r.code}` : `${window.location.origin}?token=${r.token}`;
+// Placeholder link for previews and sample emails (never a real code).
+const sampleExamLink = () => `${window.location.origin}/x/SAMPLE12345`;
 
 // Built-in copy for each mail kind. These are only the DEFAULTS — an admin can override the subject
 // and message per exam in the Mail Composer (persisted as exam.mailTemplates), and the invitation
@@ -624,7 +633,15 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   // JSON snapshot of the exam as it was when the editor opened, so Cancel can warn about unsaved edits.
   const editorSnapshotRef = useRef<string>('');
   // Set when an exam has both already-invited and newly-assigned students: the admin picks who to mail.
-  const [inviteScopeTarget, setInviteScopeTarget] = useState<{ exam: Exam; recipients: ExamRecipient[]; pending: ExamRecipient[] } | null>(null);
+  // Also used (with confirmText) as the plain send confirmation when WhatsApp invitations are on, so
+  // the "Also send on WhatsApp" checkbox can sit next to the send button.
+  const [inviteScopeTarget, setInviteScopeTarget] = useState<{ exam: Exam; recipients: ExamRecipient[]; pending: ExamRecipient[]; confirmText?: string } | null>(null);
+  // WhatsApp copies of invitations/reminders. Nothing is shown unless the server says WhatsApp is ready
+  // for that message kind (it ships disabled until .env is configured — see docs/WHATSAPP_SETUP.md).
+  const [waStatus, setWaStatus] = useState<WhatsAppStatus | null>(null);
+  const [waOptIn, setWaOptIn] = useState(true);
+  // Student ids (of the exam being sent) that have a mobile number; null while loading.
+  const [waCoverage, setWaCoverage] = useState<{ examId: string; ids: Set<string> } | null>(null);
   // Per-exam Mail Composer: pick the audience (e.g. only students who never attempted), edit the
   // subject/message, preview it, optionally save it as this exam's default, then send.
   const [mailComposer, setMailComposer] = useState<{
@@ -1778,6 +1795,80 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     }
   };
 
+  // --- WhatsApp (optional companion to the invitation / reminder emails) ---
+  useEffect(() => {
+    let cancelled = false;
+    apiGet<WhatsAppStatus>('whatsapp.php')
+      .then(status => { if (!cancelled) setWaStatus(status); })
+      .catch(() => { if (!cancelled) setWaStatus(null); }); // unavailable = treated as "off"
+    return () => { cancelled = true; };
+  }, []);
+
+  const waReadyFor = (kind: ExamMailKind): boolean => !!waStatus?.ready && !!waStatus.kinds?.[kind];
+
+  // Which of these recipients have a mobile number (for the "N of M" hint). Best-effort.
+  const loadWaCoverage = async (exam: Exam, recipients: ExamRecipient[]) => {
+    setWaCoverage(null);
+    const ids = recipients.map(r => r.id);
+    const withMobile = new Set<string>();
+    try {
+      for (let i = 0; i < ids.length; i += 5000) {
+        const res = await apiPost<{ withMobile: string[] }>('whatsapp.php', withCompany({ action: 'COVERAGE', studentIds: ids.slice(i, i + 5000) }));
+        (res?.withMobile || []).forEach(id => withMobile.add(id));
+      }
+    } catch (e) {
+      console.error('Could not check which students have a mobile number:', e);
+    }
+    setWaCoverage({ examId: exam.id, ids: withMobile });
+  };
+
+  // Send the WhatsApp copy to students whose email went out, in small chunks so no single request
+  // runs long. Counts are summed across chunks.
+  const sendWhatsAppNotices = async (exam: Exam, studentIds: string[], kind: ExamMailKind): Promise<WhatsAppSendSummary> => {
+    const total: WhatsAppSendSummary = { sent: 0, failed: 0, skippedNoMobile: 0, skippedDisabled: 0, failures: [] };
+    for (let i = 0; i < studentIds.length; i += 25) {
+      const res = await apiPost<WhatsAppSendSummary>('whatsapp.php', withCompany({
+        action: 'SEND_EXAM_NOTICE',
+        examId: exam.id,
+        kind,
+        studentIds: studentIds.slice(i, i + 25),
+      }));
+      total.sent += res?.sent || 0;
+      total.failed += res?.failed || 0;
+      total.skippedNoMobile += res?.skippedNoMobile || 0;
+      total.skippedDisabled += res?.skippedDisabled || 0;
+      total.failures.push(...(res?.failures || []));
+    }
+    return total;
+  };
+
+  // "Also send on WhatsApp (N of M recipients have a mobile number)" — shared by the invitation
+  // dialog and the Mail Composer. Renders nothing when WhatsApp isn't ready for this kind.
+  const renderWhatsAppOptIn = (exam: Exam, kind: ExamMailKind, targets: ExamRecipient[]) => {
+    if (!waReadyFor(kind)) return null;
+    const coverage = waCoverage && waCoverage.examId === exam.id ? waCoverage.ids : null;
+    const withMobile = coverage ? targets.filter(t => coverage.has(t.id)).length : null;
+    return (
+      <label className="flex items-start gap-2 text-sm text-slate-700 cursor-pointer select-none">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={waOptIn}
+          onChange={e => setWaOptIn(e.target.checked)}
+        />
+        <span className="flex items-center gap-1.5 flex-wrap">
+          <MessageCircle size={14} className="text-emerald-600 shrink-0" aria-hidden="true" />
+          Also send on WhatsApp
+          <span className="text-slate-500">
+            {withMobile === null
+              ? '(checking mobile numbers…)'
+              : `(${withMobile} of ${targets.length} recipient${targets.length === 1 ? ' has' : 's have'} a mobile number)`}
+          </span>
+        </span>
+      </label>
+    );
+  };
+
   // --- Email System Logic ---
   // Resolve the real recipients for an exam. When students are explicitly assigned we fetch them
   // from the server so cross-company assignments (a super admin can pick batches from any company)
@@ -1833,12 +1924,12 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   // missing so a caller never mails an invitation with an empty (useless) link.
   const mintAccessTokens = async (exam: Exam, recipients: ExamRecipient[]): Promise<ExamRecipient[]> => {
     if (recipients.length === 0) return recipients;
-    const { tokens } = await apiPost<{ tokens: Record<string, string> }>('exams.php', {
+    const { tokens, codes } = await apiPost<{ tokens: Record<string, string>; codes?: Record<string, string> }>('exams.php', {
       action: 'MINT_ACCESS_TOKENS',
       examId: exam.id,
       studentIds: recipients.map(r => r.id),
     });
-    const withTokens = recipients.map(r => ({ ...r, token: tokens?.[r.id] }));
+    const withTokens = recipients.map(r => ({ ...r, token: tokens?.[r.id], code: codes?.[r.id] || undefined }));
     const missing = withTokens.filter(r => !r.token);
     if (missing.length > 0) {
       throw new Error(
@@ -1876,6 +1967,12 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
 
     // Mixed roster — students were added after the exam went out. Re-mailing everyone would push a
     // duplicate invitation at candidates who may already be sitting the exam, so make it a choice.
+    const waInvites = waReadyFor('INVITE');
+    if (waInvites) {
+      setWaOptIn(true);
+      void loadWaCoverage(exam, recipients);
+    }
+
     if (pending.length > 0 && pending.length < recipients.length) {
       setInviteScopeTarget({ exam, recipients, pending });
       return;
@@ -1886,6 +1983,11 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     const confirmText = pending.length === 0
       ? `All ${recipients.length} assigned students have already been sent a link. Resend the same invitation to all of them?`
       : `Are you sure you want to send exam invitations to ${recipients.length} students?`;
+    if (waInvites) {
+      // Same question, in the in-app dialog so the WhatsApp opt-in can sit next to the send button.
+      setInviteScopeTarget({ exam, recipients, pending, confirmText });
+      return;
+    }
     if (!confirm(confirmText)) return;
     await dispatchEmails(exam, recipients, false);
   };
@@ -1895,6 +1997,8 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     targetStudents: ExamRecipient[],
     reminder: boolean,
     override?: { subject?: string; message?: string },
+    // Also send the WhatsApp copy to the students whose email went out (caller checked readiness).
+    whatsapp = false,
   ) => {
     setEmailSendingId(exam.id);
     setSendingMode(reminder ? 'reminder' : 'notify');
@@ -1904,8 +2008,8 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
           // Reminder emails carry the exam details only — no access link/token.
           // The token is minted+signed server-side (resolveRecipients); we never build it here.
           let link = '';
-          if (!reminder && student.token) {
-            link = `${window.location.origin}?token=${student.token}`;
+          if (!reminder && (student.code || student.token)) {
+            link = examLinkFor(student);
           }
 
           const { subject, body } = buildExamEmailContent(exam, student.fullName, link, reminder, override);
@@ -1923,11 +2027,11 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
 
         // Record who actually received a link. Addresses that bounced stay uninvited so the next send
         // retries them instead of quietly leaving those students without a way in.
+        const failedTo = new Set((result.failed || []).map(f => (f.to || '').trim().toLowerCase()));
+        const deliveredIds = targetStudents
+          .filter(s => !failedTo.has(s.email.trim().toLowerCase()))
+          .map(s => s.id);
         if (!reminder) {
-          const failedTo = new Set((result.failed || []).map(f => (f.to || '').trim().toLowerCase()));
-          const deliveredIds = targetStudents
-            .filter(s => !failedTo.has(s.email.trim().toLowerCase()))
-            .map(s => s.id);
           if (deliveredIds.length > 0) {
             try {
               await apiPost('exams.php', withCompany({ action: 'MARK_INVITED', examId: exam.id, studentIds: deliveredIds }));
@@ -1940,10 +2044,30 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
           }
         }
 
+        // WhatsApp copy for the students whose email went out. A WhatsApp problem is reported in the
+        // same summary but never undoes or blocks the email side, which has already happened.
+        let waLine = '';
+        if (whatsapp && deliveredIds.length > 0) {
+          try {
+            const wa = await sendWhatsAppNotices(exam, deliveredIds, reminder ? 'REMINDER' : 'INVITE');
+            const parts = [`${wa.sent} sent`];
+            if (wa.failed > 0) parts.push(`${wa.failed} failed`);
+            if (wa.skippedNoMobile > 0) parts.push(`${wa.skippedNoMobile} without a mobile number`);
+            if (wa.skippedDisabled > 0) parts.push(`${wa.skippedDisabled} skipped (WhatsApp not configured)`);
+            waLine = `\nWhatsApp: ${parts.join(', ')}.`;
+            if (wa.failures.length > 0) {
+              waLine += ` First error: ${wa.failures[0].error}`;
+            }
+          } catch (err) {
+            console.error('WhatsApp send failed:', err);
+            waLine = `\nWhatsApp: ${apiErrorMessage(err, 'the WhatsApp messages could not be sent.')}`;
+          }
+        }
+
         if (result.failed && result.failed.length > 0) {
-          alert(`Sent ${result.sent} emails. Failed: ${result.failed.length}. Check server response for details.`);
+          alert(`Sent ${result.sent} emails. Failed: ${result.failed.length}. Check server response for details.${waLine}`);
         } else {
-          alert(`Success! ${reminder ? 'Reminders' : 'Invitations'} sent to ${result.sent} students.`);
+          alert(`Success! ${reminder ? 'Reminders' : 'Invitations'} sent to ${result.sent} students.${waLine}`);
         }
     } catch (e) {
         console.error(e);
@@ -1979,6 +2103,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       // Tokens are minted at send time for the filtered audience only, so skip them here.
       const recipients = await resolveRecipients(exam, false);
       setMailComposer(prev => (prev && prev.exam.id === exam.id ? { ...prev, recipients, loading: false } : prev));
+      if (waReadyFor('INVITE') || waReadyFor('REMINDER')) {
+        setWaOptIn(true);
+        void loadWaCoverage(exam, recipients);
+      }
     } catch (e: any) {
       console.error(e);
       setMailComposer(prev => (prev && prev.exam.id === exam.id
@@ -2096,7 +2224,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     await dispatchEmails(composer.exam, sendTargets, composer.kind === 'REMINDER', {
       subject: composer.subject,
       message: composer.message,
-    });
+    }, waReadyFor(composer.kind) && waOptIn);
   };
 
   // --- Link Generation & Export ---
@@ -2127,9 +2255,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     }
 
     targetStudents.forEach(student => {
-      // The signed token is minted server-side (resolveRecipients, validated non-empty above). Never
-      // build it client-side — an unsigned token would be forgeable and defeat impersonation protection.
-      const link = `${window.location.origin}?token=${student.token}`;
+      // The signed token / short code is minted server-side (resolveRecipients, validated non-empty
+      // above). Never build a token client-side — an unsigned one would be forgeable.
+      const link = examLinkFor(student);
 
       // Lets an admin filter the sheet down to students who were added after the invitations went out.
       const inviteStatus = student.invitedAt
@@ -4177,7 +4305,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
           durationMinutes: newExam.durationMinutes || 60,
           proctoringConfig: effectiveProctoringConfig(proctoringConfig),
         } as Exam;
-        const sampleLink = `${window.location.origin}?token=SAMPLE-TOKEN`;
+        const sampleLink = sampleExamLink();
         const { subject, body } = buildExamEmailContent(
           mailPreviewExam,
           'Sample Student',
@@ -4241,7 +4369,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     const reminder = kind === 'REMINDER';
     const targets = filterByAudience(recipients, audience);
     const sample = targets[0] || recipients[0];
-    const previewLink = reminder ? '' : `${window.location.origin}?token=SAMPLE-TOKEN`;
+    const previewLink = reminder ? '' : sampleExamLink();
     const preview = buildExamEmailContent(exam, sample?.fullName || 'Sample Student', previewLink, reminder, { subject, message });
     const busy = saving || emailSendingId === exam.id;
 
@@ -4383,11 +4511,14 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
           </div>
 
           <div className="p-4 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3 bg-slate-50">
-            <p className="text-sm text-slate-600">
-              {loading
-                ? 'Resolving recipients…'
-                : <>Sending to <span className="font-semibold text-slate-900">{targets.length}</span> of {recipients.length} assigned student{recipients.length === 1 ? '' : 's'}</>}
-            </p>
+            <div className="space-y-1.5 min-w-0">
+              <p className="text-sm text-slate-600">
+                {loading
+                  ? 'Resolving recipients…'
+                  : <>Sending to <span className="font-semibold text-slate-900">{targets.length}</span> of {recipients.length} assigned student{recipients.length === 1 ? '' : 's'}</>}
+              </p>
+              {!loading && renderWhatsAppOptIn(exam, kind, targets)}
+            </div>
             <div className="flex items-center gap-2">
               <button
                 onClick={closeComposer}
@@ -4419,33 +4550,57 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
           <div className="w-full max-w-md rounded-2xl bg-white shadow-xl border border-slate-200">
             <div className="p-5 border-b border-slate-100">
               <h3 className="text-lg font-semibold text-slate-900">Send Invitations</h3>
-              <p className="text-sm text-slate-600 mt-1">
-                <span className="font-medium text-slate-900">{inviteScopeTarget.pending.length}</span> of{' '}
-                {inviteScopeTarget.recipients.length} students assigned to{' '}
-                <span className="font-medium text-slate-900">{inviteScopeTarget.exam.title}</span> have not received a link yet.
-              </p>
+              {inviteScopeTarget.confirmText ? (
+                <p className="text-sm text-slate-600 mt-1">{inviteScopeTarget.confirmText}</p>
+              ) : (
+                <p className="text-sm text-slate-600 mt-1">
+                  <span className="font-medium text-slate-900">{inviteScopeTarget.pending.length}</span> of{' '}
+                  {inviteScopeTarget.recipients.length} students assigned to{' '}
+                  <span className="font-medium text-slate-900">{inviteScopeTarget.exam.title}</span> have not received a link yet.
+                </p>
+              )}
             </div>
             <div className="p-5 space-y-3">
-              <button
-                onClick={() => {
-                  const target = inviteScopeTarget;
-                  setInviteScopeTarget(null);
-                  dispatchEmails(target.exam, target.pending, false);
-                }}
-                className="w-full px-4 py-2.5 rounded-lg bg-blue-600 text-white font-medium hover:bg-blue-700"
-              >
-                Send to {inviteScopeTarget.pending.length} new students only
-              </button>
-              <button
-                onClick={() => {
-                  const target = inviteScopeTarget;
-                  setInviteScopeTarget(null);
-                  dispatchEmails(target.exam, target.recipients, false);
-                }}
-                className="w-full px-4 py-2.5 rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50"
-              >
-                Resend to all {inviteScopeTarget.recipients.length} students
-              </button>
+              {waReadyFor('INVITE') && (
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+                  {renderWhatsAppOptIn(inviteScopeTarget.exam, 'INVITE', inviteScopeTarget.confirmText ? inviteScopeTarget.recipients : inviteScopeTarget.pending)}
+                </div>
+              )}
+              {inviteScopeTarget.confirmText ? (
+                <button
+                  onClick={() => {
+                    const target = inviteScopeTarget;
+                    setInviteScopeTarget(null);
+                    dispatchEmails(target.exam, target.recipients, false, undefined, waReadyFor('INVITE') && waOptIn);
+                  }}
+                  className="w-full px-4 py-2.5 rounded-lg bg-blue-600 text-white font-medium hover:bg-blue-700"
+                >
+                  Send to {inviteScopeTarget.recipients.length} student{inviteScopeTarget.recipients.length === 1 ? '' : 's'}
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={() => {
+                      const target = inviteScopeTarget;
+                      setInviteScopeTarget(null);
+                      dispatchEmails(target.exam, target.pending, false, undefined, waReadyFor('INVITE') && waOptIn);
+                    }}
+                    className="w-full px-4 py-2.5 rounded-lg bg-blue-600 text-white font-medium hover:bg-blue-700"
+                  >
+                    Send to {inviteScopeTarget.pending.length} new students only
+                  </button>
+                  <button
+                    onClick={() => {
+                      const target = inviteScopeTarget;
+                      setInviteScopeTarget(null);
+                      dispatchEmails(target.exam, target.recipients, false, undefined, waReadyFor('INVITE') && waOptIn);
+                    }}
+                    className="w-full px-4 py-2.5 rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50"
+                  >
+                    Resend to all {inviteScopeTarget.recipients.length} students
+                  </button>
+                </>
+              )}
               <p className="text-xs text-slate-400 text-center px-2">
                 Existing links never change — resending only mails the same link again.
               </p>

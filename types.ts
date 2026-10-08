@@ -264,6 +264,8 @@ export interface ExamRequester {
   codeHint?: string | null;
   createdAt: number;
   lastRequestAt?: number | null;
+  /** Optional WhatsApp number for request status updates (bare international digits). */
+  mobile?: string | null;
 }
 
 export type ExamMailKind = 'INVITE' | 'REMINDER';
@@ -289,6 +291,8 @@ export interface Student {
   fullName: string;
   email: string;
   registrationId: string;
+  /** Optional WhatsApp number, stored as bare international digits (e.g. "919876543210"). */
+  mobile?: string | null;
   companyId?: number;
   company?: string;
   batches: { id: number; name: string }[];
@@ -522,7 +526,7 @@ export interface NotificationTemplate {
 
 export interface DeliveryLog {
   id: number;
-  channel: 'EMAIL' | 'SMS';
+  channel: 'EMAIL' | 'SMS' | 'WHATSAPP';
   recipient: string;
   subject?: string | null;
   body?: string | null;
@@ -658,4 +662,26 @@ export interface RecordingSummary {
   screenCount: number;
   combinedCount: number;
   totalCount: number;
+}
+
+/** GET api/whatsapp.php — WhatsApp notification status (no secrets). */
+export type WhatsAppKind = 'INVITE' | 'REMINDER' | 'REQUEST_UPDATE';
+export interface WhatsAppStatus {
+  enabled: boolean;
+  provider: 'meta' | 'lsc' | null;
+  /** True once enabled + provider credentials + at least one template are configured. */
+  ready: boolean;
+  /** Which message kinds have a template name configured. */
+  kinds: Record<WhatsAppKind, boolean>;
+  /** .env keys that still need setting (names only, never values). */
+  issues?: string[];
+}
+
+/** POST api/whatsapp.php {action:'SEND_EXAM_NOTICE'} result. */
+export interface WhatsAppSendSummary {
+  sent: number;
+  failed: number;
+  skippedNoMobile: number;
+  skippedDisabled: number;
+  failures: { studentId: string; error: string }[];
 }

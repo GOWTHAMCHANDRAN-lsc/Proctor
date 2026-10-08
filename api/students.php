@@ -68,15 +68,23 @@ function normalize_batch_name($value): ?string {
     return $name !== '' ? $name : null;
 }
 
+// Optional WhatsApp number (students.mobile, added by ensure_whatsapp_schema()). Selected as NULL when
+// the column could not be added, so every query below works either way.
+function student_mobile_select(): string {
+    return !empty($GLOBALS['pg_students_mobile_ready']) ? 'mobile' : 'NULL';
+}
+
 function normalize_student_row(array $row, array $batches = []): array {
     $companyId = (int)($row['company_id'] ?? $row['companyId'] ?? 0);
     $enrolledAt = $row['enrolled_at'] ?? null;
+    $mobile = isset($row['mobile']) && trim((string)$row['mobile']) !== '' ? (string)$row['mobile'] : null;
 
     return [
         'id' => (string)$row['id'],
         'fullName' => (string)($row['full_name'] ?? $row['fullName'] ?? ''),
         'email' => (string)$row['email'],
         'registrationId' => (string)($row['registration_id'] ?? $row['registrationId'] ?? ''),
+        'mobile' => $mobile,
         'companyId' => $companyId,
         'company' => normalize_company_label($companyId),
         'batches' => $batches,
@@ -87,12 +95,14 @@ function normalize_student_row(array $row, array $batches = []): array {
 
 function fetch_students(PDO $pdo, int $companyId, bool $withBatchData, bool $enrollReady = false): array {
     $enrolledExpr = $enrollReady ? 'enrolled_at' : 'NULL';
+    $mobileExpr = student_mobile_select();
     $stmt = $pdo->prepare("SELECT
                              id,
                              full_name,
                              email,
                              registration_id,
                              company_id,
+                             {$mobileExpr} AS mobile,
                              {$enrolledExpr} AS enrolled_at
                            FROM students
                            WHERE company_id = ?
@@ -119,12 +129,14 @@ function fetch_students(PDO $pdo, int $companyId, bool $withBatchData, bool $enr
 }
 
 function fetch_student_by_id(PDO $pdo, int $companyId, string $studentId, bool $withBatchData): ?array {
+    $mobileExpr = student_mobile_select();
     $stmt = $pdo->prepare("SELECT
                              id,
                              full_name,
                              email,
                              registration_id,
-                             company_id
+                             company_id,
+                             {$mobileExpr} AS mobile
                            FROM students
                            WHERE company_id = ? AND id = ?
                            LIMIT 1");
@@ -194,6 +206,17 @@ try {
 } catch (Throwable $e) {
     $schemaReady = false;
 }
+
+// students.mobile (optional WhatsApp number) + the WHATSAPP delivery channel. Best effort: when the
+// column can't be added, mobile is simply not stored or returned.
+$GLOBALS['pg_students_mobile_ready'] = false;
+try {
+    $GLOBALS['pg_students_mobile_ready'] = !empty(ensure_whatsapp_schema($pdo)['studentsMobile']);
+} catch (Throwable $e) {
+    $GLOBALS['pg_students_mobile_ready'] = false;
+}
+$mobileReady = (bool)$GLOBALS['pg_students_mobile_ready'];
+$mobileCountryCode = substr((string)preg_replace('/\D+/', '', (string)pg_env('WHATSAPP_COUNTRY_CODE', '91')), 0, 4) ?: '91';
 
 $enrollReady = false;
 try {
@@ -404,6 +427,22 @@ if ($method === 'POST') {
             continue;
         }
 
+        // Optional WhatsApp number. Key absent (or null) = leave whatever is stored alone, so a
+        // 3-column CSV re-upload never wipes numbers; '' = clear it; anything else must normalise to
+        // a valid international number (stored as bare digits, e.g. 919876543210).
+        $mobileProvided = $mobileReady && array_key_exists('mobile', $item) && $item['mobile'] !== null;
+        $mobile = null;
+        if ($mobileProvided) {
+            $rawMobile = is_scalar($item['mobile']) ? trim((string)$item['mobile']) : '[invalid]';
+            if ($rawMobile !== '') {
+                $mobile = normalize_mobile($rawMobile, $mobileCountryCode);
+                if ($mobile === null) {
+                    $errors[] = "Row skipped for {$registrationId}: invalid mobile number \"" . mb_substr($rawMobile, 0, 40, 'UTF-8') . "\" (use 10 digits or +country code).";
+                    continue;
+                }
+            }
+        }
+
         try {
             $resolvedBatchId = null;
             $resolvedBatchName = null;
@@ -446,10 +485,17 @@ if ($method === 'POST') {
 
             if ($existing) {
                 $studentId = (string)$existing['id'];
-                $update = $pdo->prepare("UPDATE students
-                                         SET full_name = ?, email = ?, registration_id = ?
-                                         WHERE id = ? AND company_id = ?");
-                $update->execute([$fullName, $email, $registrationId, $studentId, $companyId]);
+                if ($mobileProvided) {
+                    $update = $pdo->prepare("UPDATE students
+                                             SET full_name = ?, email = ?, registration_id = ?, mobile = ?
+                                             WHERE id = ? AND company_id = ?");
+                    $update->execute([$fullName, $email, $registrationId, $mobile, $studentId, $companyId]);
+                } else {
+                    $update = $pdo->prepare("UPDATE students
+                                             SET full_name = ?, email = ?, registration_id = ?
+                                             WHERE id = ? AND company_id = ?");
+                    $update->execute([$fullName, $email, $registrationId, $studentId, $companyId]);
+                }
                 $update->closeCursor();
 
                 // Adds the enrollment rather than moving the student — this is what lets the
@@ -477,15 +523,22 @@ if ($method === 'POST') {
                         'email' => $email,
                         'registrationId' => $registrationId,
                         'batch' => $resolvedBatchName,
+                        'mobileChanged' => $mobileProvided,
                     ],
                 ]);
                 continue;
             }
 
             $studentId = (string)($item['id'] ?? bin2hex(random_bytes(8)));
-            $insert = $pdo->prepare("INSERT INTO students (id, company_id, full_name, email, registration_id)
-                                     VALUES (?, ?, ?, ?, ?)");
-            $insert->execute([$studentId, $companyId, $fullName, $email, $registrationId]);
+            if ($mobileReady) {
+                $insert = $pdo->prepare("INSERT INTO students (id, company_id, full_name, email, registration_id, mobile)
+                                         VALUES (?, ?, ?, ?, ?, ?)");
+                $insert->execute([$studentId, $companyId, $fullName, $email, $registrationId, $mobile]);
+            } else {
+                $insert = $pdo->prepare("INSERT INTO students (id, company_id, full_name, email, registration_id)
+                                         VALUES (?, ?, ?, ?, ?)");
+                $insert->execute([$studentId, $companyId, $fullName, $email, $registrationId]);
+            }
             $insert->closeCursor();
 
             if ($schemaReady && $resolvedBatchId !== null) {

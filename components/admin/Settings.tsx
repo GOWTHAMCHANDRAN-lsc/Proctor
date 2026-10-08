@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Palette, SlidersHorizontal, LayoutGrid, RotateCcw, Upload, Check, Building2, Image as ImageIcon, Trash2, KeyRound, Loader2 } from 'lucide-react';
+import { Palette, SlidersHorizontal, LayoutGrid, RotateCcw, Upload, Check, Building2, Image as ImageIcon, Trash2, KeyRound, Loader2, MessageCircle, Minus, Send } from 'lucide-react';
 import { useSettings, isValidHex, DEFAULT_SETTINGS } from '../../services/appSettings';
-import { apiPost } from '../../services/api';
+import { apiGet, apiPost, getApiErrorMessage } from '../../services/api';
 import { UserRole } from '../../types';
+import type { WhatsAppKind, WhatsAppStatus } from '../../types';
 
 const ACCENT_PRESETS = [
   { name: 'Google Blue', hex: '#1a73e8' },
@@ -52,6 +53,161 @@ const Toggle: React.FC<{ label: string; checked: boolean; onChange: (v: boolean)
 );
 
 const inputCls = 'w-full px-3.5 py-2.5 border border-slate-300 rounded-lg outline-none text-slate-800 bg-white';
+
+const WHATSAPP_KIND_LABELS: { kind: WhatsAppKind; label: string; hint: string }[] = [
+  { kind: 'INVITE', label: 'Exam invitations', hint: 'with the candidate’s personal exam link' },
+  { kind: 'REMINDER', label: '“Not attempted” reminders', hint: 'from the Mail Composer' },
+  { kind: 'REQUEST_UPDATE', label: 'Exam-request updates', hint: 'to employees who email exam requests' },
+];
+
+/**
+ * WhatsApp notifications: read-only status (configured in the server's .env — never here, and no
+ * secrets are shown), plus a test message for admins.
+ */
+const WhatsAppPanel: React.FC<{ canTest: boolean }> = ({ canTest }) => {
+  const [status, setStatus] = useState<WhatsAppStatus | null>(null);
+  const [loadError, setLoadError] = useState('');
+  const [testMobile, setTestMobile] = useState('');
+  const [testKind, setTestKind] = useState<WhatsAppKind>('INVITE');
+  const [testBusy, setTestBusy] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiGet<WhatsAppStatus>('whatsapp.php')
+      .then(s => { if (!cancelled) setStatus(s); })
+      .catch(e => { if (!cancelled) setLoadError(getApiErrorMessage(e, 'Could not load the WhatsApp status.')); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const kindReady = (kind: WhatsAppKind) => !!status?.ready && !!status.kinds?.[kind];
+
+  const sendTest = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (testBusy || !testMobile.trim()) return;
+    setTestBusy(true);
+    setTestResult(null);
+    try {
+      const res = await apiPost<{ ok: boolean; status: string; error?: string | null; to?: string }>('whatsapp.php', {
+        action: 'TEST',
+        kind: testKind,
+        mobile: testMobile.trim(),
+      });
+      setTestResult(res.ok
+        ? { ok: true, text: `Sent to ${res.to || testMobile.trim()}. Check the phone — delivery can take a few seconds.` }
+        : { ok: false, text: res.error || 'The provider did not accept the message.' });
+    } catch (err) {
+      setTestResult({ ok: false, text: getApiErrorMessage(err, 'Could not send the test message.') });
+    } finally {
+      setTestBusy(false);
+    }
+  };
+
+  const chip = !status
+    ? null
+    : status.ready
+      ? <span className="lsc-chip-success">Ready via {status.provider === 'meta' ? 'Meta' : 'LSC gateway'}</span>
+      : <span className="lsc-chip-neutral">Not configured</span>;
+
+  return (
+    <Section icon={<MessageCircle size={18} />} title="WhatsApp notifications" subtitle="Send invitations, reminders and exam-request updates on WhatsApp too.">
+      <div className="space-y-4">
+        {loadError && <p role="alert" className="text-sm text-rose-600">{loadError}</p>}
+        {!status && !loadError && (
+          <p className="text-sm text-slate-500 flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> Checking status…</p>
+        )}
+        {status && (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm text-slate-600">Status</span>
+              {chip}
+            </div>
+            <ul className="space-y-1.5" aria-label="Message templates">
+              {WHATSAPP_KIND_LABELS.map(({ kind, label, hint }) => (
+                <li key={kind} className="flex items-start gap-2 text-sm">
+                  {status.kinds?.[kind]
+                    ? <Check size={15} className="mt-0.5 text-teal-600 shrink-0" aria-label="Template set" />
+                    : <Minus size={15} className="mt-0.5 text-slate-300 shrink-0" aria-label="No template" />}
+                  <span className={status.kinds?.[kind] ? 'text-slate-700' : 'text-slate-400'}>
+                    {label} <span className="text-slate-400">— {status.kinds?.[kind] ? hint : 'no template set'}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+            {!status.ready && (
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-500 space-y-2">
+                <p>
+                  WhatsApp is off until the server administrator configures it: set <code>WHATSAPP_ENABLED=1</code>, choose a
+                  provider (<code>meta</code> for the WhatsApp Cloud API or <code>lsc</code> for the LSC gateway) with its credentials,
+                  and add the name of each approved message template in the server’s <code>.env</code>. No code change or
+                  restart is needed. Full steps, template texts and the variable order are in <code>docs/WHATSAPP_SETUP.md</code>.
+                  Until then nothing is sent and email works exactly as before.
+                </p>
+                {status.issues && status.issues.length > 0 && (
+                  <ul className="list-disc list-inside space-y-0.5">
+                    {status.issues.map(issue => <li key={issue}>{issue}</li>)}
+                  </ul>
+                )}
+              </div>
+            )}
+            {status.ready && (
+              <p className="text-xs text-slate-500">
+                When sending invitations or reminders you can choose to also send them on WhatsApp to students with a mobile
+                number. Every message is recorded in Communications → Delivery Logs. Setup details: <code>docs/WHATSAPP_SETUP.md</code>.
+              </p>
+            )}
+
+            {canTest && (
+              <form onSubmit={sendTest} className="border-t border-slate-100 pt-4 space-y-3">
+                <div className="text-[13px] font-medium text-slate-700">Send a test message</div>
+                <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto] gap-3">
+                  <input
+                    type="tel"
+                    inputMode="tel"
+                    className={inputCls}
+                    value={testMobile}
+                    onChange={e => { setTestMobile(e.target.value); setTestResult(null); }}
+                    placeholder="+91 98765 43210"
+                    aria-label="Mobile number for the test message"
+                    disabled={!status.ready}
+                  />
+                  <select
+                    className={inputCls}
+                    value={testKind}
+                    onChange={e => { setTestKind(e.target.value as WhatsAppKind); setTestResult(null); }}
+                    aria-label="Message type"
+                    disabled={!status.ready}
+                  >
+                    {WHATSAPP_KIND_LABELS.map(({ kind, label }) => (
+                      <option key={kind} value={kind} disabled={!kindReady(kind)}>{label}{kindReady(kind) ? '' : ' (no template)'}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    type="submit"
+                    disabled={!kindReady(testKind) || testBusy || !testMobile.trim()}
+                    className="px-4 py-2 lsc-button-primary text-sm inline-flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
+                    title={!status.ready ? 'WhatsApp is not configured yet' : undefined}
+                  >
+                    {testBusy ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
+                    {testBusy ? 'Sending…' : 'Send test message'}
+                  </button>
+                  <span className="text-xs text-slate-400">Uses sample exam details, not real candidate data.</span>
+                </div>
+                {testResult && (
+                  <p role={testResult.ok ? 'status' : 'alert'} className={`text-sm ${testResult.ok ? 'text-teal-600' : 'text-rose-600'}`}>
+                    {testResult.text}
+                  </p>
+                )}
+              </form>
+            )}
+          </>
+        )}
+      </div>
+    </Section>
+  );
+};
 
 export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
   const { settings, updateBranding, updateExamDefaults, updateUi, reset } = useSettings();
@@ -352,6 +508,9 @@ export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
             </div>
           </div>
         </Section>
+
+        {/* WhatsApp notifications — status from the server's .env; admins can send a test. */}
+        <WhatsAppPanel canTest={isFullAdmin} />
         </>)}
 
         {/* Security — self-service password reset (hidden for super admins) */}

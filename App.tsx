@@ -885,7 +885,29 @@ const AdminApp: React.FC = () => (
   </SettingsProvider>
 );
 
+// Short exam links: "/x/<code>" (api/link.php swaps the code for the signed access token, and the
+// page then runs exactly the ?token= flow). The short URL stays in the address bar, so a reload
+// simply resolves the code again.
+const SHORT_LINK_PATH = /^\/x\/([A-Za-z0-9]{6,16})\/?$/;
+const getShortLinkCode = (): string | null => {
+  if (typeof window === 'undefined') return null;
+  const match = window.location.pathname.match(SHORT_LINK_PATH);
+  return match ? match[1] : null;
+};
+const SHORT_LINK_INVALID_MESSAGE = 'This exam link is invalid or has expired. Please use the link from your latest invitation email.';
+const STUDENT_SERVER_UNREACHABLE_MESSAGE = "We couldn't reach the exam server to load your exam. Check your internet connection and reload this page.";
+
 const StudentApp: React.FC = () => {
+  // Captured once at load: a "/x/<code>" URL whose code still has to be resolved to a token.
+  const [shortLinkCode] = useState<string | null>(() => {
+    try {
+      // An explicit ?token= on the URL always wins (old links keep working unchanged).
+      return new URLSearchParams(window.location.search).get('token') ? null : getShortLinkCode();
+    } catch {
+      return null;
+    }
+  });
+  const [shortLinkResolving, setShortLinkResolving] = useState(shortLinkCode !== null);
   const [accessRequestContext, setAccessRequestContext] = useState<{
     examId: string;
     studentId: string;
@@ -975,6 +997,9 @@ const StudentApp: React.FC = () => {
     try {
       const urlToken = new URLSearchParams(window.location.search).get('token');
       if (urlToken) return normalizeAccessToken(urlToken);
+      // A short link's token isn't known until api/link.php answers; start empty so the data is
+      // (re)loaded for the resolved token rather than for whatever was stored from a previous exam.
+      if (getShortLinkCode()) return null;
       const stored = localStorage.getItem(STUDENT_EXAM_TOKEN_KEY);
       return stored ? normalizeAccessToken(stored) : null;
     } catch {
@@ -1027,6 +1052,36 @@ const StudentApp: React.FC = () => {
     if (urlToken) {
       queueTokenLogin(urlToken, true);
       return;
+    }
+    if (shortLinkCode) {
+      // Resolve "/x/<code>" to the signed token, then run the normal ?token= flow with it.
+      setIsDirectLinkMode(true);
+      let cancelled = false;
+      (async () => {
+        try {
+          const res = await apiGet<{ token?: string }>(`link.php?c=${encodeURIComponent(shortLinkCode)}`);
+          if (cancelled) return;
+          if (!res?.token) {
+            setTokenError(SHORT_LINK_INVALID_MESSAGE);
+            return;
+          }
+          queueTokenLogin(res.token, true);
+        } catch (e) {
+          if (cancelled) return;
+          if (e instanceof ApiError && e.status === 404) {
+            setTokenError(SHORT_LINK_INVALID_MESSAGE);
+          } else if (e instanceof ApiError && e.status === 429) {
+            setTokenError('Too many attempts to open exam links from this network. Please wait a few minutes and reload this page.');
+          } else {
+            setTokenError(STUDENT_SERVER_UNREACHABLE_MESSAGE);
+          }
+        } finally {
+          if (!cancelled) setShortLinkResolving(false);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
     }
     // Restore from localStorage after a page reload (URL token was cleared by replaceState).
     try {
@@ -1122,7 +1177,7 @@ const StudentApp: React.FC = () => {
       const student = students.find(s => s.id === payload.sid);
 
       if ((!exam || !student) && studentDataUnreachableRef.current) {
-        throw new Error("We couldn't reach the exam server to load your exam. Check your internet connection and reload this page.");
+        throw new Error(STUDENT_SERVER_UNREACHABLE_MESSAGE);
       }
       if (!exam) throw new Error("Exam not found or expired.");
       if (!student) throw new Error("Student record not found.");
@@ -1480,7 +1535,7 @@ const StudentApp: React.FC = () => {
   }
 
   if (isDirectLinkMode) {
-    const linkLoading = !preStartContext && !tokenError && (pendingToken !== null || !studentsLoaded || !examsLoaded);
+    const linkLoading = !shortLinkResolving && !preStartContext && !tokenError && (pendingToken !== null || !studentsLoaded || !examsLoaded);
     return (
       <div className="min-h-screen relative lsc-auth-bg">
         <div className="relative z-10 min-h-screen flex items-center justify-center p-6">
@@ -1506,6 +1561,12 @@ const StudentApp: React.FC = () => {
                 Use Manual Token
               </button>
             </div>
+
+            {shortLinkResolving && !tokenError && (
+              <div role="status" className="rounded-xl border border-slate-200 bg-white px-5 py-4 text-sm text-slate-600">
+                Opening your exam…
+              </div>
+            )}
 
             {linkLoading && (
               <div className="rounded-xl border border-slate-200 bg-white px-5 py-4 text-sm text-slate-600">

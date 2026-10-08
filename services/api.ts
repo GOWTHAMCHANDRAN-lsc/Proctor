@@ -14,7 +14,9 @@ const resolveApiBase = () => {
   if (segments.length === 0) {
     return API_BASE_RAW;
   }
-  if (segments[0] === 'admin') {
+  // '/x/<code>' is the student short-link route (api/link.php), not a sub-path deployment prefix —
+  // without this the API base would become '/x/api' and every call from that page would 404.
+  if (segments[0] === 'admin' || segments[0] === 'x') {
     return API_BASE_RAW;
   }
   const prefix = `/${segments[0]}`;

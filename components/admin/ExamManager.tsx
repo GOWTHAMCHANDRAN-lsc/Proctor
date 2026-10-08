@@ -10,19 +10,11 @@ import { buildQuestionCsvTemplate, parseCsvLine, parseQuestionCsv } from '../../
 import {
   EXAM_TIMEZONES, DEFAULT_EXAM_TIMEZONE, resolveExamTimezone,
   epochToZonedInput, zonedInputToEpoch,
-  formatScheduleLabel, formatScheduleShort, formatDateInZone, formatTimeInZone,
+  formatScheduleShort,
 } from '../../services/timezone';
-
-// Render an exam duration in minutes as a human-friendly string, e.g. "1 hr 30 min".
-const formatDuration = (mins: number): string => {
-  const total = Math.max(0, Math.round(Number(mins) || 0));
-  if (total === 0) return 'Not specified';
-  const h = Math.floor(total / 60);
-  const m = total % 60;
-  if (h === 0) return `${m} min`;
-  if (m === 0) return `${h} hr`;
-  return `${h} hr ${m} min`;
-};
+import { buildExamEmailContent, resolveExamMailTemplate, DEFAULT_INVITE_MESSAGE, DEFAULT_REMINDER_MESSAGE } from '../../services/examEmail';
+import type { ExamMailTemplate } from '../../types';
+import { ExamEmailsEditor, EmailPreviewFrame } from './ExamEmailsEditor';
 
 // A student resolved as the target of one exam's mail run.
 // attemptStatus / attemptCount come from the server's exam_sessions aggregate and drive the Mail
@@ -61,353 +53,10 @@ const filterByAudience = (recipients: ExamRecipient[], audience: MailAudience): 
   }
 };
 
-// Built-in copy for each mail kind. These are only the DEFAULTS — an admin can override the subject
-// and message per exam in the Mail Composer (persisted as exam.mailTemplates), and the invitation
-// additionally honours the older notificationConfig.customSubject/customMessage fields.
-export const DEFAULT_INVITE_MESSAGE =
-  'Dear {StudentName},\n\n'
-  + 'You have been invited to appear for a proctored online examination. Please review the details '
-  + 'below and click the button to begin when you are ready.';
-
-export const DEFAULT_REMINDER_MESSAGE =
-  'Dear {StudentName},\n\n'
-  + 'This is a friendly reminder about your proctored online examination "{ExamTitle}". Our records '
-  + 'show that you have not completed it yet. Please review the details below and make sure you are '
-  + 'prepared before the assessment window closes.\n\n'
-  + 'Your secure exam link was shared in your invitation email. Kindly ignore this message if you '
-  + 'have already taken the assessment.';
-
-// An unproctored exam has no camera, microphone or screen monitoring, so its built-in copy must not
-// call it "proctored".
-const isUnproctoredExam = (exam: Partial<Exam>) => exam.proctoringConfig?.mode === 'UNPROCTORED';
-const unproctoredCopy = (text: string) => text.replace(/proctored online examination/g, 'online examination');
-
-// Resolve the subject/message actually used for one exam + mail kind, in priority order:
-// per-exam override (Mail Composer) → legacy notificationConfig (invitations only) → built-in default.
-// Placeholders are left unsubstituted here so the composer can show the editable template text.
-export const resolveExamMailTemplate = (exam: Partial<Exam>, reminder: boolean): { subject: string; message: string } => {
-  const saved = exam.mailTemplates?.[reminder ? 'REMINDER' : 'INVITE'];
-  const unproctored = isUnproctoredExam(exam);
-  if (reminder) {
-    return {
-      subject: saved?.subject?.trim() || 'Reminder — {ExamTitle}',
-      message: saved?.message?.trim() || (unproctored ? unproctoredCopy(DEFAULT_REMINDER_MESSAGE) : DEFAULT_REMINDER_MESSAGE),
-    };
-  }
-  return {
-    subject: saved?.subject?.trim() || exam.notificationConfig?.customSubject?.trim() || 'Your Exam Invitation — {ExamTitle}',
-    message: saved?.message?.trim() || exam.notificationConfig?.customMessage?.trim()
-      || (unproctored ? unproctoredCopy(DEFAULT_INVITE_MESSAGE) : DEFAULT_INVITE_MESSAGE),
-  };
-};
-
-// Student names (CSV / LMS webhook imports) and exam titles are plain text; escape them wherever they
-// land in the email HTML so a name like "<b>Ana</b>" or "R&D" can't inject markup or break the layout.
-// The admin-authored message template itself is left as-is (saved templates may carry HTML).
-const escapeEmailHtml = (value: string) => value
-  .replace(/&/g, '&amp;')
-  .replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;')
-  .replace(/"/g, '&quot;')
-  .replace(/'/g, '&#39;');
-
-// Builds the exact invitation/reminder email HTML sent by dispatchEmails. Also used by the
-// live preview in the Email Notifications editor and the Mail Composer, so what admins see is
-// exactly what sends. `override` lets the composer preview unsaved edits without persisting them.
-const buildExamEmailContent = (
-  exam: Exam,
-  recipientName: string,
-  link: string,
-  reminder: boolean,
-  override?: { subject?: string; message?: string },
-): { subject: string; body: string } => {
-  // Exam instructions are LINKED, not attached: a 700 KB PDF on every message made large
-  // batches slow and risked Gmail size/rate limits. The file is served from the app's public
-  // root, so candidates download it on demand from a tiny link instead.
-  const instructionsUrl = `${window.location.origin}/ProctorGuard_Exam_Instructions_updated.pdf`;
-
-  // Every date/time in the email is rendered in the exam's own timezone so the
-  // student sees the same schedule the admin set, regardless of local clocks.
-  const examTz = resolveExamTimezone(exam.timezone);
-  // Use the exam's actual time limit, not the availability window (endTime - startTime).
-  const durationMin = exam.durationMinutes;
-  const dateStr = formatDateInZone(exam.startTime, examTz);
-  const timeStr = formatTimeInZone(exam.startTime, examTz);
-
-  // Availability window (portal open → close) for the reminder email,
-  // rendered as an explicit "From → To" range in the exam's timezone.
-  const winOpenLabel = formatScheduleLabel(exam.startTime, examTz);
-  const winCloseLabel = formatScheduleLabel(exam.endTime, examTz);
-
-  const startLabel = `${dateStr} at ${timeStr}`;
-  const safeName = escapeEmailHtml(recipientName);
-  const safeTitle = escapeEmailHtml(exam.title);
-  const safeLink = escapeEmailHtml(link);
-  // Function replacers: a plain replacement string would expand "$&" / "$1" sequences that can
-  // legitimately appear in a title or name. `html` escapes the substituted values for the body.
-  const fillTemplate = (tpl: string, html = false) => tpl
-    .replace(/\{StudentName\}/g, () => (html ? safeName : recipientName))
-    .replace(/\{ExamTitle\}/g, () => (html ? safeTitle : exam.title))
-    .replace(/\{StartTime\}/g, () => startLabel)
-    .replace(/\{Link\}/g, () => (html ? safeLink : link));
-
-  // Composer edits (override) win over the saved per-exam template, which wins over the default.
-  const resolved = resolveExamMailTemplate(exam, reminder);
-  const subjectTpl = override?.subject?.trim() || resolved.subject;
-  const messageTpl = override?.message !== undefined ? override.message : resolved.message;
-  const subject = fillTemplate(subjectTpl);
-  // In the HTML body the candidate's name is emphasised, matching how the salutation has always
-  // rendered. The subject stays plain text.
-  const message = recipientName.trim() === ''
-    ? fillTemplate(messageTpl, true)
-    : fillTemplate(messageTpl, true).split(safeName).join(`<strong>${safeName}</strong>`);
-
-  // The message carries its own greeting ("Dear {StudentName},"), so it is rendered on its own —
-  // no separate intro block, which is what used to produce the doubled greeting. The first
-  // paragraph is styled as the salutation and the rest as body copy.
-  const messageParas = message.split(/\n\s*\n/).map(p => p.trim()).filter(Boolean);
-  const greetingBlock = messageParas.length === 0
-    ? ''
-    : messageParas.map((para, i) => i === 0
-        ? `<p style="margin:0;font-size:16px;color:#1e293b;line-height:1.6;">${para.replace(/\n/g, '<br/>')}</p>`
-        : `<p style="margin:12px 0 0;font-size:14px;color:#475569;line-height:1.7;">${para.replace(/\n/g, '<br/>')}</p>`
-      ).join('\n  ');
-
-  // Both invitations and reminders show the availability window (when the exam
-  // portal is open) as an explicit "Date From → To" range, plus the duration it
-  // runs for — instead of a single fixed start date/time.
-  const detailsGrid = `
-    <tr>
-      <td class="lsc-pad" style="padding:16px 24px;border-bottom:1px solid #e2e8f0;">
-        <p style="margin:0 0 3px;font-size:10px;font-weight:700;letter-spacing:2px;color:#94a3b8;text-transform:uppercase;">Date From</p>
-        <p style="margin:0;font-size:14px;font-weight:600;color:#0f172a;">${winOpenLabel}</p>
-      </td>
-    </tr>
-    <tr>
-      <td class="lsc-pad" style="padding:16px 24px;border-bottom:1px solid #e2e8f0;">
-        <p style="margin:0 0 3px;font-size:10px;font-weight:700;letter-spacing:2px;color:#94a3b8;text-transform:uppercase;">To</p>
-        <p style="margin:0;font-size:14px;font-weight:600;color:#0f172a;">${winCloseLabel}</p>
-      </td>
-    </tr>
-    <tr>
-      <td style="padding:0;">
-        <table width="100%" cellpadding="0" cellspacing="0">
-          <tr>
-            <td class="lsc-stack" style="padding:16px 24px;border-right:1px solid #e2e8f0;width:50%;">
-              <p style="margin:0 0 3px;font-size:10px;font-weight:700;letter-spacing:2px;color:#94a3b8;text-transform:uppercase;">Duration</p>
-              <p style="margin:0;font-size:14px;font-weight:600;color:#0f172a;">${formatDuration(durationMin)}</p>
-            </td>
-            <td class="lsc-stack" style="padding:16px 24px;width:50%;">
-              <p style="margin:0 0 3px;font-size:10px;font-weight:700;letter-spacing:2px;color:#94a3b8;text-transform:uppercase;">Candidate</p>
-              <p style="margin:0;font-size:14px;font-weight:600;color:#0f172a;">${safeName}</p>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>`;
-
-  // Invitations get a call-to-action button + link; reminders deliberately omit it.
-  const ctaBlock = reminder ? '' : `
-<!-- CTA Button -->
-<tr>
-<td class="lsc-pad" style="background:#ffffff;padding:8px 40px 32px;text-align:center;">
-  <a href="${safeLink}" target="_blank" class="lsc-cta" style="display:inline-block;background:linear-gradient(135deg,#1d4ed8,#2563eb);color:#ffffff;font-size:16px;font-weight:700;text-decoration:none;padding:16px 48px;border-radius:8px;letter-spacing:0.3px;box-shadow:0 4px 14px rgba(37,99,235,0.4);">
-    Open Exam Portal &rarr;
-  </a>
-  <p style="margin:16px 0 0;font-size:12px;color:#94a3b8;">Button not working? Copy and paste this link into your browser:</p>
-  <p style="margin:6px 0 0;"><a href="${safeLink}" style="font-size:12px;color:#2563eb;word-break:break-all;">${safeLink}</a></p>
-</td>
-</tr>`;
-
-  // Device requirements — reflect the exam's allowed-device restriction so the email
-  // only tells candidates about devices they may actually use. Empty/undefined = all.
-  const allowedDevices = (exam.allowedDeviceTypes && exam.allowedDeviceTypes.length > 0)
-    ? exam.allowedDeviceTypes
-    : (['desktop', 'tablet', 'mobile'] as const);
-  const devicePhrase: Record<string, string> = {
-    desktop: 'a laptop or desktop computer',
-    tablet: 'a tablet',
-    mobile: 'a smartphone',
-  };
-  const deviceParts = allowedDevices.map(d => devicePhrase[d]);
-  const deviceListText = deviceParts.length === 1
-    ? deviceParts[0]
-    : deviceParts.length === 2
-    ? `${deviceParts[0]} or ${deviceParts[1]}`
-    : `${deviceParts.slice(0, -1).join(', ')}, or ${deviceParts[deviceParts.length - 1]}`;
-  const allowsMobileOrTablet = allowedDevices.includes('mobile') || allowedDevices.includes('tablet');
-  const isRestricted = !!(exam.allowedDeviceTypes && exam.allowedDeviceTypes.length > 0 && exam.allowedDeviceTypes.length < 3);
-
-  const browserLine = allowsMobileOrTablet
-    ? 'An up-to-date browser: <strong>Chrome</strong>, <strong>Edge</strong>, <strong>Firefox</strong>, or <strong>Safari</strong> (including iPhone &amp; iPad)'
-    : 'An up-to-date browser: <strong>Chrome</strong>, <strong>Edge</strong>, or <strong>Firefox</strong> on your computer';
-
-  const deviceRestrictionRow = isRestricted ? `
-    <tr>
-      <td style="padding:3px 0;font-size:13px;color:#334155;">&#10003; &nbsp;This exam can <strong>only</strong> be taken on ${deviceListText} — other devices will be blocked before you can start.</td>
-    </tr>` : '';
-
-  // The requirements and the monitoring notice follow the exam's own proctoring settings: an
-  // UNPROCTORED exam needs no camera or microphone (and has no monitoring at all), and a proctored
-  // exam only asks for the hardware it actually requires. A config-less exam keeps the classic copy.
-  const proctoring = exam.proctoringConfig;
-  const unproctored = proctoring?.mode === 'UNPROCTORED';
-  const needsCamera = !unproctored && (proctoring ? !!proctoring.cameraRequired : true);
-  const needsMic = !unproctored && (proctoring ? !!proctoring.microphoneRequired : true);
-  const hardwareHtml = needsCamera && needsMic
-    ? ' with a working <strong>camera</strong> and <strong>microphone</strong>'
-    : needsCamera ? ' with a working <strong>camera</strong>'
-    : needsMic ? ' with a working <strong>microphone</strong>'
-    : '';
-  const permissionText = needsCamera && needsMic ? 'camera and microphone' : needsCamera ? 'camera' : needsMic ? 'microphone' : '';
-  const requirementRow = (html: string) => `
-            <tr>
-              <td style="padding:3px 0;font-size:13px;color:#334155;">&#10003; &nbsp;${html}</td>
-            </tr>`;
-  const requirementRows = [
-    requirementRow(`${deviceListText.charAt(0).toUpperCase() + deviceListText.slice(1)}${hardwareHtml}`) + deviceRestrictionRow,
-    requirementRow(browserLine),
-    permissionText ? requirementRow(`Allow ${permissionText} access when your browser prompts you`) : '',
-    unproctored
-      ? requirementRow('A <strong>stable internet connection</strong> and a quiet place where you can focus')
-      : requirementRow(`A ${needsCamera ? '<strong>well-lit, quiet room</strong>' : '<strong>quiet room</strong>'} and a <strong>stable internet connection</strong>`),
-    unproctored ? '' : requirementRow('Stay on the exam screen — do <strong>not</strong> switch tabs, apps, or leave the window'),
-  ].join('');
-  const monitoredParts = [needsCamera ? 'webcam' : '', needsMic ? 'microphone' : '', 'screen activity'].filter(Boolean);
-  const monitoredText = monitoredParts.length === 1
-    ? monitoredParts[0]
-    : `${monitoredParts.slice(0, -1).join(', ')}${monitoredParts.length > 2 ? ',' : ''} and ${monitoredParts[monitoredParts.length - 1]}`;
-  const noticeBlock = unproctored ? `
-      <!-- Notice -->
-      <tr>
-        <td class="lsc-pad" style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 40px;">
-          <p style="margin:0;font-size:12px;color:#334155;line-height:1.6;">
-            <strong>&#9432; Please note:</strong> This exam is <strong>not proctored</strong> — there is no camera, microphone or screen monitoring. Answer the questions on your own and submit before the exam window closes.
-          </p>
-        </td>
-      </tr>` : `
-      <!-- Warning Banner -->
-      <tr>
-        <td class="lsc-pad" style="background:#fef2f2;border-top:1px solid #fecaca;padding:16px 40px;">
-          <p style="margin:0;font-size:12px;color:#b91c1c;line-height:1.6;">
-            <strong>&#9888; Important:</strong> This exam is proctored by AI. Your ${monitoredText} will be monitored continuously. Any suspicious behaviour will be flagged as a violation and reported to the exam administrator.
-          </p>
-        </td>
-      </tr>`;
-  const examKind = unproctored ? 'exam' : 'proctored exam';
-
-  const preheader = reminder
-    ? `Reminder: your ${examKind} "${safeTitle}" is open from ${winOpenLabel} to ${winCloseLabel}. Duration ${formatDuration(durationMin)}.`
-    : `Your ${examKind} "${safeTitle}" is scheduled for ${dateStr} at ${timeStr}. Duration ${formatDuration(durationMin)}. Open the secure portal to begin.`;
-
-  // Downloadable instructions (linked, not attached — keeps the email tiny and fast to send). The
-  // guide is all about camera / microphone / screen permissions and violations, so an unproctored
-  // exam leaves it out rather than contradict the "no monitoring" notice.
-  const instructionsBlock = unproctored ? '' : `
-<tr>
-<td class="lsc-pad" style="background:#ffffff;padding:4px 40px 24px;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;">
-    <tr>
-      <td style="padding:16px 20px;">
-        <p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#334155;">&#128196; Exam Instructions</p>
-        <p style="margin:0 0 12px;font-size:13px;color:#475569;line-height:1.6;">Please read the full instructions before your exam. Download the guide below.</p>
-        <a href="${instructionsUrl}" target="_blank" style="display:inline-block;background:#eff6ff;color:#1d4ed8;font-size:13px;font-weight:600;text-decoration:none;padding:10px 20px;border-radius:6px;border:1px solid #bfdbfe;">Download Exam Instructions (PDF) &rarr;</a>
-      </td>
-    </tr>
-  </table>
-</td>
-</tr>`;
-
-  const body = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="x-apple-disable-message-reformatting" />
-<meta name="color-scheme" content="light only" />
-<title>${escapeEmailHtml(subject)}</title>
-<style>
-  body { margin:0; padding:0; -webkit-text-size-adjust:100%; }
-  img { border:0; line-height:100%; outline:none; text-decoration:none; }
-  a { color:#2563eb; }
-  @media only screen and (max-width:620px) {
-    .lsc-container { width:100% !important; border-radius:0 !important; }
-    .lsc-pad { padding-left:22px !important; padding-right:22px !important; }
-    .lsc-stack { display:block !important; width:100% !important; border-right:none !important; }
-    .lsc-h1 { font-size:22px !important; }
-    .lsc-cta { display:block !important; width:auto !important; }
-  }
-</style>
-</head>
-<body style="margin:0;padding:0;background:#f1f5f9;font-family:'Segoe UI',Arial,sans-serif;">
-<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:#f1f5f9;font-size:1px;line-height:1px;">
-  ${preheader}
-</div>
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 0;">
-  <tr><td align="center">
-    <table width="600" cellpadding="0" cellspacing="0" class="lsc-container" style="max-width:600px;width:100%;border-radius:12px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.10);">
-
-      <!-- Header -->
-      <tr>
-        <td class="lsc-pad" style="background:linear-gradient(135deg,#1e3a8a 0%,#2563eb 60%,#3b82f6 100%);padding:36px 40px 28px;">
-          <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:3px;color:#bfdbfe;text-transform:uppercase;">${unproctored ? 'Online Examination' : 'Proctored Online Examination'}</p>
-          <h1 class="lsc-h1" style="margin:0;font-size:26px;font-weight:700;color:#ffffff;line-height:1.3;">${safeTitle}</h1>
-          <p style="margin:8px 0 0;font-size:13px;color:#93c5fd;">${unproctored ? 'Secure · Online' : 'Secure · Proctored · Online'}</p>
-        </td>
-      </tr>
-
-      <!-- Greeting -->
-      <tr>
-        <td class="lsc-pad" style="background:#ffffff;padding:32px 40px 0;">
-          ${greetingBlock}
-        </td>
-      </tr>
-
-      <!-- Exam Details Card -->
-      <tr>
-        <td class="lsc-pad" style="background:#ffffff;padding:24px 40px;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;">
-            <tr>
-              <td style="padding:20px 24px;border-bottom:1px solid #e2e8f0;">
-                <p style="margin:0 0 3px;font-size:10px;font-weight:700;letter-spacing:2px;color:#94a3b8;text-transform:uppercase;">Exam</p>
-                <p style="margin:0;font-size:15px;font-weight:600;color:#0f172a;">${safeTitle}</p>
-              </td>
-            </tr>
-            ${detailsGrid}
-          </table>
-        </td>
-      </tr>
-
-      ${ctaBlock}
-
-      <!-- Requirements -->
-      <tr>
-        <td class="lsc-pad" style="background:#eff6ff;padding:20px 40px;border-top:1px solid #dbeafe;">
-          <p style="margin:0 0 10px;font-size:12px;font-weight:700;color:#1d4ed8;text-transform:uppercase;letter-spacing:1px;">Before You Begin — What You Need</p>
-          <table width="100%" cellpadding="0" cellspacing="0">${requirementRows}
-          </table>
-        </td>
-      </tr>
-      ${instructionsBlock}
-${noticeBlock}
-
-      <!-- Footer -->
-      <tr>
-        <td class="lsc-pad" style="background:#1e293b;padding:24px 40px;text-align:center;">
-          <p style="margin:0 0 4px;font-size:13px;font-weight:600;color:#f1f5f9;">ProctorGuard &mdash; Secure Online Examinations</p>
-          <p style="margin:0;font-size:11px;color:#64748b;">This is an automated message. Please do not reply to this email.</p>
-          <p style="margin:8px 0 0;font-size:11px;color:#475569;">If you have any issues, contact your examination coordinator.</p>
-        </td>
-      </tr>
-
-    </table>
-  </td></tr>
-</table>
-</body>
-</html>`;
-
-  return { subject, body };
-};
+// The invitation/reminder email (defaults, per-exam template resolution and the HTML builder) lives in
+// services/examEmail.ts, shared with the editor's Emails section and mirrored by
+// api/exam_mail_render.php. Re-exported here for existing importers.
+export { buildExamEmailContent, resolveExamMailTemplate, DEFAULT_INVITE_MESSAGE, DEFAULT_REMINDER_MESSAGE };
 
 const readTextFile = async (file: File) => {
   const buffer = await file.arrayBuffer();
@@ -2006,6 +1655,17 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     });
   };
 
+  // Mirror what SAVE_MAIL_TEMPLATE stored (or cleared) into the exam list.
+  type SavedMailTemplateResponse = { ok?: boolean; cleared?: boolean; template?: ExamMailTemplate | null };
+  const applySavedMailTemplate = (examId: string, kind: ExamMailKind, result: SavedMailTemplateResponse) =>
+    onUpdateExams(prev => prev.map(e => {
+      if (e.id !== examId) return e;
+      const next = { ...(e.mailTemplates || {}) };
+      if (result?.cleared || !result?.template) delete next[kind];
+      else next[kind] = { subject: result.template.subject ?? '', message: result.template.message ?? '', options: result.template.options || {} };
+      return { ...e, mailTemplates: next };
+    }));
+
   // Persist the composed subject/message as this exam's default for that kind, so the next send (and
   // the next admin) starts from it. Sending does NOT require saving.
   const saveComposerTemplate = async () => {
@@ -2013,16 +1673,16 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     if (!composer) return;
     setMailComposer(prev => (prev ? { ...prev, saving: true, notice: null, error: null } : prev));
     try {
-      await apiPost('exams.php', withCompany({
+      // No `options` in the request: the server keeps the design set in the exam editor's Emails
+      // section and returns the stored template.
+      const result = await apiPost<SavedMailTemplateResponse>('exams.php', withCompany({
         action: 'SAVE_MAIL_TEMPLATE',
         examId: composer.exam.id,
         kind: composer.kind,
         subject: composer.subject,
         message: composer.message,
       }));
-      onUpdateExams(prev => prev.map(e => (e.id === composer.exam.id
-        ? { ...e, mailTemplates: { ...(e.mailTemplates || {}), [composer.kind]: { subject: composer.subject, message: composer.message } } }
-        : e)));
+      applySavedMailTemplate(composer.exam.id, composer.kind, result);
       setMailComposer(prev => (prev ? { ...prev, saving: false, dirty: false, notice: 'Saved as this exam’s default email.' } : prev));
     } catch (e: any) {
       console.error(e);
@@ -2037,7 +1697,8 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     if (!confirm('Reset this email back to the built-in default text?')) return;
     setMailComposer(prev => (prev ? { ...prev, saving: true, notice: null, error: null } : prev));
     try {
-      await apiPost('exams.php', withCompany({
+      // Resets the TEXT only; a design saved in the exam editor (colour, blocks…) is kept.
+      const result = await apiPost<SavedMailTemplateResponse>('exams.php', withCompany({
         action: 'SAVE_MAIL_TEMPLATE',
         examId: composer.exam.id,
         kind: composer.kind,
@@ -2046,12 +1707,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       }));
       const bare: Exam = { ...composer.exam, mailTemplates: {}, notificationConfig: undefined };
       const tpl = resolveExamMailTemplate(bare, composer.kind === 'REMINDER');
-      onUpdateExams(prev => prev.map(e => {
-        if (e.id !== composer.exam.id) return e;
-        const next = { ...(e.mailTemplates || {}) };
-        delete next[composer.kind];
-        return { ...e, mailTemplates: next };
-      }));
+      applySavedMailTemplate(composer.exam.id, composer.kind, result);
       setMailComposer(prev => (prev
         ? { ...prev, saving: false, dirty: false, subject: tpl.subject, message: tpl.message, notice: 'Restored the default email.' }
         : prev));
@@ -4016,6 +3672,14 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                  </div>
                )}
              </div>
+
+             {/* Emails: per-exam invitation / reminder content and design, saved with the exam.
+                 Stays editable on a published exam (it changes nothing a candidate is sitting). */}
+             <ExamEmailsEditor
+               exam={{ ...newExam, proctoringConfig: effectiveProctoringConfig(proctoringConfig) }}
+               sampleLink={`${window.location.origin}?token=SAMPLE-TOKEN`}
+               onChange={mailTemplates => setNewExam(prev => ({ ...prev, mailTemplates }))}
+             />
           </div>
         </div>
       </div>
@@ -4337,9 +4001,11 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                   className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono leading-relaxed focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-300"
                 />
                 <p className="text-[11px] text-slate-400 mt-1.5">
-                  Placeholders: <code>{'{StudentName}'}</code>, <code>{'{ExamTitle}'}</code>, <code>{'{StartTime}'}</code>
-                  {!reminder && <> , <code>{'{Link}'}</code></>}. Blank lines start a new paragraph. The exam schedule,
-                  duration, device rules and instructions link are added automatically below your message.
+                  Placeholders: <code>{'{StudentName}'}</code>, <code>{'{ExamTitle}'}</code>, <code>{'{StartTime}'}</code>,
+                  {' '}<code>{'{EndTime}'}</code>, <code>{'{Duration}'}</code>
+                  {!reminder && <> , <code>{'{Link}'}</code></>}. Blank lines start a new paragraph. The exam details,
+                  requirements and instructions link are added below your message; their design (header, colour,
+                  which blocks show) is set in the exam editor’s Emails section.
                 </p>
               </div>
 
@@ -4373,11 +4039,11 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               <p className="text-xs text-slate-500 mb-2">
                 Preview as <span className="font-medium text-slate-700">{sample?.fullName || 'Sample Student'}</span> — exactly the HTML that will be sent.
               </p>
-              <iframe
+              <EmailPreviewFrame
+                html={preview.body}
                 title="Composed email preview"
-                srcDoc={preview.body}
-                className="flex-1 w-full min-h-[320px] rounded-lg border border-slate-200 bg-white"
-                sandbox=""
+                className="flex-1 min-h-0 flex flex-col"
+                viewportClassName="flex-1 min-h-[320px]"
               />
             </div>
           </div>

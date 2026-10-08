@@ -176,8 +176,8 @@ export interface Exam {
   // Assigned students who have never opened this exam — no session row at all (server-computed,
   // read-only). This is the audience a "not attempted" reminder targets.
   notAttemptedCount?: number;
-  // Per-exam subject/message overrides composed in the Mail Composer. An absent kind means the
-  // built-in default body is used for that mail.
+  // Per-exam subject/message/design overrides (exam editor "Emails" section, Mail Composer). An
+  // absent kind means the built-in default email is used for that mail.
   mailTemplates?: Partial<Record<ExamMailKind, ExamMailTemplate>>;
   notificationConfig?: NotificationConfig;
 }
@@ -268,9 +268,37 @@ export interface ExamRequester {
 
 export type ExamMailKind = 'INVITE' | 'REMINDER';
 
+/**
+ * Per-exam design of one email kind (exam editor "Emails" section). Every field is optional and an
+ * absent field keeps the original email, so `{}` renders exactly the built-in design.
+ */
+export interface ExamMailTemplateOptions {
+  /** Heading in the coloured header band (placeholders allowed). Default: the exam title. */
+  headerTitle?: string;
+  /** Invitation button label (placeholders allowed). Default: "Open Exam Portal →". */
+  buttonText?: string;
+  /** "#rrggbb" for the header band, button and links. Default: the original blue palette. */
+  accentColor?: string;
+  /** Exam window (Date From / To). Default on. */
+  showSchedule?: boolean;
+  /** Duration tile. Default on. */
+  showDuration?: boolean;
+  /** Candidate-name tile. Default on. */
+  showCandidate?: boolean;
+  /** "Before you begin" device/system requirements. Default on (unproctored: no camera/mic items). */
+  showRequirements?: boolean;
+  /** Instructions PDF link. Default on for proctored exams, off for unproctored ones. */
+  showInstructionsPdf?: boolean;
+  /** AI-proctoring warning (unproctored: the "not proctored" note). Default on. */
+  showProctoringNotice?: boolean;
+  /** Optional sign-off above the footer (plain text, placeholders allowed). */
+  closingNote?: string;
+}
+
 export interface ExamMailTemplate {
   subject: string;
   message: string;
+  options?: ExamMailTemplateOptions;
 }
 
 export interface ExamSection {

@@ -284,12 +284,13 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   const editorSnapshotRef = useRef<string>('');
   // Set when an exam has both already-invited and newly-assigned students: the admin picks who to mail.
   // Also used (with confirmText) as the plain send confirmation when WhatsApp invitations are on, so
-  // the "Also send on WhatsApp" checkbox can sit next to the send button.
+  // the Email / WhatsApp checkboxes can sit next to the send button.
   const [inviteScopeTarget, setInviteScopeTarget] = useState<{ exam: Exam; recipients: ExamRecipient[]; pending: ExamRecipient[]; confirmText?: string } | null>(null);
   // WhatsApp copies of invitations/reminders. Nothing is shown unless the server says WhatsApp is ready
   // for that message kind (it ships disabled until .env is configured — see docs/WHATSAPP_SETUP.md).
   const [waStatus, setWaStatus] = useState<WhatsAppStatus | null>(null);
-  const [waOptIn, setWaOptIn] = useState(true);
+  // Which channels the next invitation/reminder goes out on (the Email / WhatsApp checkboxes).
+  const [sendChannels, setSendChannels] = useState<{ email: boolean; whatsapp: boolean }>({ email: true, whatsapp: true });
   // Student ids (of the exam being sent) that have a mobile number; null while loading.
   const [waCoverage, setWaCoverage] = useState<{ examId: string; ids: Set<string> } | null>(null);
   // Per-exam Mail Composer: pick the audience (e.g. only students who never attempted), edit the
@@ -1456,6 +1457,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   }, []);
 
   const waReadyFor = (kind: ExamMailKind): boolean => !!waStatus?.ready && !!waStatus.kinds?.[kind];
+  // The channels actually used for a send: WhatsApp only while it's configured for that message kind.
+  const channelsFor = (kind: ExamMailKind) => ({ email: sendChannels.email, whatsapp: waReadyFor(kind) && sendChannels.whatsapp });
+  const noChannelFor = (kind: ExamMailKind) => { const c = channelsFor(kind); return !c.email && !c.whatsapp; };
 
   // Which of these recipients have a mobile number (for the "N of M" hint). Best-effort.
   const loadWaCoverage = async (exam: Exam, recipients: ExamRecipient[]) => {
@@ -1473,10 +1477,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     setWaCoverage({ examId: exam.id, ids: withMobile });
   };
 
-  // Send the WhatsApp copy to students whose email went out, in small chunks so no single request
-  // runs long. Counts are summed across chunks.
+  // Send the WhatsApp message to these students, in small chunks so no single request runs long.
+  // Counts (and the ids it reached) are summed across chunks.
   const sendWhatsAppNotices = async (exam: Exam, studentIds: string[], kind: ExamMailKind): Promise<WhatsAppSendSummary> => {
-    const total: WhatsAppSendSummary = { sent: 0, failed: 0, skippedNoMobile: 0, skippedDisabled: 0, failures: [] };
+    const total: WhatsAppSendSummary = { sent: 0, failed: 0, skippedNoMobile: 0, skippedDisabled: 0, failures: [], sentIds: [] };
     for (let i = 0; i < studentIds.length; i += 25) {
       const res = await apiPost<WhatsAppSendSummary>('whatsapp.php', withCompany({
         action: 'SEND_EXAM_NOTICE',
@@ -1489,34 +1493,54 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       total.skippedNoMobile += res?.skippedNoMobile || 0;
       total.skippedDisabled += res?.skippedDisabled || 0;
       total.failures.push(...(res?.failures || []));
+      total.sentIds!.push(...(res?.sentIds || []));
     }
     return total;
   };
 
-  // "Also send on WhatsApp (N of M recipients have a mobile number)" — shared by the invitation
-  // dialog and the Mail Composer. Renders nothing when WhatsApp isn't ready for this kind.
-  const renderWhatsAppOptIn = (exam: Exam, kind: ExamMailKind, targets: ExamRecipient[]) => {
-    if (!waReadyFor(kind)) return null;
+  // Email / WhatsApp checkboxes ("N of M recipients have a mobile number") — shared by the invitation
+  // dialog and the Mail Composer. WhatsApp stays visible but disabled while it isn't set up for this kind.
+  const renderChannelOptions = (exam: Exam, kind: ExamMailKind, targets: ExamRecipient[]) => {
+    const waReady = waReadyFor(kind);
     const coverage = waCoverage && waCoverage.examId === exam.id ? waCoverage.ids : null;
     const withMobile = coverage ? targets.filter(t => coverage.has(t.id)).length : null;
     return (
-      <label className="flex items-start gap-2 text-sm text-slate-700 cursor-pointer select-none">
-        <input
-          type="checkbox"
-          className="mt-0.5"
-          checked={waOptIn}
-          onChange={e => setWaOptIn(e.target.checked)}
-        />
-        <span className="flex items-center gap-1.5 flex-wrap">
-          <MessageCircle size={14} className="text-emerald-600 shrink-0" aria-hidden="true" />
-          Also send on WhatsApp
-          <span className="text-slate-500">
-            {withMobile === null
-              ? '(checking mobile numbers…)'
-              : `(${withMobile} of ${targets.length} recipient${targets.length === 1 ? ' has' : 's have'} a mobile number)`}
+      <div className="space-y-1.5">
+        <p className="text-xs font-medium text-slate-500">Send by</p>
+        <label className="flex items-center gap-2 text-sm text-slate-700 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={sendChannels.email}
+            onChange={e => setSendChannels(prev => ({ ...prev, email: e.target.checked }))}
+          />
+          <Mail size={14} className="text-slate-500 shrink-0" aria-hidden="true" />
+          Email
+        </label>
+        <label className={`flex items-start gap-2 text-sm text-slate-700 select-none ${waReady ? 'cursor-pointer' : 'opacity-60'}`}>
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={waReady && sendChannels.whatsapp}
+            disabled={!waReady}
+            onChange={e => setSendChannels(prev => ({ ...prev, whatsapp: e.target.checked }))}
+          />
+          <span className="flex items-center gap-1.5 flex-wrap">
+            <MessageCircle size={14} className="text-emerald-600 shrink-0" aria-hidden="true" />
+            WhatsApp
+            <span className="text-slate-500">
+              {!waReady
+                ? '(not set up for this message)'
+                : withMobile === null
+                  ? '(checking mobile numbers…)'
+                  : `(${withMobile} of ${targets.length} recipient${targets.length === 1 ? ' has' : 's have'} a mobile number)`}
+            </span>
           </span>
-        </span>
-      </label>
+        </label>
+        {waReady && sendChannels.whatsapp && (
+          <p className="text-xs text-slate-400">WhatsApp sends the approved WhatsApp template (exam details and the student's link), not the email text.</p>
+        )}
+        {noChannelFor(kind) && <p className="text-xs text-rose-600">Tick Email, WhatsApp or both.</p>}
+      </div>
     );
   };
 
@@ -1619,8 +1643,8 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     // Mixed roster — students were added after the exam went out. Re-mailing everyone would push a
     // duplicate invitation at candidates who may already be sitting the exam, so make it a choice.
     const waInvites = waReadyFor('INVITE');
+    setSendChannels({ email: true, whatsapp: true });
     if (waInvites) {
-      setWaOptIn(true);
       void loadWaCoverage(exam, recipients);
     }
 
@@ -1635,12 +1659,12 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       ? `All ${recipients.length} assigned students have already been sent a link. Resend the same invitation to all of them?`
       : `Are you sure you want to send exam invitations to ${recipients.length} students?`;
     if (waInvites) {
-      // Same question, in the in-app dialog so the WhatsApp opt-in can sit next to the send button.
+      // Same question, in the in-app dialog so the Email / WhatsApp checkboxes can sit next to the send button.
       setInviteScopeTarget({ exam, recipients, pending, confirmText });
       return;
     }
     if (!confirm(confirmText)) return;
-    await dispatchEmails(exam, recipients, false);
+    await dispatchEmails(exam, recipients, false, undefined, { email: true, whatsapp: false });
   };
 
   const dispatchEmails = async (
@@ -1648,81 +1672,91 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     targetStudents: ExamRecipient[],
     reminder: boolean,
     override?: { subject?: string; message?: string },
-    // Also send the WhatsApp copy to the students whose email went out (caller checked readiness).
-    whatsapp = false,
+    // Which channels to use (the Email / WhatsApp checkboxes; caller checked WhatsApp readiness).
+    channels: { email: boolean; whatsapp: boolean } = { email: true, whatsapp: false },
   ) => {
     setEmailSendingId(exam.id);
     setSendingMode(reminder ? 'reminder' : 'notify');
 
     try {
-        const messages = targetStudents.map(student => {
-          // Reminder emails carry the exam details only — no access link/token.
-          // The token is minted+signed server-side (resolveRecipients); we never build it here.
-          let link = '';
-          if (!reminder && (student.code || student.token)) {
-            link = examLinkFor(student);
-          }
+        const lines: string[] = [];
+        // Students who got their link by email or WhatsApp (an invitation counts as sent if EITHER did).
+        const reachedIds = new Set<string>();
 
-          const { subject, body } = buildExamEmailContent(exam, student.fullName, link, reminder, override);
-
-          // Normalise the address — emails typed in ALL CAPS or Mixed Case go to the
-          // same mailbox, so send to the correctly-formatted lowercase address.
-          // Instructions are linked in the body (instructionsBlock), not attached — see above.
-          return { to: student.email.trim().toLowerCase(), subject, body };
-        });
-
-        // withCompany: notify.php scopes SMTP + delivery logs by company, like every other write here;
-        // without it a super admin's send was rejected ("companyId is required") or logged under
-        // whichever company the top bar happened to hold.
-        const result = await apiPost<{ sent: number; failed?: { to: string; error: string }[] }>('notify.php', withCompany({ messages }));
-
-        // Record who actually received a link. Addresses that bounced stay uninvited so the next send
-        // retries them instead of quietly leaving those students without a way in.
-        const failedTo = new Set((result.failed || []).map(f => (f.to || '').trim().toLowerCase()));
-        const deliveredIds = targetStudents
-          .filter(s => !failedTo.has(s.email.trim().toLowerCase()))
-          .map(s => s.id);
-        if (!reminder) {
-          if (deliveredIds.length > 0) {
-            try {
-              await apiPost('exams.php', withCompany({ action: 'MARK_INVITED', examId: exam.id, studentIds: deliveredIds }));
-              onUpdateExams(prev => prev.map(e => e.id === exam.id
-                ? { ...e, pendingInviteCount: Math.max(0, (e.pendingInviteCount ?? 0) - deliveredIds.length) }
-                : e));
-            } catch (err) {
-              console.error('Invitations were sent but could not be recorded:', err);
+        if (channels.email) {
+          const messages = targetStudents.map(student => {
+            // Reminder emails carry the exam details only — no access link/token.
+            // The token is minted+signed server-side (resolveRecipients); we never build it here.
+            let link = '';
+            if (!reminder && (student.code || student.token)) {
+              link = examLinkFor(student);
             }
+
+            const { subject, body } = buildExamEmailContent(exam, student.fullName, link, reminder, override);
+
+            // Normalise the address — emails typed in ALL CAPS or Mixed Case go to the
+            // same mailbox, so send to the correctly-formatted lowercase address.
+            // Instructions are linked in the body (instructionsBlock), not attached — see above.
+            return { to: student.email.trim().toLowerCase(), subject, body };
+          });
+
+          // withCompany: notify.php scopes SMTP + delivery logs by company, like every other write here;
+          // without it a super admin's send was rejected ("companyId is required") or logged under
+          // whichever company the top bar happened to hold.
+          try {
+            const result = await apiPost<{ sent: number; failed?: { to: string; error: string }[] }>('notify.php', withCompany({ messages }));
+            // Addresses that bounced stay uninvited so the next send retries them.
+            const failedTo = new Set((result.failed || []).map(f => (f.to || '').trim().toLowerCase()));
+            targetStudents
+              .filter(s => !failedTo.has(s.email.trim().toLowerCase()))
+              .forEach(s => reachedIds.add(s.id));
+            lines.push(result.failed && result.failed.length > 0
+              ? `Email: ${result.sent} sent, ${result.failed.length} failed.`
+              : `Email: sent to ${result.sent} student${result.sent === 1 ? '' : 's'}.`);
+          } catch (err) {
+            console.error('Email send failed:', err);
+            lines.push(`Email: ${apiErrorMessage(err, 'the emails could not be sent.')}`);
           }
         }
 
-        // WhatsApp copy for the students whose email went out. A WhatsApp problem is reported in the
-        // same summary but never undoes or blocks the email side, which has already happened.
-        let waLine = '';
-        if (whatsapp && deliveredIds.length > 0) {
+        // WhatsApp goes to every selected student with a mobile number, whatever happened to the email.
+        // A WhatsApp problem is reported in the same summary but never undoes the email side.
+        if (channels.whatsapp && targetStudents.length > 0) {
           try {
-            const wa = await sendWhatsAppNotices(exam, deliveredIds, reminder ? 'REMINDER' : 'INVITE');
+            const wa = await sendWhatsAppNotices(exam, targetStudents.map(s => s.id), reminder ? 'REMINDER' : 'INVITE');
+            (wa.sentIds || []).forEach(id => reachedIds.add(id));
             const parts = [`${wa.sent} sent`];
             if (wa.failed > 0) parts.push(`${wa.failed} failed`);
             if (wa.skippedNoMobile > 0) parts.push(`${wa.skippedNoMobile} without a mobile number`);
             if (wa.skippedDisabled > 0) parts.push(`${wa.skippedDisabled} skipped (WhatsApp not configured)`);
-            waLine = `\nWhatsApp: ${parts.join(', ')}.`;
+            let waLine = `WhatsApp: ${parts.join(', ')}.`;
             if (wa.failures.length > 0) {
               waLine += ` First error: ${wa.failures[0].error}`;
             }
+            lines.push(waLine);
           } catch (err) {
             console.error('WhatsApp send failed:', err);
-            waLine = `\nWhatsApp: ${apiErrorMessage(err, 'the WhatsApp messages could not be sent.')}`;
+            lines.push(`WhatsApp: ${apiErrorMessage(err, 'the WhatsApp messages could not be sent.')}`);
           }
         }
 
-        if (result.failed && result.failed.length > 0) {
-          alert(`Sent ${result.sent} emails. Failed: ${result.failed.length}. Check server response for details.${waLine}`);
-        } else {
-          alert(`Success! ${reminder ? 'Reminders' : 'Invitations'} sent to ${result.sent} students.${waLine}`);
+        // Record who actually received a link, so they aren't counted as "to invite" any more.
+        if (!reminder && reachedIds.size > 0) {
+          const deliveredIds = Array.from(reachedIds);
+          try {
+            await apiPost('exams.php', withCompany({ action: 'MARK_INVITED', examId: exam.id, studentIds: deliveredIds }));
+            onUpdateExams(prev => prev.map(e => e.id === exam.id
+              ? { ...e, pendingInviteCount: Math.max(0, (e.pendingInviteCount ?? 0) - deliveredIds.length) }
+              : e));
+          } catch (err) {
+            console.error('Invitations were sent but could not be recorded:', err);
+          }
         }
+
+        alert(`${reminder ? 'Reminders' : 'Invitations'} for ${targetStudents.length} student${targetStudents.length === 1 ? '' : 's'}:\n${lines.join('\n')}`);
     } catch (e) {
         console.error(e);
-        alert("Failed to send emails. Please try again.");
+        alert("Failed to send. Please try again.");
     } finally {
         setEmailSendingId(null);
         setSendingMode(null);
@@ -1754,8 +1788,8 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       // Tokens are minted at send time for the filtered audience only, so skip them here.
       const recipients = await resolveRecipients(exam, false);
       setMailComposer(prev => (prev && prev.exam.id === exam.id ? { ...prev, recipients, loading: false } : prev));
+      setSendChannels({ email: true, whatsapp: true });
       if (waReadyFor('INVITE') || waReadyFor('REMINDER')) {
-        setWaOptIn(true);
         void loadWaCoverage(exam, recipients);
       }
     } catch (e: any) {
@@ -1862,7 +1896,13 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     }
 
     const kindLabel = composer.kind === 'REMINDER' ? 'reminder' : 'invitation';
-    if (!confirm(`Send this ${kindLabel} to ${targets.length} student${targets.length === 1 ? '' : 's'}?`)) return;
+    const channels = channelsFor(composer.kind);
+    if (!channels.email && !channels.whatsapp) {
+      alert('Tick Email, WhatsApp or both.');
+      return;
+    }
+    const via = channels.email && channels.whatsapp ? 'by email and WhatsApp' : channels.email ? 'by email' : 'on WhatsApp';
+    if (!confirm(`Send this ${kindLabel} ${via} to ${targets.length} student${targets.length === 1 ? '' : 's'}?`)) return;
 
     // Only invitations carry an access link, so only they need signed tokens — and only for the
     // filtered audience, not the whole roster.
@@ -1882,7 +1922,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     await dispatchEmails(composer.exam, sendTargets, composer.kind === 'REMINDER', {
       subject: composer.subject,
       message: composer.message,
-    }, waReadyFor(composer.kind) && waOptIn);
+    }, channels);
   };
 
   // --- Link Generation & Export ---
@@ -4206,7 +4246,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                   ? 'Resolving recipients…'
                   : <>Sending to <span className="font-semibold text-slate-900">{targets.length}</span> of {recipients.length} assigned student{recipients.length === 1 ? '' : 's'}</>}
               </p>
-              {!loading && renderWhatsAppOptIn(exam, kind, targets)}
+              {!loading && renderChannelOptions(exam, kind, targets)}
             </div>
             <div className="flex items-center gap-2">
               <button
@@ -4217,7 +4257,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               </button>
               <button
                 onClick={sendFromComposer}
-                disabled={busy || loading || targets.length === 0}
+                disabled={busy || loading || targets.length === 0 || noChannelFor(kind)}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
               >
                 {busy ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
@@ -4250,19 +4290,18 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               )}
             </div>
             <div className="p-5 space-y-3">
-              {waReadyFor('INVITE') && (
-                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
-                  {renderWhatsAppOptIn(inviteScopeTarget.exam, 'INVITE', inviteScopeTarget.confirmText ? inviteScopeTarget.recipients : inviteScopeTarget.pending)}
-                </div>
-              )}
+              <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
+                {renderChannelOptions(inviteScopeTarget.exam, 'INVITE', inviteScopeTarget.confirmText ? inviteScopeTarget.recipients : inviteScopeTarget.pending)}
+              </div>
               {inviteScopeTarget.confirmText ? (
                 <button
                   onClick={() => {
                     const target = inviteScopeTarget;
                     setInviteScopeTarget(null);
-                    dispatchEmails(target.exam, target.recipients, false, undefined, waReadyFor('INVITE') && waOptIn);
+                    dispatchEmails(target.exam, target.recipients, false, undefined, channelsFor('INVITE'));
                   }}
-                  className="w-full px-4 py-2.5 rounded-lg bg-blue-600 text-white font-medium hover:bg-blue-700"
+                  disabled={noChannelFor('INVITE')}
+                  className="w-full px-4 py-2.5 rounded-lg bg-blue-600 text-white font-medium hover:bg-blue-700 disabled:opacity-50"
                 >
                   Send to {inviteScopeTarget.recipients.length} student{inviteScopeTarget.recipients.length === 1 ? '' : 's'}
                 </button>
@@ -4272,9 +4311,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                     onClick={() => {
                       const target = inviteScopeTarget;
                       setInviteScopeTarget(null);
-                      dispatchEmails(target.exam, target.pending, false, undefined, waReadyFor('INVITE') && waOptIn);
+                      dispatchEmails(target.exam, target.pending, false, undefined, channelsFor('INVITE'));
                     }}
-                    className="w-full px-4 py-2.5 rounded-lg bg-blue-600 text-white font-medium hover:bg-blue-700"
+                    disabled={noChannelFor('INVITE')}
+                    className="w-full px-4 py-2.5 rounded-lg bg-blue-600 text-white font-medium hover:bg-blue-700 disabled:opacity-50"
                   >
                     Send to {inviteScopeTarget.pending.length} new students only
                   </button>
@@ -4282,9 +4322,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                     onClick={() => {
                       const target = inviteScopeTarget;
                       setInviteScopeTarget(null);
-                      dispatchEmails(target.exam, target.recipients, false, undefined, waReadyFor('INVITE') && waOptIn);
+                      dispatchEmails(target.exam, target.recipients, false, undefined, channelsFor('INVITE'));
                     }}
-                    className="w-full px-4 py-2.5 rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50"
+                    disabled={noChannelFor('INVITE')}
+                    className="w-full px-4 py-2.5 rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-50"
                   >
                     Resend to all {inviteScopeTarget.recipients.length} students
                   </button>

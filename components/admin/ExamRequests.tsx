@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Inbox, Users, FileText, RefreshCw, Loader2, AlertCircle, AlertTriangle, Check, Copy, X, Plus, Trash2,
   KeyRound, Ban, Send, ShieldCheck, Mail, Download, Search, ChevronDown, ChevronRight, UserPlus, Info,
-  CalendarClock, ClipboardList, Pencil,
+  CalendarClock, ClipboardList, Pencil, MessageCircle,
 } from 'lucide-react';
 import { apiGet, apiPost, getApiErrorMessage } from '../../services/api';
 import { parseCsvLine } from '../../services/questionCsv';
@@ -13,6 +13,7 @@ import {
 import { Pagination, usePagination } from './Pagination';
 import {
   CompanyDirectoryRecord, ExamRequest, ExamRequestDetails, ExamRequestStudent, ExamRequester, ExamRequestStatus,
+  WhatsAppStatus,
 } from '../../types';
 
 // Exam Requests tab (SUPER_ADMIN): exam requests employees send by email (see api/exam_requests.php,
@@ -41,7 +42,13 @@ interface InviteChunk {
   inviteCursor: string | null;
   inviteError: string | null;
   pendingTotal?: number;
+  whatsappSent?: number;
+  whatsappFailed?: number;
+  whatsappNoMobile?: number;
 }
+
+/** Which channels invitations go out on (api/exam_requests.php er_invite_channels()). */
+interface InviteChannelChoice { email: boolean; whatsapp: boolean }
 
 type Tab = 'requests' | 'employees' | 'template';
 type Filter = 'PENDING' | 'ATTENTION' | 'APPROVED' | 'REJECTED' | 'INVALID' | 'ALL';
@@ -349,6 +356,26 @@ const StudentsEditor: React.FC<{
   );
 };
 
+/** Email / WhatsApp checkboxes for invitations. WhatsApp is disabled until it's configured for invites. */
+const InviteChannels: React.FC<{
+  value: InviteChannelChoice;
+  whatsappReady: boolean;
+  disabled?: boolean;
+  onChange: (next: InviteChannelChoice) => void;
+}> = ({ value, whatsappReady, disabled, onChange }) => (
+  <div className="flex flex-wrap gap-x-5 gap-y-1.5 text-sm text-slate-700">
+    <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+      <input type="checkbox" className="accent-[var(--lsc-primary)]" checked={value.email} disabled={disabled} onChange={e => onChange({ ...value, email: e.target.checked })} />
+      <Mail size={14} className="text-slate-500" aria-hidden="true" /> Email
+    </label>
+    <label className={`inline-flex items-center gap-1.5 select-none ${whatsappReady ? 'cursor-pointer' : 'opacity-60'}`}>
+      <input type="checkbox" className="accent-[var(--lsc-primary)]" checked={whatsappReady && value.whatsapp} disabled={disabled || !whatsappReady} onChange={e => onChange({ ...value, whatsapp: e.target.checked })} />
+      <MessageCircle size={14} className="text-emerald-600" aria-hidden="true" /> WhatsApp
+      <span className="text-xs text-slate-400">{whatsappReady ? '(students with a mobile number)' : '(not set up)'}</span>
+    </label>
+  </div>
+);
+
 const KeyValue: React.FC<{ label: string; children: React.ReactNode }> = ({ label, children }) => (
   <div className="min-w-0">
     <dt className="text-[11px] font-medium uppercase tracking-wide text-slate-400">{label}</dt>
@@ -368,11 +395,21 @@ const RequestDetail: React.FC<DetailProps> = ({ request, onClose, onChanged }) =
   const [busy, setBusy] = useState<'' | 'save' | 'approve' | 'reject' | 'invite'>('');
   const [notice, setNotice] = useState<{ tone: 'error' | 'success' | 'info'; text: string } | null>(null);
   const [approveOpen, setApproveOpen] = useState(false);
-  const [sendInvites, setSendInvites] = useState(true);
+  const [inviteChannels, setInviteChannels] = useState<InviteChannelChoice>({ email: true, whatsapp: true });
+  const [whatsappReady, setWhatsappReady] = useState(false);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectNote, setRejectNote] = useState('');
-  const [inviteProgress, setInviteProgress] = useState<{ sent: number; failed: InviteFailure[]; remaining: number; done: boolean; error: string | null } | null>(null);
+  const [inviteProgress, setInviteProgress] = useState<{ sent: number; failed: InviteFailure[]; remaining: number; done: boolean; error: string | null; whatsappSent: number; whatsappFailed: number; whatsappNoMobile: number } | null>(null);
   const [showBody, setShowBody] = useState(false);
+
+  // WhatsApp invitations are only offered once the server says they're configured.
+  useEffect(() => {
+    let cancelled = false;
+    apiGet<WhatsAppStatus>('whatsapp.php')
+      .then(status => { if (!cancelled) setWhatsappReady(!!status?.ready && !!status.kinds?.INVITE); })
+      .catch(() => { if (!cancelled) setWhatsappReady(false); });
+    return () => { cancelled = true; };
+  }, []);
 
   const isPending = current.status === 'PENDING';
   const tz = resolveExamTimezone(draft.timezone);
@@ -462,33 +499,42 @@ const RequestDetail: React.FC<DetailProps> = ({ request, onClose, onChanged }) =
   };
 
   /** Continue sending invitations chunk by chunk (each server call is time-boxed). */
-  const continueInvites = async (start: InviteChunk, notifyRequester: boolean) => {
+  const continueInvites = async (start: InviteChunk, notifyRequester: boolean, channels: InviteChannelChoice) => {
     let sent = start.invited;
     let failed = [...start.inviteFailures];
     let remaining = start.inviteRemaining;
     let cursor = start.inviteCursor;
     let error = start.inviteError;
-    setInviteProgress({ sent, failed, remaining, done: remaining === 0 || !!error, error });
+    const wa = { whatsappSent: start.whatsappSent || 0, whatsappFailed: start.whatsappFailed || 0, whatsappNoMobile: start.whatsappNoMobile || 0 };
+    setInviteProgress({ sent, failed, remaining, done: remaining === 0 || !!error, error, ...wa });
     while (remaining > 0 && !error && cursor !== null) {
-      const res: InviteChunk = await apiPost<InviteChunk>(API, { action: 'SEND_INVITES', id: current.id, after: cursor, notifyRequester });
+      const res: InviteChunk = await apiPost<InviteChunk>(API, { action: 'SEND_INVITES', id: current.id, after: cursor, notifyRequester, channels });
       sent += res.invited;
       failed = [...failed, ...res.inviteFailures];
       error = res.inviteError;
+      wa.whatsappSent += res.whatsappSent || 0;
+      wa.whatsappFailed += res.whatsappFailed || 0;
+      wa.whatsappNoMobile += res.whatsappNoMobile || 0;
       const progressed = res.invited > 0 || res.inviteFailures.length > 0 || res.inviteCursor !== cursor;
       remaining = res.inviteRemaining;
       cursor = res.inviteCursor;
-      setInviteProgress({ sent, failed, remaining, done: false, error });
+      setInviteProgress({ sent, failed, remaining, done: false, error, ...wa });
       if (!progressed) break;
     }
-    setInviteProgress({ sent, failed, remaining, done: true, error });
+    setInviteProgress({ sent, failed, remaining, done: true, error, ...wa });
   };
+
+  // The channels actually requested: WhatsApp only counts while it's configured for invitations.
+  const effectiveChannels: InviteChannelChoice = { email: inviteChannels.email, whatsapp: whatsappReady && inviteChannels.whatsapp };
+  const sendInvites = effectiveChannels.email || effectiveChannels.whatsapp;
 
   const approve = async () => {
     setBusy('approve');
     setNotice(null);
     setInviteProgress(null);
     try {
-      const body: Record<string, unknown> = { action: 'APPROVE', id: current.id, sendInvites };
+      const channels = effectiveChannels;
+      const body: Record<string, unknown> = { action: 'APPROVE', id: current.id, sendInvites, channels };
       if (dirty) {
         body.details = draft;
         body.students = students;
@@ -499,7 +545,7 @@ const RequestDetail: React.FC<DetailProps> = ({ request, onClose, onChanged }) =
       setNotice({ tone: 'success', text: `Approved — exam "${res.request.details.title}" created with ${res.assigned} student${res.assigned === 1 ? '' : 's'} enrolled.` });
       if (sendInvites) {
         setBusy('invite');
-        await continueInvites(res, true);
+        await continueInvites(res, true, channels);
         await reloadCurrent();
       }
       onChanged();
@@ -517,8 +563,9 @@ const RequestDetail: React.FC<DetailProps> = ({ request, onClose, onChanged }) =
     setBusy('invite');
     setNotice(null);
     try {
-      const first = await apiPost<InviteChunk>(API, { action: 'SEND_INVITES', id: current.id });
-      await continueInvites(first, false);
+      const channels = effectiveChannels;
+      const first = await apiPost<InviteChunk>(API, { action: 'SEND_INVITES', id: current.id, channels });
+      await continueInvites(first, false, channels);
       await reloadCurrent();
       onChanged();
     } catch (e) {
@@ -600,9 +647,17 @@ const RequestDetail: React.FC<DetailProps> = ({ request, onClose, onChanged }) =
                 {inviteProgress.done ? 'Invitations' : 'Sending invitations…'}
               </div>
               <p className="text-slate-600">
-                {inviteProgress.sent} sent · {inviteProgress.failed.length} failed
+                {inviteProgress.sent} student{inviteProgress.sent === 1 ? '' : 's'} invited · {inviteProgress.failed.length} failed
                 {inviteProgress.remaining > 0 ? ` · ${inviteProgress.remaining} not sent yet` : ''}
               </p>
+              {(inviteProgress.whatsappSent + inviteProgress.whatsappFailed + inviteProgress.whatsappNoMobile) > 0 && (
+                <p className="text-slate-600 flex items-center gap-1.5">
+                  <MessageCircle size={13} className="text-emerald-600" aria-hidden="true" />
+                  WhatsApp: {inviteProgress.whatsappSent} sent
+                  {inviteProgress.whatsappFailed > 0 ? ` · ${inviteProgress.whatsappFailed} failed` : ''}
+                  {inviteProgress.whatsappNoMobile > 0 ? ` · ${inviteProgress.whatsappNoMobile} without a mobile number` : ''}
+                </p>
+              )}
               {inviteProgress.error && <p className="text-rose-700">{inviteProgress.error}</p>}
               {inviteProgress.failed.length > 0 && (
                 <ul className="text-xs text-rose-700 list-disc pl-5 max-h-32 overflow-y-auto">
@@ -635,10 +690,13 @@ const RequestDetail: React.FC<DetailProps> = ({ request, onClose, onChanged }) =
                 {current.reviewedBy ? ` · approved by ${current.reviewedBy} on ${fmtDateTime(current.reviewedAt)}` : ''}
               </p>
               {(current.pendingInviteCount ?? 0) > 0 && (
-                <button type="button" onClick={() => { void sendPending(); }} disabled={!!busy} className="px-3 py-1.5 lsc-button-primary text-xs inline-flex items-center gap-1.5 disabled:opacity-60">
-                  {busy === 'invite' ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
-                  Send {current.pendingInviteCount} pending invitation{current.pendingInviteCount === 1 ? '' : 's'}
-                </button>
+                <div className="space-y-2 rounded-lg border border-emerald-200 bg-white/70 px-3 py-2.5">
+                  <InviteChannels value={inviteChannels} whatsappReady={whatsappReady} disabled={!!busy} onChange={setInviteChannels} />
+                  <button type="button" onClick={() => { void sendPending(); }} disabled={!!busy || !sendInvites} className="px-3 py-1.5 lsc-button-primary text-xs inline-flex items-center gap-1.5 disabled:opacity-60">
+                    {busy === 'invite' ? <Loader2 size={13} className="animate-spin" /> : <Send size={13} />}
+                    Send {current.pendingInviteCount} pending invitation{current.pendingInviteCount === 1 ? '' : 's'}
+                  </button>
+                </div>
               )}
             </div>
           )}
@@ -871,13 +929,15 @@ const RequestDetail: React.FC<DetailProps> = ({ request, onClose, onChanged }) =
           </p>
           <p className="mt-2 text-xs text-slate-500 flex items-center gap-1.5"><CalendarClock size={13} /> {scheduleLabel(d.startTime, d.timezone)} → {scheduleLabel(d.endTime, d.timezone)}</p>
           {dirty && <p className="mt-2 text-xs text-slate-500">Your unsaved changes are included.</p>}
-          <label className="mt-4 flex items-start gap-2.5 rounded-lg border border-slate-200 px-3 py-2.5 cursor-pointer">
-            <input type="checkbox" className="mt-0.5 accent-[var(--lsc-primary)]" checked={sendInvites} onChange={e => setSendInvites(e.target.checked)} />
-            <span>
-              <span className="block font-medium text-slate-800">Send invitations to {batch ? 'about ' : ''}{recipientEstimate} student{recipientEstimate === 1 ? '' : 's'} now</span>
-              <span className="block text-xs text-slate-500">Each student gets their personal, signed exam link. Otherwise send them later from this request or the Exams tab.</span>
+          <div className="mt-4 rounded-lg border border-slate-200 px-3 py-2.5 space-y-2">
+            <span className="block font-medium text-slate-800">Send invitations to {batch ? 'about ' : ''}{recipientEstimate} student{recipientEstimate === 1 ? '' : 's'} now by</span>
+            <InviteChannels value={inviteChannels} whatsappReady={whatsappReady} disabled={busy === 'approve'} onChange={setInviteChannels} />
+            <span className="block text-xs text-slate-500">
+              {sendInvites
+                ? 'Each student gets their personal exam link on the ticked channels.'
+                : 'Nothing is sent now — send the invitations later from this request or the Exams tab.'}
             </span>
-          </label>
+          </div>
         </Modal>
       )}
 

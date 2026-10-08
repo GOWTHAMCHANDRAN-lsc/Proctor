@@ -1140,18 +1140,24 @@ function er_invitation_email(array $exam, string $companyName, string $fullName,
  * send_exam_invitation(): a signed mint_exam_access_token() link, the per (exam, student) GET_LOCK,
  * the exam_invitations "already mailed" marker written only after a successful send, and a
  * delivery_logs row per attempt. One SMTP session is reused for the whole run (notify.php style).
- * Returns ['invited' => n, 'failures' => [[email, error]], 'remaining' => n, 'cursor' => ?string, 'error' => ?string].
+ * $channels (er_invite_channels()) picks email, WhatsApp or both. A student counts as invited, and is
+ * never re-sent, once EITHER channel reached them. WhatsApp only reaches students with a mobile number.
+ * Returns ['invited' => n, 'failures' => [[email, error]], 'remaining' => n, 'cursor' => ?string,
+ * 'error' => ?string, 'whatsappSent' => n, 'whatsappFailed' => n, 'whatsappNoMobile' => n].
  */
-function er_send_invitations(PDO $pdo, array $env, string $examId, string $after = '', float $budget = ER_INVITE_TIME_BUDGET): array {
+function er_send_invitations(PDO $pdo, array $env, string $examId, string $after = '', float $budget = ER_INVITE_TIME_BUDGET, array $channels = ['email' => true, 'whatsapp' => true]): array {
     $examStmt = $pdo->prepare('SELECT * FROM exams WHERE id = ? LIMIT 1');
     $examStmt->execute([$examId]);
     $exam = $examStmt->fetch();
     $examStmt->closeCursor();
-    $result = ['invited' => 0, 'failures' => [], 'remaining' => 0, 'cursor' => null, 'error' => null];
+    $result = ['invited' => 0, 'failures' => [], 'remaining' => 0, 'cursor' => null, 'error' => null,
+               'whatsappSent' => 0, 'whatsappFailed' => 0, 'whatsappNoMobile' => 0];
     if (!$exam) {
         $result['error'] = 'Exam not found.';
         return $result;
     }
+    $useEmail = !empty($channels['email']);
+    $useWhatsApp = !empty($channels['whatsapp']) && whatsapp_kind_ready(whatsapp_config($env), 'INVITE');
     $mailExam = exam_mail_exam_by_id($pdo, $examId);
     $cfg = er_smtp_config($env);
     $countRemaining = static function (string $cursor) use ($pdo, $examId): int {
@@ -1159,7 +1165,14 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
                                     LEFT JOIN exam_invitations ei ON ei.exam_id = ea.exam_id AND ei.student_id = ea.student_id
                                     WHERE ea.exam_id = ? AND ei.student_id IS NULL AND ea.student_id > ?', [$examId, $cursor]);
     };
-    if ($cfg === null) {
+    if (!$useEmail && !$useWhatsApp) {
+        $result['error'] = !empty($channels['whatsapp'])
+            ? 'WhatsApp invitations are not configured, so no invitations were sent.'
+            : 'Choose email, WhatsApp or both.';
+        $result['remaining'] = $countRemaining('');
+        return $result;
+    }
+    if ($useEmail && $cfg === null) {
         $result['error'] = 'SMTP is not configured, so no invitations were sent.';
         $result['remaining'] = $countRemaining('');
         return $result;
@@ -1188,7 +1201,7 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
                 $stopped = true;
                 break;
             }
-            if (!is_resource($fp)) {
+            if ($useEmail && !is_resource($fp)) {
                 $conn = smtp_open($cfg['host'], $cfg['port'], $cfg['user'], $cfg['pass'], $cfg['secure'], $cfg['timeout'], $cfg['selfSigned']);
                 if (!$conn['ok']) {
                     // Retrying per student would just burn the time budget on the same failure.
@@ -1216,10 +1229,11 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
                 [$subject, $html] = er_invitation_email($exam, $companyNames[$studentCompany], $fullName, $link);
             }
 
-            if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+            $emailValid = filter_var($email, FILTER_VALIDATE_EMAIL) !== false;
+            if ($useEmail && !$emailValid) {
                 add_delivery_log($pdo, $studentCompany, 'EMAIL', $email, $subject, $html, 'FAILED', 'Invalid recipient email address.');
                 $result['failures'][] = ['email' => $email, 'error' => 'Invalid recipient email address.'];
-                continue;
+                if (!$useWhatsApp) continue;
             }
 
             $lockName = 'exam_invite_' . $examId . '_' . $studentId;
@@ -1238,43 +1252,60 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
                 $already->closeCursor();
                 if ($isSent) continue;
 
-                $send = smtp_deliver($fp, $cfg['from'], [
-                    'to' => $email,
-                    'subject' => $subject,
-                    'body' => $html,
-                    'plain' => er_html_to_plain($html),
-                    'fromName' => $companyNames[$studentCompany] . ' ProctorGuard',
-                ]);
-                if ($send['ok']) {
-                    // Reset for the next recipient; a bad RSET means the session is suspect — reopen.
-                    $rset = @fwrite($fp, "RSET\r\n");
-                    $resp = $rset === false ? ['code' => 0] : smtp_read_response($fp);
-                    if ($rset === false || $resp['code'] !== 250) {
+                $emailOk = false;
+                if ($useEmail && $emailValid) {
+                    $send = smtp_deliver($fp, $cfg['from'], [
+                        'to' => $email,
+                        'subject' => $subject,
+                        'body' => $html,
+                        'plain' => er_html_to_plain($html),
+                        'fromName' => $companyNames[$studentCompany] . ' ProctorGuard',
+                    ]);
+                    if ($send['ok']) {
+                        // Reset for the next recipient; a bad RSET means the session is suspect — reopen.
+                        $rset = @fwrite($fp, "RSET\r\n");
+                        $resp = $rset === false ? ['code' => 0] : smtp_read_response($fp);
+                        if ($rset === false || $resp['code'] !== 250) {
+                            smtp_close($fp);
+                            $fp = null;
+                        }
+                    } else {
+                        // Connection state is unknown after a failed delivery.
                         smtp_close($fp);
                         $fp = null;
+                        $result['failures'][] = ['email' => $email, 'error' => (string)($send['error'] ?? 'Send failed')];
                     }
-                } else {
-                    // Connection state is unknown after a failed delivery.
-                    smtp_close($fp);
-                    $fp = null;
+                    add_delivery_log($pdo, $studentCompany, 'EMAIL', $email, $subject, $html, $send['ok'] ? 'SENT' : 'FAILED', $send['ok'] ? null : (string)($send['error'] ?? 'Send failed'));
+                    $emailOk = (bool)$send['ok'];
                 }
-                add_delivery_log($pdo, $studentCompany, 'EMAIL', $email, $subject, $html, $send['ok'] ? 'SENT' : 'FAILED', $send['ok'] ? null : (string)($send['error'] ?? 'Send failed'));
-                if ($send['ok']) {
+                // WhatsApp (same link) for students with a mobile number. Best-effort: logged in
+                // delivery_logs and counted, never fails this run.
+                $whatsappOk = false;
+                if ($useWhatsApp) {
+                    try {
+                        $wa = whatsapp_send_exam_notice($pdo, $env, $studentCompany, $exam, $row, 'INVITE');
+                        if ($wa['status'] === 'SENT') {
+                            $whatsappOk = true;
+                            $result['whatsappSent']++;
+                        } elseif (($wa['reason'] ?? '') === 'NO_MOBILE') {
+                            $result['whatsappNoMobile']++;
+                        } elseif ($wa['status'] === 'FAILED') {
+                            $result['whatsappFailed']++;
+                            if (!$useEmail) {
+                                $result['failures'][] = ['email' => $email, 'error' => 'WhatsApp: ' . (string)($wa['error'] ?? 'send failed')];
+                            }
+                        }
+                    } catch (Throwable $e) {
+                        $result['whatsappFailed']++;
+                        error_log('[exam_requests] WhatsApp invitation failed: ' . $e->getMessage());
+                    }
+                }
+                // Invited once either channel reached the student, so a later run never repeats it.
+                if ($emailOk || $whatsappOk) {
                     $mark = $pdo->prepare('INSERT IGNORE INTO exam_invitations (exam_id, student_id) VALUES (?, ?)');
                     $mark->execute([$examId, $studentId]);
                     $mark->closeCursor();
                     $result['invited']++;
-                    // WhatsApp copy (same link) for students with a mobile number — only after the
-                    // email went out and the "invited" marker is written, so a later run never
-                    // repeats it. Best-effort: logged in delivery_logs, never fails this run. Returns
-                    // at once (no logging) while WhatsApp invitations aren't configured.
-                    try {
-                        whatsapp_send_exam_notice($pdo, $env, $studentCompany, $exam, $row, 'INVITE');
-                    } catch (Throwable $e) {
-                        error_log('[exam_requests] WhatsApp invitation failed: ' . $e->getMessage());
-                    }
-                } else {
-                    $result['failures'][] = ['email' => $email, 'error' => (string)($send['error'] ?? 'Send failed')];
                 }
             } finally {
                 $release = $pdo->prepare('SELECT RELEASE_LOCK(?)');
@@ -1292,6 +1323,18 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
         $result['failures'] = array_slice($result['failures'], 0, 100);
     }
     return $result;
+}
+
+/**
+ * Channels for invitations from the payload's {channels: {email, whatsapp}}. A payload without
+ * channels (older clients) keeps the previous behaviour: email plus the WhatsApp copy.
+ */
+function er_invite_channels(array $payload): array {
+    $raw = $payload['channels'] ?? null;
+    if (!is_array($raw)) {
+        return ['email' => true, 'whatsapp' => true];
+    }
+    return ['email' => er_bool($raw['email'] ?? false, false), 'whatsapp' => er_bool($raw['whatsapp'] ?? false, false)];
 }
 
 /** "Approved, exam scheduled, N invitations sent" to the requester. */
@@ -1761,7 +1804,8 @@ if ($action === 'APPROVE') {
         json_response(['error' => 'Only pending requests can be approved.'], 409);
     }
     $companyId = $request['company_id'] !== null ? (int)$request['company_id'] : 0;
-    $sendInvites = !empty($payload['sendInvites']);
+    $channels = er_invite_channels($payload);
+    $sendInvites = !empty($payload['sendInvites']) && ($channels['email'] || $channels['whatsapp']);
     // Problems recorded at intake (including ones about how a value was written, which a fresh
     // validation can't see) block approval until the request is edited — an APPROVE carrying
     // details/students is such an edit and is re-validated below.
@@ -1824,7 +1868,7 @@ if ($action === 'APPROVE') {
     @set_time_limit(120);
     $invite = ['invited' => 0, 'failures' => [], 'remaining' => 0, 'cursor' => null, 'error' => null];
     if ($sendInvites) {
-        $invite = er_send_invitations($pdo, $env, $examId);
+        $invite = er_send_invitations($pdo, $env, $examId, '', ER_INVITE_TIME_BUDGET, $channels);
     }
     $approved = er_fetch_request($pdo, $requestId);
     if (!$sendInvites || $invite['remaining'] === 0) {
@@ -1840,6 +1884,9 @@ if ($action === 'APPROVE') {
         'inviteRemaining' => $invite['remaining'],
         'inviteCursor' => $invite['cursor'],
         'inviteError' => $invite['error'],
+        'whatsappSent' => (int)($invite['whatsappSent'] ?? 0),
+        'whatsappFailed' => (int)($invite['whatsappFailed'] ?? 0),
+        'whatsappNoMobile' => (int)($invite['whatsappNoMobile'] ?? 0),
         'pendingTotal' => (int)($approved['pending_invite_count'] ?? 0),
     ]);
 }
@@ -1851,7 +1898,7 @@ if ($action === 'SEND_INVITES') {
     ignore_user_abort(true);
     @set_time_limit(120);
     $examId = (string)$request['created_exam_id'];
-    $invite = er_send_invitations($pdo, $env, $examId, trim((string)($payload['after'] ?? '')));
+    $invite = er_send_invitations($pdo, $env, $examId, trim((string)($payload['after'] ?? '')), ER_INVITE_TIME_BUDGET, er_invite_channels($payload));
     // notifyRequester: the UI's continuation of an APPROVE sends the requester's confirmation once
     // the last chunk is out (APPROVE itself only mails it when everything fit in one call).
     // Only when THIS call delivered the final chunk: a repeated/retried call with nothing left to send
@@ -1874,6 +1921,9 @@ if ($action === 'SEND_INVITES') {
         'inviteRemaining' => $invite['remaining'],
         'inviteCursor' => $invite['cursor'],
         'inviteError' => $invite['error'],
+        'whatsappSent' => (int)($invite['whatsappSent'] ?? 0),
+        'whatsappFailed' => (int)($invite['whatsappFailed'] ?? 0),
+        'whatsappNoMobile' => (int)($invite['whatsappNoMobile'] ?? 0),
         'pendingTotal' => db_scalar_int($pdo, 'SELECT COUNT(*) FROM exam_assignments ea LEFT JOIN exam_invitations ei ON ei.exam_id = ea.exam_id AND ei.student_id = ea.student_id WHERE ea.exam_id = ? AND ei.student_id IS NULL', [$examId]),
     ]);
 }

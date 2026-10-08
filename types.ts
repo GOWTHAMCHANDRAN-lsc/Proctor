@@ -717,4 +717,6 @@ export interface WhatsAppSendSummary {
   skippedNoMobile: number;
   skippedDisabled: number;
   failures: { studentId: string; error: string }[];
+  /** Students the message was sent to (api/whatsapp.php SEND_EXAM_NOTICE). */
+  sentIds?: string[];
 }

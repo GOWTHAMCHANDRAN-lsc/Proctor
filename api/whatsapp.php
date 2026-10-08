@@ -894,7 +894,8 @@ if ($action === 'SEND_EXAM_NOTICE') {
         $stmt->closeCursor();
     }
 
-    $result = ['sent' => 0, 'failed' => 0, 'skippedNoMobile' => 0, 'skippedDisabled' => 0, 'failures' => []];
+    // sentIds: who actually got the message, so a WhatsApp-only invitation can be recorded as sent.
+    $result = ['sent' => 0, 'failed' => 0, 'skippedNoMobile' => 0, 'skippedDisabled' => 0, 'failures' => [], 'sentIds' => []];
     $ready = whatsapp_kind_ready($cfg, $kind);
     if ($ready) {
         ignore_user_abort(true);
@@ -918,6 +919,7 @@ if ($action === 'SEND_EXAM_NOTICE') {
         $res = whatsapp_send_exam_notice($pdo, $env, $companyId, $exam, $student, $kind);
         if ($res['status'] === 'SENT') {
             $result['sent']++;
+            $result['sentIds'][] = $sid;
         } elseif ($res['status'] === 'FAILED') {
             $result['failed']++;
             $result['failures'][] = ['studentId' => $sid, 'error' => (string)($res['error'] ?? 'Send failed.')];

@@ -102,6 +102,13 @@ Update on your exam request {{2}} for "{{3}}":
 You will also receive the full details by email.
 ```
 
+**Keep them Utility.** Meta re-checks the category after approval and may move a template to
+*Marketing* (the 2026-10-08 `_v1` templates were moved). Marketing templates are capped per
+recipient, so messages are accepted by the API and then silently not delivered. Check the category
+in WhatsApp Manager; if Meta moved it, submit a new version (`_v2`, `_v3`) as Utility and point
+`.env` at it. Also check the button URL: Meta's editor pre-fills `business.facebook.com`, and
+`_v1` was approved with that address.
+
 Notes for approval: use the example values above as the "sample content" Meta asks for. Variables
 are plain text (ProctorGuard removes line breaks/tabs and caps each at 1000 characters). A kind whose
 template isn't approved yet can simply be left blank in `.env` — the other kinds still work.
@@ -113,18 +120,18 @@ A template may also carry a **Visit website** button that opens the candidate's 
 
 * **Static URL** (the same for everyone, e.g. `https://proctor.lsc-crm.in`): nothing to configure.
 * **Dynamic URL** (personal link per candidate): in Meta set the button URL to
-  `https://proctor.lsc-crm.in?{{1}}` (sample value e.g. `Ab3dE5gH9k`) and copy that URL into `.env`
+  `https://proctor.lsc-crm.in/?{{1}}` (sample value e.g. `Ab3dE5gH9k`) and copy that URL into `.env`
   exactly as written in the template:
 
   ```
-  WHATSAPP_TEMPLATE_INVITE_BUTTON_URL=https://proctor.lsc-crm.in?{{1}}
-  WHATSAPP_TEMPLATE_REMINDER_BUTTON_URL=https://proctor.lsc-crm.in?{{1}}
+  WHATSAPP_TEMPLATE_INVITE_BUTTON_URL=https://proctor.lsc-crm.in/?{{1}}
+  WHATSAPP_TEMPLATE_REMINDER_BUTTON_URL=https://proctor.lsc-crm.in/?{{1}}
   # only if the link button is not the template's first button (0 = first, 1 = second, ...)
   WHATSAPP_TEMPLATE_INVITE_BUTTON_INDEX=0
   ```
 
   Each message fills the button's `{{1}}` with the candidate's 10-character short-link code (a
-  template written as `https://proctor.lsc-crm.in/?{{1}}` or `https://proctor.lsc-crm.in/x/{{1}}`
+  template written as `https://proctor.lsc-crm.in?{{1}}` or `https://proctor.lsc-crm.in/x/{{1}}`
   gets the same code). Without this line Meta rejects every message of a template with a dynamic
   button ("number of parameters does not match"). The Settings → WhatsApp test send
   fills the button with the placeholder code `TESTLINK00` (opens the "invalid link" notice).

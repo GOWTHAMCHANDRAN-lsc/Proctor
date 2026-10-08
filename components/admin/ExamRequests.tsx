@@ -63,7 +63,7 @@ Proctoring: PROCTORED        (or UNPROCTORED)
 Camera: ON
 Show Alerts: YES
 Throw Out On Violations: NO
-Batch: Batch_7                (or attach students.csv: Full Name, Email, Registration ID)
+Batch: Batch_7                (existing batch, or a new name + attach students.csv: Full Name, Email, Registration ID)
 Notes: optional text for the approver`;
 const CSV_SAMPLE = 'Full Name,Email,Registration ID\nAsha Rao,asha.rao@example.com,REG-1001\nBilal Khan,bilal.khan@example.com,REG-1002\n';
 
@@ -428,7 +428,10 @@ const RequestDetail: React.FC<DetailProps> = ({ request, onClose, onChanged }) =
   };
 
   const bank = banks.find(b => b.id === draft.questionBankId) || null;
-  const batch = draft.batchName ? batches.find(b => b.name.toLowerCase() === draft.batchName!.toLowerCase()) || null : null;
+  const batchKey = (draft.batchName || '').trim().toLowerCase();
+  const batch = batchKey ? batches.find(b => b.name.trim().toLowerCase() === batchKey) || null : null;
+  // A name that isn't an existing batch is created on approval, with the CSV students as its members.
+  const newBatch = batchKey !== '' && !batch;
   const recipientEstimate = students.length + (batch ? batch.studentCount : 0);
   const canApprove = isPending && !busy && (dirty || current.errors.length === 0);
 
@@ -764,12 +767,25 @@ const RequestDetail: React.FC<DetailProps> = ({ request, onClose, onChanged }) =
 
               <div>
                 <label className={labelCls} htmlFor="er-batch">Batch</label>
-                <select id="er-batch" className={inputCls} value={batch ? batch.name : (d.batchName || '')} onChange={e => patch({ batchName: e.target.value || null })}>
-                  <option value="">No batch</option>
-                  {d.batchName && !batch && <option value={d.batchName}>"{d.batchName}" (not found)</option>}
-                  {batches.map(b => <option key={b.id} value={b.name}>{b.name} ({b.studentCount} student{b.studentCount === 1 ? '' : 's'})</option>)}
-                </select>
-                <p className="text-[11px] text-slate-400 mt-1">The batch's current members are enrolled along with the CSV students below.</p>
+                <input
+                  id="er-batch"
+                  className={inputCls}
+                  list="er-batch-options"
+                  maxLength={255}
+                  placeholder="No batch — pick an existing one or type a new name"
+                  value={d.batchName || ''}
+                  onChange={e => patch({ batchName: e.target.value.trim() === '' ? null : e.target.value })}
+                />
+                <datalist id="er-batch-options">
+                  {batches.map(b => <option key={b.id} value={b.name}>{b.studentCount} student{b.studentCount === 1 ? '' : 's'}</option>)}
+                </datalist>
+                {batch ? (
+                  <p className="text-[11px] text-slate-400 mt-1">Existing batch ({batch.studentCount} student{batch.studentCount === 1 ? '' : 's'}): its members are enrolled along with the CSV students below. The batch itself is not changed.</p>
+                ) : newBatch && students.length > 0 ? (
+                  <p className="text-[11px] text-teal-700 mt-1">New batch — approving creates "{(d.batchName || '').trim()}" with the {students.length} CSV student{students.length === 1 ? '' : 's'} below as its members.</p>
+                ) : newBatch ? (
+                  <p className="text-[11px] text-rose-600 mt-1">"{(d.batchName || '').trim()}" is not an existing batch. Add students below to create it with them, or pick an existing batch.</p>
+                ) : null}
               </div>
 
               <StudentsEditor students={students} readOnly={false} onChange={changeStudents} />
@@ -1391,7 +1407,7 @@ const TemplateTab: React.FC<{ mailbox: string }> = ({ mailbox }) => (
         <li><strong>Start / End</strong>: <code>YYYY-MM-DD HH:MM</code>, <code>DD-MM-YYYY HH:MM</code> or <code>DD/MM/YYYY HH:MM</code>, optional AM/PM, in the given <strong>Timezone</strong> (IANA name, default Asia/Kolkata). End must be after Start.</li>
         <li><strong>Proctoring</strong> PROCTORED (default) or UNPROCTORED (turns camera and microphone off). <strong>Camera</strong> ON/OFF (default ON), <strong>Microphone</strong> defaults to the camera setting.</li>
         <li><strong>Show Alerts</strong> and <strong>Throw Out On Violations</strong>: YES/NO, both default YES.</li>
-        <li>Students: name an existing <strong>Batch</strong>, attach a <strong>students.csv</strong>, or both.</li>
+        <li>Students: name an existing <strong>Batch</strong>, attach a <strong>students.csv</strong>, or both. A <strong>Batch</strong> name that doesn't exist yet (checked ignoring case) needs a students.csv — approving creates that batch with the CSV students in it. An existing batch is never changed.</li>
         <li>Text in brackets after a value, e.g. <code>(ALL = whole bank)</code>, is ignored. At most 10 requests per employee per hour.</li>
         <li>Every accepted request waits here as <strong>Pending</strong> (problems are flagged as <em>Needs attention</em>). A super admin reviews, edits and approves it; the employee is emailed at each step.</li>
       </ul>

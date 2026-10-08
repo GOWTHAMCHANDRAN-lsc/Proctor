@@ -1128,7 +1128,7 @@ function ensure_exam_request_schema(PDO $pdo): void {
 }
 
 /**
- * Short exam links: "<origin>/x/<code>" instead of the ~170-character "<origin>/?token=<signed token>"
+ * Short exam links: "<origin>?<code>" instead of the ~170-character "<origin>/?token=<signed token>"
  * (the long link is unwieldy in WhatsApp/SMS and gets mangled by mail clients). The code is an opaque,
  * random, case-sensitive 10-char base62 handle on (exam, student, company); api/link.php swaps it for
  * the SAME signed token the long link carries (mint_exam_access_token() is deterministic), so the
@@ -1254,12 +1254,13 @@ function exam_token_link(string $origin, string $eid, string $sid, int $cid): st
 }
 
 /**
- * The candidate's exam link: "<origin>/x/<code>", or — if the short code can't be created for any
- * reason — the long "<origin>/?token=..." link, so a link is always produced.
+ * The candidate's exam link: "<origin>?<code>", or — if the short code can't be created for any
+ * reason — the long "<origin>/?token=..." link, so a link is always produced. Links sent in the
+ * earlier "<origin>/x/<code>" form keep working (App.tsx accepts both).
  */
 function exam_access_link(PDO $pdo, string $origin, string $eid, string $sid, int $cid): string {
     try {
-        return rtrim($origin, '/') . '/x/' . exam_short_code($pdo, $eid, $sid, $cid);
+        return rtrim($origin, '/') . '?' . exam_short_code($pdo, $eid, $sid, $cid);
     } catch (Throwable $e) {
         error_log('[short-link] falling back to token link: ' . $e->getMessage());
         return exam_token_link($origin, $eid, $sid, $cid);

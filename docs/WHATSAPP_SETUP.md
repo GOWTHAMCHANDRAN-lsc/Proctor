@@ -50,7 +50,7 @@ reword the surrounding text, but keep every variable and its meaning.
 | `{{2}}` | exam title | Sales Assessment Q4 |
 | `{{3}}` | availability window, in the exam's timezone | 15 Oct 2026, 10:00 – 18:00 IST |
 | `{{4}}` | duration | 30 minutes |
-| `{{5}}` | the candidate's personal exam link (same link as the email) | https://proctor.lsc-crm.in/x/Ab3dE5gH9k |
+| `{{5}}` | the candidate's personal exam link (same link as the email) | https://proctor.lsc-crm.in?Ab3dE5gH9k |
 
 ```
 Hello {{1}},
@@ -72,7 +72,7 @@ This link is personal to you. Please do not share it.
 | `{{1}}` | candidate name | Asha Rao |
 | `{{2}}` | exam title | Sales Assessment Q4 |
 | `{{3}}` | when the exam window closes, in the exam's timezone | 15 Oct 2026, 18:00 IST |
-| `{{4}}` | the candidate's personal exam link | https://proctor.lsc-crm.in/x/Ab3dE5gH9k |
+| `{{4}}` | the candidate's personal exam link | https://proctor.lsc-crm.in?Ab3dE5gH9k |
 
 ```
 Hello {{1}},
@@ -105,6 +105,29 @@ You will also receive the full details by email.
 Notes for approval: use the example values above as the "sample content" Meta asks for. Variables
 are plain text (ProctorGuard removes line breaks/tabs and caps each at 1000 characters). A kind whose
 template isn't approved yet can simply be left blank in `.env` — the other kinds still work.
+
+### Optional: a "Start exam" link button (INVITE / REMINDER, Meta only)
+
+A template may also carry a **Visit website** button that opens the candidate's link. Keep `{{5}}`
+(INVITE) / `{{4}}` (REMINDER) in the body as well — ProctorGuard always sends the body variables.
+
+* **Static URL** (the same for everyone, e.g. `https://proctor.lsc-crm.in`): nothing to configure.
+* **Dynamic URL** (personal link per candidate): in Meta set the button URL to
+  `https://proctor.lsc-crm.in?{{1}}` (sample value e.g. `Ab3dE5gH9k`) and copy that URL into `.env`
+  exactly as written in the template:
+
+  ```
+  WHATSAPP_TEMPLATE_INVITE_BUTTON_URL=https://proctor.lsc-crm.in?{{1}}
+  WHATSAPP_TEMPLATE_REMINDER_BUTTON_URL=https://proctor.lsc-crm.in?{{1}}
+  # only if the link button is not the template's first button (0 = first, 1 = second, ...)
+  WHATSAPP_TEMPLATE_INVITE_BUTTON_INDEX=0
+  ```
+
+  Each message fills the button's `{{1}}` with the candidate's 10-character short-link code (a
+  template written as `https://proctor.lsc-crm.in/?{{1}}` or `https://proctor.lsc-crm.in/x/{{1}}`
+  gets the same code). Without this line Meta rejects every message of a template with a dynamic
+  button ("number of parameters does not match"). The Settings → WhatsApp test send
+  fills the button with the placeholder code `TESTLINK00` (opens the "invalid link" notice).
 
 ## 4. Option A — Meta WhatsApp Cloud API (`WHATSAPP_PROVIDER=meta`)
 
@@ -174,7 +197,7 @@ WHATSAPP_TEMPLATE_REQUEST_UPDATE=exam_request_update_v1
   "mobile_number": "919876543210",
   "template": "exam_invite_v1",
   "language": "en",
-  "params": ["Asha Rao", "Sales Assessment Q4", "15 Oct 2026, 10:00 – 18:00 IST", "30 minutes", "https://proctor.lsc-crm.in/x/Ab3dE5gH9k"]
+  "params": ["Asha Rao", "Sales Assessment Q4", "15 Oct 2026, 10:00 – 18:00 IST", "30 minutes", "https://proctor.lsc-crm.in?Ab3dE5gH9k"]
 }
 ```
 
@@ -226,10 +249,10 @@ Developers can test without contacting Meta/LSC: point `WHATSAPP_META_BASE_URL` 
 ## 8. Short exam links
 
 Invitation emails, WhatsApp messages and the exported Links CSV use short links
-`https://proctor.lsc-crm.in/x/<10-character code>` instead of the long `/?token=…` link (which
+`https://proctor.lsc-crm.in?<10-character code>` instead of the long `/?token=…` link (which
 WhatsApp and some mail clients break). Each (exam, candidate) has one permanent code; the page swaps
-it for the same signed token through `api/link.php`, so all exam-start checks are unchanged and old
-`/?token=` links keep working. Unknown codes are rate-limited per network (60 misses / 10 minutes).
+it for the same signed token through `api/link.php`, so all exam-start checks are unchanged. Links
+sent earlier as `https://proctor.lsc-crm.in/x/<code>` and old `/?token=` links keep working. Unknown codes are rate-limited per network (60 misses / 10 minutes).
 `APP_ORIGIN` in `.env` sets the origin used in server-built links.
 
 ## 9. Troubleshooting

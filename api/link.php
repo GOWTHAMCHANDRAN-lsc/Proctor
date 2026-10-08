@@ -4,7 +4,7 @@ declare(strict_types=1);
 /**
  * Public short-link resolver: GET api/link.php?c=<code> → {"token": "<signed exam-access token>"}.
  *
- * The student page calls this for a "/x/<code>" URL, then runs the normal ?token= flow with the
+ * The student page calls this for a "<origin>?<code>" (or older "/x/<code>") URL, then runs the normal ?token= flow with the
  * returned token, so every existing check (signature, exam window, assignment, attempts) still
  * applies at exam start. No auth — the code itself is the credential, exactly like the long ?token=
  * link it stands for — and the response carries nothing but that token. Codes are 10 random base62

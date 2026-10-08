@@ -473,6 +473,9 @@ db_add_column_if_missing($pdo, 'exams', 'proctor_timing_json', 'JSON NULL AFTER 
 // Certificate issuance is on-demand only (never automatic on pass) and gated per-exam by this
 // flag, set on exam creation — see api/certificates.php's maybe_issue_certificate().
 db_add_column_if_missing($pdo, 'exams', 'certificate_enabled', 'TINYINT(1) NOT NULL DEFAULT 0');
+// Post-exam feedback form on the candidate's completion screen. Default on = what every existing
+// exam already does.
+db_add_column_if_missing($pdo, 'exams', 'feedback_enabled', 'TINYINT(1) NOT NULL DEFAULT 1');
 // Optional cap on the length of a descriptive (TEXT) answer. NULL = no limit, which is what every
 // existing question keeps, so adding this changes nothing until an admin sets a value.
 db_add_column_if_missing($pdo, 'questions', 'word_limit', 'INT NULL AFTER marks');
@@ -551,6 +554,7 @@ function build_exam_response(array $row, PDO $pdo, int $companyId, bool $include
         'shuffleQuestions' => (bool)$row['shuffle_questions'],
         'showResults' => (bool)$row['show_results'],
         'certificateEnabled' => (bool)($row['certificate_enabled'] ?? 0),
+        'feedbackEnabled' => (bool)($row['feedback_enabled'] ?? 1),
         'attemptPolicy' => $row['attempt_policy'] ?? 'LAST',
         'passPercent' => isset($row['pass_percent']) ? (int)$row['pass_percent'] : 60,
         'reconnectLimit' => isset($row['reconnect_limit']) ? (int)$row['reconnect_limit'] : 0,
@@ -939,7 +943,7 @@ if ($method === 'POST') {
                 $tokens[$sid] = mint_exam_access_token((string)$examId, $sid, (int)$r['company_id']);
                 $studentCompanies[$sid] = (int)$r['company_id'];
             }
-            // Short-link codes ("<origin>/x/<code>") for the same (exam, student, company) — get-or-
+            // Short-link codes ("<origin>?<code>") for the same (exam, student, company) — get-or-
             // create, so a resend or a Links CSV reuses each student's existing code. A student with no
             // code (allocation failed) is just absent from `codes`; the client then uses the token link.
             $codes = [];
@@ -1351,6 +1355,15 @@ if ($method === 'POST') {
             $certUpdate = $pdo->prepare('UPDATE exams SET certificate_enabled = ? WHERE id = ? AND company_id = ?');
             $certUpdate->execute([!empty($exam['certificateEnabled']) ? 1 : 0, $id, $companyId]);
             $certUpdate->closeCursor();
+        }
+
+        // Only when the payload carries the switch: a save from an older client (or any other caller)
+        // leaves the stored value alone instead of switching feedback back on. New exams get the
+        // column default (on).
+        if (array_key_exists('feedbackEnabled', $exam) && db_column_exists($pdo, 'exams', 'feedback_enabled')) {
+            $feedbackUpdate = $pdo->prepare('UPDATE exams SET feedback_enabled = ? WHERE id = ? AND company_id = ?');
+            $feedbackUpdate->execute([exam_bool_flag($exam['feedbackEnabled'] ?? null, true) ? 1 : 0, $id, $companyId]);
+            $feedbackUpdate->closeCursor();
         }
 
         if (exam_proctoring_mode_ready($pdo)) {

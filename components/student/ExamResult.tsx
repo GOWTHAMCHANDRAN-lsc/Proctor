@@ -1,7 +1,7 @@
 ﻿import React, { useState, useEffect, useRef } from 'react';
 import { Exam, Student, QuestionType, ViolationLog, Question } from '../../types';
 import { gradeLocalAnswer, formatLocalAnswer } from '../../services/gradeClient';
-import { CheckCircle, XCircle, Home, Clock, Award, Send, Star, AlertTriangle } from 'lucide-react';
+import { CheckCircle, CheckCircle2, XCircle, Clock, Award, Send, Star, AlertTriangle, Loader2 } from 'lucide-react';
 import { apiPost } from '../../services/api';
 
 interface ExamResultProps {
@@ -11,7 +11,8 @@ interface ExamResultProps {
   violations: ViolationLog[];
   questions?: Question[]; // The specific subset taken
   sessionId?: number;
-  onExit: () => void;
+  // True while the final submission is still on its way to the server (first try or a retry).
+  submitting?: boolean;
   // False when the final submission couldn't be confirmed by the server (e.g. a dropped network
   // request) — the score/review below is computed locally and may not match what's on record yet.
   submissionSynced?: boolean;
@@ -45,18 +46,23 @@ const StarRating = ({ label, value, onChange, disabled }: { label: string; value
   </div>
 );
 
-export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, questions, sessionId, onExit, submissionSynced = true, resubmitting = false, onRetrySubmission }) => {
+export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, questions, sessionId, submitting = false, submissionSynced = true, resubmitting = false, onRetrySubmission }) => {
   const questionsToGrade = questions || exam.questions;
   const showResults = exam.showResults ?? false;
+  // Per-exam switch (exam editor → Candidate Feedback); exams saved before it existed ask for feedback.
+  const feedbackEnabled = exam.feedbackEnabled !== false;
   const feedbackRef = useRef<HTMLDivElement>(null);
+  // Only a confirmed submission is "completed" — until then the candidate must keep the page open.
+  const completed = submissionSynced && !submitting;
 
   // Auto-scroll to feedback after a short delay so the student sees it.
   useEffect(() => {
+    if (!feedbackEnabled) return;
     const t = window.setTimeout(() => {
       feedbackRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }, 800);
     return () => window.clearTimeout(t);
-  }, []);
+  }, [feedbackEnabled]);
 
   // Calculate Score
   let score = 0;
@@ -121,7 +127,7 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
   // Rendered via a plain function call ({renderFeedbackBox()}), NOT as <FeedbackBox />: as an inline
   // component it remounted on every state change, so the comment box lost focus after each
   // character typed.
-  const renderFeedbackBox = () => (
+  const renderFeedbackBox = () => !feedbackEnabled ? null : (
     <div ref={feedbackRef} className="p-6 border-t-2 border-blue-100 bg-blue-50/40">
       <div className="flex flex-col gap-4">
         <div className="flex items-center gap-3">
@@ -173,6 +179,26 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
     </div>
   );
 
+  // Replaces the old "Return to Home" button: the candidate's journey ends here. Sending them to the
+  // token-entry page after an exam only confused them.
+  const renderCompletionFooter = () => (
+    <div className="bg-slate-50 p-6 border-t border-slate-200 flex flex-col gap-2 sm:flex-row sm:justify-between sm:items-center">
+      <div role="status" className={`flex items-center gap-2 text-sm font-medium ${completed ? 'text-teal-700' : submitting ? 'text-slate-600' : 'text-amber-700'}`}>
+        {completed ? <CheckCircle2 size={18} className="text-teal-500 shrink-0" />
+          : submitting ? <Loader2 size={18} className="animate-spin shrink-0" />
+          : <AlertTriangle size={18} className="text-amber-500 shrink-0" />}
+        <span>
+          {completed ? 'Your exam is completed. You can now close this window.'
+            : submitting ? 'Submitting your answers… please keep this window open.'
+            : 'Please keep this window open until your submission is confirmed.'}
+        </span>
+      </div>
+      {/* Was a Math.random() string that changed on every re-render and matched nothing on
+          record — useless (and misleading) if a candidate quoted it to support. */}
+      {sessionId ? <div className="text-sm text-slate-500 font-mono">Session ID: {sessionId}</div> : null}
+    </div>
+  );
+
   const renderSyncWarningBanner = () => {
     if (submissionSynced) return null;
     return (
@@ -205,25 +231,22 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
         <div className="max-w-2xl mx-auto">
           {renderSyncWarningBanner()}
           <div className="lsc-panel overflow-hidden">
-            <div className="p-8 text-center bg-[radial-gradient(700px_circle_at_50%_0%,rgba(53,88,255,0.18),transparent_70%),linear-gradient(180deg,#f9fbff,#eef3fb)] text-slate-900 border-b border-slate-200">
-              <h1 className="text-3xl font-bold mb-2">Thank you</h1>
-              <p className="text-slate-500">{exam.title} - {student.fullName}</p>
+            <div className="p-8 text-center bg-[radial-gradient(700px_circle_at_50%_0%,rgba(20,184,166,0.16),transparent_70%),linear-gradient(180deg,#f4fbfa,#eef6f4)] text-slate-900 border-b border-slate-200">
+              <div className={`mx-auto mb-4 h-14 w-14 rounded-full flex items-center justify-center ${completed ? 'bg-teal-100 text-teal-600' : 'bg-slate-100 text-slate-500'}`}>
+                {completed ? <CheckCircle2 size={30} /> : <Loader2 size={28} className={submitting ? 'animate-spin' : ''} />}
+              </div>
+              <h1 className="text-3xl font-bold mb-2">{completed ? 'Your exam is completed' : 'Submitting your exam'}</h1>
+              <p className="text-slate-500">{exam.title} · {student.fullName}</p>
             </div>
             <div className="p-8 text-center">
               <p className="text-slate-700">
-                Your submission has been recorded. Results will be shared after evaluation.
+                {completed
+                  ? 'Your answers have been submitted. Results will be shared after evaluation.'
+                  : 'Your answers are saved. Please wait while we confirm your submission.'}
               </p>
             </div>
             {renderFeedbackBox()}
-            <div className="bg-slate-50 p-6 border-t border-slate-200 flex justify-center">
-              <button
-                type="button"
-                onClick={onExit}
-                className="px-6 py-2 lsc-button-primary flex items-center gap-2"
-              >
-                <Home size={18} /> Return to Home
-              </button>
-            </div>
+            {renderCompletionFooter()}
           </div>
         </div>
       </div>
@@ -248,6 +271,11 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
               : verdictPending
                 ? 'bg-[radial-gradient(800px_circle_at_50%_-15%,rgba(37,99,235,0.14),transparent_70%),linear-gradient(180deg,#f7faff,#eef3fb)]'
                 : 'bg-[radial-gradient(800px_circle_at_50%_-15%,rgba(244,63,94,0.15),transparent_70%),linear-gradient(180deg,#fff7f7,#fdeef0)]'}`}>
+            {completed && (
+              <p className="mb-3 flex items-center justify-center gap-1.5 text-sm font-semibold text-slate-700">
+                <CheckCircle2 size={16} className="text-teal-500" /> Your exam is completed
+              </p>
+            )}
             <div className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold tracking-wide ${passed ? 'bg-teal-100 text-teal-700' : verdictPending ? 'bg-blue-100 text-blue-700' : 'bg-rose-100 text-rose-700'}`}>
               {passed ? <CheckCircle size={13} /> : verdictPending ? <Clock size={13} /> : <XCircle size={13} />}
               {passed ? 'PASSED' : verdictPending ? 'PENDING EVALUATION' : 'FAILED'}
@@ -446,20 +474,7 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
 
           {/* Footer */}
           {renderFeedbackBox()}
-          <div className="bg-slate-50 p-6 border-t border-slate-200 flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center">
-             {/* Was a Math.random() string that changed on every re-render and matched nothing on
-                 record — useless (and misleading) if a candidate quoted it to support. */}
-             <div className="text-sm text-slate-500 font-mono">
-               {sessionId ? `Session ID: ${sessionId}` : ''}
-             </div>
-             <button
-               type="button"
-               onClick={onExit}
-               className="px-6 py-2 lsc-button-primary flex items-center gap-2"
-             >
-               <Home size={18} /> Return to Home
-             </button>
-          </div>
+          {renderCompletionFooter()}
         </div>
       </div>
     </div>

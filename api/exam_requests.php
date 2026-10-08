@@ -829,13 +829,14 @@ function er_existing_student_maps(PDO $pdo, int $companyId, array $students): ar
 /**
  * Validate (and canonicalise) a request for $companyId. Returns [details, errors, meta]; details has
  * the bank id/name, batch name and timezone resolved to their canonical forms. meta carries
- * bankId/bankSize/batchId/batchMembers for the approval step. $hints (intake only, see
+ * bankId/bankSize/batchId/batchMembers for the approval step, and newBatch when the batch name is
+ * not an existing batch (approval then creates it from the CSV students). $hints (intake only, see
  * er_details_from_email) lets a message quote what the employee wrote.
  */
 function er_validate(PDO $pdo, ?int $companyId, array $details, array $students, array $hints = []): array {
     $d = er_normalize_details($details);
     $errors = [];
-    $meta = ['bankId' => null, 'bankSize' => 0, 'batchId' => null, 'batchMembers' => 0];
+    $meta = ['bankId' => null, 'bankSize' => 0, 'batchId' => null, 'batchMembers' => 0, 'newBatch' => false];
     if ($companyId === null || $companyId <= 0) {
         return [$d, ['This request is not linked to a company.'], $meta];
     }
@@ -909,18 +910,22 @@ function er_validate(PDO $pdo, ?int $companyId, array $details, array $students,
     }
 
     if ($d['batchName'] !== null) {
+        // Matched case-insensitively, so "batch 7" never creates a near-duplicate of "Batch 7".
         $batch = er_find_batch($pdo, $companyId, $d['batchName']);
-        if (!$batch) {
-            $errors[] = "Batch \"{$d['batchName']}\" was not found in {$companyName}.";
-        } else {
+        if ($batch) {
             $d['batchName'] = (string)$batch['name'];
             $meta['batchId'] = (int)$batch['id'];
             $meta['batchMembers'] = (int)$batch['member_count'];
+        } elseif (count($students) > 0) {
+            // A name that isn't a batch yet: approval creates it with this request's CSV students.
+            $meta['newBatch'] = true;
+        } else {
+            $errors[] = "Batch \"{$d['batchName']}\" does not exist in {$companyName}. To create it, attach a students CSV (Full Name, Email, Registration ID) — those students become the new batch.";
         }
     }
 
     if (count($students) === 0 && $d['batchName'] === null) {
-        $errors[] = 'Students are required: name an existing Batch or attach a students CSV (Full Name, Email, Registration ID).';
+        $errors[] = 'Students are required: name a Batch or attach a students CSV (Full Name, Email, Registration ID).';
     } elseif (count($students) === 0 && $meta['batchId'] !== null && $meta['batchMembers'] === 0) {
         $errors[] = "Batch \"{$d['batchName']}\" has no students.";
     }
@@ -1067,10 +1072,14 @@ function er_format_when(?int $ms, string $tz): string {
 }
 
 /** Plain-text summary rows of a request's particulars, for the requester emails. */
-function er_details_rows(array $d, int $csvCount): array {
+function er_details_rows(array $d, int $csvCount, bool $newBatch = false): array {
     $students = [];
-    if ($d['batchName'] !== null) $students[] = 'Batch ' . $d['batchName'];
-    if ($csvCount > 0) $students[] = $csvCount . ' from CSV';
+    if ($d['batchName'] !== null && $newBatch) {
+        $students[] = 'New batch ' . $d['batchName'] . ' (created on approval with the ' . $csvCount . ' student' . ($csvCount === 1 ? '' : 's') . ' from CSV)';
+    } else {
+        if ($d['batchName'] !== null) $students[] = 'Batch ' . $d['batchName'];
+        if ($csvCount > 0) $students[] = $csvCount . ' from CSV';
+    }
     return [
         'Exam title' => $d['title'] !== '' ? $d['title'] : '—',
         'Question bank' => $d['questionBankName'] !== '' ? $d['questionBankName'] : '—',
@@ -1197,7 +1206,7 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
             if (!isset($companyNames[$studentCompany])) {
                 $companyNames[$studentCompany] = er_company_name($pdo, $studentCompany);
             }
-            // Short "/x/<code>" link (falls back to the long signed ?token= link if a code can't be made).
+            // Short "<origin>?<code>" link (falls back to the long signed ?token= link if a code can't be made).
             $link = exam_access_link($pdo, $origin, $examId, $studentId, $studentCompany);
             if ($mailExam !== null) {
                 // Same per-exam invitation (incl. any template the admin customised) as console sends.
@@ -1290,7 +1299,7 @@ function er_notify_approved(PDO $pdo, array $env, array $request, string $examId
     $details = er_normalize_details(json_decode((string)$request['details_json'], true) ?: []);
     $assigned = db_scalar_int($pdo, 'SELECT COUNT(*) FROM exam_assignments WHERE exam_id = ?', [$examId]);
     $invited = db_scalar_int($pdo, 'SELECT COUNT(*) FROM exam_invitations WHERE exam_id = ?', [$examId]);
-    $rows = er_details_rows($details, count(er_decode_json_list($request['students_json'] ?? null)));
+    $rows = er_details_rows($details, count(er_decode_json_list($request['students_json'] ?? null)), er_batch_created_by_request($pdo, $request, $details));
     $rows['Students assigned'] = (string)$assigned;
     $rows['Invitations sent'] = $invited . ' of ' . $assigned;
     $inner = '<p style="margin:0 0 12px;">Your exam request <strong>#' . (int)$request['id'] . '</strong> has been approved and the exam is scheduled. '
@@ -1341,12 +1350,32 @@ function er_upsert_student(PDO $pdo, int $companyId, array $s): array {
     return [$id, true];
 }
 
+/** batches.description of a batch an approval created, so it can be traced back to its request. */
+function er_new_batch_description(int $requestId): string {
+    return 'Created by exam request #' . $requestId;
+}
+
+/** True when the request's batch is one its own approval created (the CSV students ARE the batch). */
+function er_batch_created_by_request(PDO $pdo, array $request, array $d): bool {
+    if ($d['batchName'] === null || $request['company_id'] === null) return false;
+    $batch = er_find_batch($pdo, (int)$request['company_id'], $d['batchName']);
+    if (!$batch) return false;
+    $stmt = $pdo->prepare('SELECT description FROM batches WHERE id = ? LIMIT 1');
+    $stmt->execute([(int)$batch['id']]);
+    $description = $stmt->fetchColumn();
+    $stmt->closeCursor();
+    return $description === er_new_batch_description((int)$request['id']);
+}
+
 /**
  * Create the exam + links + enrolments for a validated request. Must run inside the caller's
  * transaction. Written with the same columns exams.php's save uses; question rows are NOT copied —
- * the bank's questions are linked through exam_questions in bank order.
+ * the bank's questions are linked through exam_questions in bank order. When the request names a
+ * batch that doesn't exist yet ($meta['newBatch']), the batch is created here and the request's CSV
+ * students become its members; an existing batch is only read (its members are enrolled), never
+ * changed.
  */
-function er_create_exam(PDO $pdo, int $companyId, array $d, array $meta, array $students): array {
+function er_create_exam(PDO $pdo, int $companyId, array $d, array $meta, array $students, int $requestId): array {
     $examId = bin2hex(random_bytes(8));
     $proctored = $d['proctoringMode'] === 'PROCTORED';
     $totalMarks = db_scalar_int($pdo, 'SELECT COALESCE(SUM(q.marks), 0) FROM question_bank_items i JOIN questions q ON q.id = i.question_id WHERE i.bank_id = ?', [$meta['bankId']]);
@@ -1407,6 +1436,20 @@ function er_create_exam(PDO $pdo, int $companyId, array $d, array $meta, array $
     $linked = $link->rowCount();
     $link->closeCursor();
 
+    $newBatchId = null;
+    if (!empty($meta['newBatch']) && $d['batchName'] !== null) {
+        // Validation ran a moment ago in this same transaction; if someone created the batch in
+        // between, stop rather than silently adding these students to it.
+        if (er_find_batch($pdo, $companyId, $d['batchName'])) {
+            throw new RuntimeException("Batch \"{$d['batchName']}\" was created by someone else just now — review the request and approve it again.");
+        }
+        $batchInsert = $pdo->prepare('INSERT INTO batches (company_id, name, description) VALUES (?, ?, ?)');
+        $batchInsert->execute([$companyId, $d['batchName'], er_new_batch_description($requestId)]);
+        $batchInsert->closeCursor();
+        $newBatchId = (int)$pdo->lastInsertId();
+        $meta['batchId'] = $newBatchId;
+    }
+
     $assign = $pdo->prepare('INSERT IGNORE INTO exam_assignments (exam_id, student_id) VALUES (?, ?)');
     $created = 0;
     $updated = 0;
@@ -1414,6 +1457,9 @@ function er_create_exam(PDO $pdo, int $companyId, array $d, array $meta, array $
         [$studentId, $isNew] = er_upsert_student($pdo, $companyId, $s);
         $isNew ? $created++ : $updated++;
         $assign->execute([$examId, $studentId]);
+        if ($newBatchId !== null) {
+            add_student_batch($pdo, $studentId, $newBatchId);
+        }
     }
     $assign->closeCursor();
 
@@ -1428,7 +1474,8 @@ function er_create_exam(PDO $pdo, int $companyId, array $d, array $meta, array $
     }
     $assigned = db_scalar_int($pdo, 'SELECT COUNT(*) FROM exam_assignments WHERE exam_id = ?', [$examId]);
 
-    return ['examId' => $examId, 'linkedQuestions' => $linked, 'studentsCreated' => $created, 'studentsUpdated' => $updated, 'assigned' => $assigned];
+    return ['examId' => $examId, 'linkedQuestions' => $linked, 'studentsCreated' => $created, 'studentsUpdated' => $updated, 'assigned' => $assigned,
+            'batchCreated' => $newBatchId !== null, 'batchId' => $meta['batchId']];
 }
 
 // =============================================================================================
@@ -1735,7 +1782,7 @@ if ($action === 'APPROVE') {
         }
         [$details, $errors, $meta] = er_validate($pdo, $companyId, $details, $students);
         if (count($errors) === 0) {
-            $created = er_create_exam($pdo, $companyId, $details, $meta, $students);
+            $created = er_create_exam($pdo, $companyId, $details, $meta, $students, $requestId);
             $stmt = $pdo->prepare("UPDATE exam_requests
                                       SET status = 'APPROVED', created_exam_id = ?, reviewed_by = ?, reviewed_at = NOW(),
                                           details_json = ?, students_json = ?, errors_json = ?
@@ -1766,7 +1813,8 @@ if ($action === 'APPROVE') {
     audit_log($pdo, [
         'companyId' => $companyId, 'actorRole' => $actorRole, 'actorId' => $actorId,
         'action' => 'EXAM_REQUEST_APPROVE', 'targetType' => 'exam_request', 'targetId' => (string)$requestId,
-        'message' => "Exam request #{$requestId} approved — exam \"{$details['title']}\" ({$examId}) created",
+        'message' => "Exam request #{$requestId} approved — exam \"{$details['title']}\" ({$examId}) created"
+            . ($created['batchCreated'] ? " with new batch \"{$details['batchName']}\" (" . count($students) . ' students)' : ''),
         'metadata' => array_merge($created, ['bankId' => $details['questionBankId'], 'batch' => $details['batchName'], 'sendInvites' => $sendInvites]),
     ]);
 

@@ -181,7 +181,7 @@ try {
 
     // ---- Authenticated: parse + validate; always PENDING ----
     [$details, $students, $parseErrors, $hints] = er_details_from_email($fields, $attachments);
-    [$details, $validationErrors] = er_validate($pdo, $companyId, $details, $students, $hints);
+    [$details, $validationErrors, $validationMeta] = er_validate($pdo, $companyId, $details, $students, $hints);
     $errors = array_values(array_unique(array_merge($parseErrors, $validationErrors)));
     $row['status'] = 'PENDING';
     $row['details_json'] = er_json($details);
@@ -203,7 +203,7 @@ try {
     $inner = '<p style="margin:0 0 12px;">Hello ' . er_h((string)$requester['name']) . ',</p>'
         . '<p style="margin:0 0 12px;">Your exam request <strong>#' . $id . '</strong> was received and is pending super-admin approval. '
         . 'You will get another email when it is approved or rejected.</p>'
-        . er_email_table(er_details_rows($details, count($students)));
+        . er_email_table(er_details_rows($details, count($students), !empty($validationMeta['newBatch'])));
     if ($errors) {
         $inner .= '<p style="margin:0 0 4px;font-weight:600;color:#b91c1c;">Problems found — the approver will need to correct these before the exam can be scheduled:</p>'
             . er_email_list($errors)

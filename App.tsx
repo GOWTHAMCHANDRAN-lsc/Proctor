@@ -885,20 +885,27 @@ const AdminApp: React.FC = () => (
   </SettingsProvider>
 );
 
-// Short exam links: "/x/<code>" (api/link.php swaps the code for the signed access token, and the
-// page then runs exactly the ?token= flow). The short URL stays in the address bar, so a reload
-// simply resolves the code again.
+// Short exam links: "<origin>?<code>" — and the earlier "<origin>/x/<code>" form, which links already
+// sent still use (api/link.php swaps the code for the signed access token, and the page then runs
+// exactly the ?token= flow). The short URL stays in the address bar, so a reload simply resolves the
+// code again.
 const SHORT_LINK_PATH = /^\/x\/([A-Za-z0-9]{6,16})\/?$/;
+const SHORT_LINK_CODE = /^[A-Za-z0-9]{6,16}$/;
 const getShortLinkCode = (): string | null => {
   if (typeof window === 'undefined') return null;
   const match = window.location.pathname.match(SHORT_LINK_PATH);
-  return match ? match[1] : null;
+  if (match) return match[1];
+  if (window.location.pathname !== '/' && window.location.pathname !== '') return null;
+  // "?<code>": the code is the first query item and has no "=" (apps that open links sometimes
+  // append their own tracking parameters after it, e.g. "&fbclid=...").
+  const first = window.location.search.replace(/^\?/, '').split('&')[0] || '';
+  return SHORT_LINK_CODE.test(first) ? first : null;
 };
 const SHORT_LINK_INVALID_MESSAGE = 'This exam link is invalid or has expired. Please use the link from your latest invitation email.';
 const STUDENT_SERVER_UNREACHABLE_MESSAGE = "We couldn't reach the exam server to load your exam. Check your internet connection and reload this page.";
 
 const StudentApp: React.FC = () => {
-  // Captured once at load: a "/x/<code>" URL whose code still has to be resolved to a token.
+  // Captured once at load: a "?<code>" / "/x/<code>" URL whose code still has to be resolved to a token.
   const [shortLinkCode] = useState<string | null>(() => {
     try {
       // An explicit ?token= on the URL always wins (old links keep working unchanged).
@@ -939,6 +946,9 @@ const StudentApp: React.FC = () => {
   // stays false the session never actually flips to COMPLETED server-side — surface that instead
   // of silently losing the submission (see Nandhakumar S incident, 2026-07-28).
   const [submissionSynced, setSubmissionSynced] = useState(true);
+  // The first 'complete' call (with its retries) is still in flight — the results screen holds back
+  // "Your exam is completed / you can close this window" until the server has confirmed it.
+  const [submittingSession, setSubmittingSession] = useState(false);
   const [resubmittingSession, setResubmittingSession] = useState(false);
   const pendingCompletePayloadRef = useRef<Record<string, unknown> | null>(null);
 
@@ -1054,7 +1064,7 @@ const StudentApp: React.FC = () => {
       return;
     }
     if (shortLinkCode) {
-      // Resolve "/x/<code>" to the signed token, then run the normal ?token= flow with it.
+      // Resolve the short code to the signed token, then run the normal ?token= flow with it.
       setIsDirectLinkMode(true);
       let cancelled = false;
       (async () => {
@@ -1273,7 +1283,10 @@ const StudentApp: React.FC = () => {
         setAccessRequestComment('');
         setTokenError(parsed?.message || 'This exam is bound to another device. Request access to continue.');
       } else if (msg.includes('SESSION_EXISTS')) {
-        setTokenError('This exam session is already started or completed. Please contact admin to renew your link.');
+        // Reopening the link after submitting (e.g. a page reload on the completion screen).
+        setTokenError(/already completed/i.test(String(parsed?.message || ''))
+          ? 'Your exam is completed. Your answers have already been submitted — you can close this window.'
+          : 'This exam session is already started or completed. Please contact admin to renew your link.');
       } else if (msg.includes('RECONNECT_LIMIT')) {
         setTokenError('No more reconnection is possible. Please contact administrator.');
       } else if (errCode === 'MAC_ADDRESS_MISMATCH' || msg.includes('MAC_ADDRESS_MISMATCH')) {
@@ -1392,7 +1405,8 @@ const StudentApp: React.FC = () => {
           questionIds: data.questions.map(q => q.id),
           questionTimes: data.questionTimes || {}
         };
-        const synced = await postSessionCompleteWithRetry(completePayload);
+        setSubmittingSession(true);
+        const synced = await postSessionCompleteWithRetry(completePayload).finally(() => setSubmittingSession(false));
         if (!synced) {
           // Keep the payload around so the student (or the "Retry" button on the results screen)
           // can resend it without re-answering — the server never got the completion, so the
@@ -1437,22 +1451,6 @@ const StudentApp: React.FC = () => {
     } finally {
       setResubmittingSession(false);
     }
-  };
-
-  const handleExitStudent = () => {
-    setActiveExam(null);
-    setCurrentStudent(null);
-    setExamResults(null);
-    setSessionId(null);
-    storeStudentExamToken(null);
-    storeStudentCompanyId(null);
-    // "Return to Home" lands on the token entry screen. Candidates who arrived via an emailed link
-    // used to get an empty "Secure Link Access" card with no content and no way forward.
-    setIsDirectLinkMode(false);
-    setPreStartContext(null);
-    setAccessRequestContext(null);
-    setTokenError('');
-    setTokenInput('');
   };
 
   const renderAccessRequestAction = () => {
@@ -1514,7 +1512,7 @@ const StudentApp: React.FC = () => {
            violations={examResults.violations}
            questions={examResults.questions}
            sessionId={sessionId ?? undefined}
-           onExit={handleExitStudent}
+           submitting={submittingSession}
            submissionSynced={submissionSynced}
            resubmitting={resubmittingSession}
            onRetrySubmission={handleRetrySubmission}

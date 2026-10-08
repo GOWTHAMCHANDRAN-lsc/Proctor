@@ -127,6 +127,29 @@ function whatsapp_config(array $env): array {
         $issues[] = 'No message templates are set (WHATSAPP_TEMPLATE_INVITE / _REMINDER / _REQUEST_UPDATE).';
     }
 
+    // Optional "Visit website" button carrying the candidate's exam link. A button whose URL is fixed
+    // needs nothing here. A DYNAMIC one (URL ending in {{1}} in the Meta template) must be sent a
+    // value, or Meta rejects every message — so its URL is copied here exactly as in the template,
+    // e.g. WHATSAPP_TEMPLATE_INVITE_BUTTON_URL=https://proctor.lsc-crm.in?{{1}}, and each message
+    // fills {{1}} with the candidate's short-link code (see whatsapp_button_value()).
+    $buttons = [];
+    foreach (WHATSAPP_EXAM_KINDS as $kind) {
+        $url = $get('WHATSAPP_TEMPLATE_' . $kind . '_BUTTON_URL');
+        if ($url === '') {
+            continue;
+        }
+        if (preg_match('/^(https?:\/\/[^\s{}]+)\{\{\s*1\s*\}\}$/i', $url, $m) !== 1) {
+            $issues[] = "WHATSAPP_TEMPLATE_{$kind}_BUTTON_URL must be the button URL exactly as in the Meta template, ending in {{1}} (e.g. https://proctor.lsc-crm.in?{{1}}).";
+            continue;
+        }
+        $index = $get('WHATSAPP_TEMPLATE_' . $kind . '_BUTTON_INDEX');
+        if ($index !== '' && !ctype_digit($index)) {
+            $issues[] = "WHATSAPP_TEMPLATE_{$kind}_BUTTON_INDEX must be the button's position (0 = first button).";
+            continue;
+        }
+        $buttons[$kind] = ['prefix' => $m[1], 'index' => $index === '' ? 0 : min(9, (int)$index)];
+    }
+
     return [
         'enabled' => $enabled,
         'provider' => $provider,
@@ -136,6 +159,7 @@ function whatsapp_config(array $env): array {
         'countryCode' => $countryCode,
         'language' => $language,
         'templates' => $templates,
+        'buttons' => $buttons,
         '_transport' => $transport,
     ];
 }
@@ -222,10 +246,25 @@ function whatsapp_http_post_json(string $url, array $headers, array $body): arra
     return ['status' => $status, 'body' => is_array($decoded) ? $decoded : null, 'error' => null];
 }
 
-/** Meta WhatsApp Cloud API: send one approved template message. */
-function whatsapp_send_meta(array $cfg, string $to, string $template, array $params): array {
+/**
+ * Meta WhatsApp Cloud API: send one approved template message. $button = ['index' => int, 'text' =>
+ * the value for the dynamic URL button's {{1}}], or null when the template has no dynamic button.
+ */
+function whatsapp_send_meta(array $cfg, string $to, string $template, array $params, ?array $button = null): array {
     $t = $cfg['_transport']['meta'];
     $url = rtrim((string)$t['baseUrl'], '/') . '/' . rawurlencode((string)$t['version']) . '/' . rawurlencode((string)$t['phoneNumberId']) . '/messages';
+    $components = [[
+        'type' => 'body',
+        'parameters' => array_map(static fn(string $p) => ['type' => 'text', 'text' => $p], $params),
+    ]];
+    if ($button !== null) {
+        $components[] = [
+            'type' => 'button',
+            'sub_type' => 'url',
+            'index' => (string)(int)$button['index'],
+            'parameters' => [['type' => 'text', 'text' => (string)$button['text']]],
+        ];
+    }
     $body = [
         'messaging_product' => 'whatsapp',
         'to' => $to,
@@ -233,10 +272,7 @@ function whatsapp_send_meta(array $cfg, string $to, string $template, array $par
         'template' => [
             'name' => $template,
             'language' => ['code' => $cfg['language']],
-            'components' => [[
-                'type' => 'body',
-                'parameters' => array_map(static fn(string $p) => ['type' => 'text', 'text' => $p], $params),
-            ]],
+            'components' => $components,
         ],
     ];
     $res = whatsapp_http_post_json($url, ['Authorization: Bearer ' . $t['accessToken']], $body);
@@ -343,6 +379,33 @@ function whatsapp_log_delivery(PDO $pdo, int $companyId, string $recipient, ?str
     }
 }
 
+/**
+ * The value for a dynamic link button's {{1}}: what follows the template button's fixed URL part
+ * ($prefix) in the candidate's link. A short link can be written as "<origin>?<code>",
+ * "<origin>/?<code>" or "<origin>/x/<code>" (the student page opens all three), so whichever of those
+ * the template uses, the button gets just the code. '' when the link can't fit the button.
+ */
+function whatsapp_button_value(string $prefix, string $link): string {
+    $link = trim($link);
+    $forms = [$link];
+    if (preg_match('#^(https?://[^/?\#]+)(?:/x/|/?\?)([A-Za-z0-9]{6,16})$#i', $link, $m) === 1) {
+        $forms = [$m[1] . '?' . $m[2], $m[1] . '/?' . $m[2], $m[1] . '/x/' . $m[2], $link];
+    }
+    $fallback = '';
+    foreach ($forms as $form) {
+        if (strlen($form) > strlen($prefix) && strncasecmp($form, $prefix, strlen($prefix)) === 0) {
+            $rest = substr($form, strlen($prefix));
+            if (isset($m[2]) && $rest === $m[2]) {
+                return $rest;
+            }
+            if ($fallback === '') {
+                $fallback = $rest;
+            }
+        }
+    }
+    return $fallback;
+}
+
 /** A short human-readable rendering of the message for the delivery log. */
 function whatsapp_preview(string $kind, array $params): string {
     $labels = [
@@ -362,8 +425,10 @@ function whatsapp_preview(string $kind, array $params): string {
  * Send one approved template message. Returns {ok, status: SENT|FAILED|SKIPPED, error?, messageId?}.
  * SENT and FAILED write a delivery_logs row; SKIPPED (WhatsApp off / not ready / no template for this
  * kind) returns immediately WITHOUT logging, so the log doesn't fill up while the feature is disabled.
+ * $buttonLink is the full URL the template's dynamic link button should open (exam notices only);
+ * it is used only when WHATSAPP_TEMPLATE_<KIND>_BUTTON_URL is configured.
  */
-function whatsapp_send_template(PDO $pdo, array $env, int $companyId, string $kind, string $mobile, array $params, array $meta = []): array {
+function whatsapp_send_template(PDO $pdo, array $env, int $companyId, string $kind, string $mobile, array $params, array $meta = [], ?string $buttonLink = null): array {
     static $consecutiveTransportFailures = 0;
 
     $kind = strtoupper(trim($kind));
@@ -398,6 +463,24 @@ function whatsapp_send_template(PDO $pdo, array $env, int $companyId, string $ki
         return ['ok' => false, 'status' => 'FAILED', 'error' => $error];
     }
 
+    // Dynamic link button: {{1}} = whatever follows the template's fixed URL part.
+    $button = null;
+    $buttonCfg = $cfg['provider'] === 'meta' ? ($cfg['buttons'][$kind] ?? null) : null;
+    if ($buttonCfg !== null) {
+        $prefix = (string)$buttonCfg['prefix'];
+        $link = trim((string)$buttonLink);
+        $suffix = $link !== '' ? whatsapp_button_value($prefix, $link) : '';
+        if ($suffix === '') {
+            $error = $link === ''
+                ? 'This message has no link for the template\'s link button.'
+                : "The exam link doesn't start with the template button's fixed URL ({$prefix}) — check WHATSAPP_TEMPLATE_{$kind}_BUTTON_URL.";
+            whatsapp_log_delivery($pdo, $companyId, '+' . $to, $template, $preview, 'FAILED', $error, $logMeta);
+            return ['ok' => false, 'status' => 'FAILED', 'error' => $error];
+        }
+        $button = ['index' => (int)$buttonCfg['index'], 'text' => $suffix];
+        $logMeta['button'] = $suffix;
+    }
+
     if ($consecutiveTransportFailures >= WHATSAPP_BREAKER_LIMIT) {
         $error = 'Not sent: the WhatsApp provider failed to respond ' . WHATSAPP_BREAKER_LIMIT . ' times in a row during this run. Try again later.';
         whatsapp_log_delivery($pdo, $companyId, '+' . $to, $template, $preview, 'FAILED', $error, $logMeta);
@@ -406,7 +489,7 @@ function whatsapp_send_template(PDO $pdo, array $env, int $companyId, string $ki
 
     try {
         $res = $cfg['provider'] === 'meta'
-            ? whatsapp_send_meta($cfg, $to, $template, $clean)
+            ? whatsapp_send_meta($cfg, $to, $template, $clean, $button)
             : whatsapp_send_lsc($cfg, $to, $template, $clean);
     } catch (Throwable $e) {
         $res = ['ok' => false, 'messageId' => null, 'httpStatus' => 0, 'transportFailure' => true, 'error' => 'WhatsApp send failed: ' . $e->getMessage()];
@@ -432,7 +515,7 @@ function whatsapp_send_template(PDO $pdo, array $env, int $companyId, string $ki
 
 /**
  * The candidate's personal exam link — exactly what the email invitations carry: the short
- * "<origin>/x/<code>" link for (exam, student, student's company) from exam_access_link() (get-or-
+ * "<origin>?<code>" link for (exam, student, student's company) from exam_access_link() (get-or-
  * create, so the WhatsApp message and the email share one code), falling back to the long signed
  * "?token=" link if a short code can't be made.
  */
@@ -616,7 +699,7 @@ function whatsapp_send_exam_notice(PDO $pdo, array $env, int $companyId, array $
     return whatsapp_send_template($pdo, $env, $companyId, $kind, $mobile, $params, [
         'examId' => (string)$exam['id'],
         'studentId' => $studentId,
-    ]);
+    ], $link);
 }
 
 /**
@@ -890,7 +973,10 @@ if ($action === 'TEST') {
         'REQUEST_UPDATE' => ['Test Employee', '#0', $sampleTitle, 'test message from ProctorGuard Settings'],
     ][$kind];
 
-    $res = whatsapp_send_template($pdo, $env, $companyId, $kind, $to, $params, ['test' => true]);
+    // A configured link button gets a placeholder code (the test has no real exam, so the link opens
+    // the "invalid link" notice).
+    $testButtonLink = isset($cfg['buttons'][$kind]) ? $cfg['buttons'][$kind]['prefix'] . 'TESTLINK00' : null;
+    $res = whatsapp_send_template($pdo, $env, $companyId, $kind, $to, $params, ['test' => true], $testButtonLink);
     audit_log($pdo, [
         'companyId' => $companyId,
         'actorRole' => $actorRole,

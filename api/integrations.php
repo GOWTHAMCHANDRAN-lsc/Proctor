@@ -281,7 +281,7 @@ function send_exam_invitation_locked(PDO $pdo, array $env, int $companyId, array
     $companyName = (string)($companyStmt->fetchColumn() ?: 'ProctorGuard');
     $companyStmt->closeCursor();
 
-    // Short "/x/<code>" link (falls back to the long signed ?token= link if a code can't be made).
+    // Short "<origin>?<code>" link (falls back to the long signed ?token= link if a code can't be made).
     $origin = rtrim((string)pg_env('APP_ORIGIN', 'https://proctor.lsc-crm.in'), '/');
     $link = exam_access_link($pdo, $origin, (string)$exam['id'], $studentId, $companyId);
 

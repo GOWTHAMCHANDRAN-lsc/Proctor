@@ -109,6 +109,17 @@ if ($method === 'POST') {
         json_response(['error' => 'examId and studentId are required.'], 400);
     }
 
+    // The exam's "Collect feedback" switch (exams.feedback_enabled, added by exams.php; absent = on).
+    if (db_column_exists($pdo, 'exams', 'feedback_enabled')) {
+        $enabledStmt = $pdo->prepare('SELECT feedback_enabled FROM exams WHERE id = ? AND company_id = ? LIMIT 1');
+        $enabledStmt->execute([$examId, $companyId]);
+        $feedbackEnabled = $enabledStmt->fetchColumn();
+        $enabledStmt->closeCursor();
+        if ($feedbackEnabled !== false && (int)$feedbackEnabled === 0) {
+            json_response(['error' => 'FEEDBACK_DISABLED', 'message' => 'Feedback is turned off for this exam.'], 403);
+        }
+    }
+
     // A client-supplied sessionId must belong to this company/exam/student. session_feedback has a
     // UNIQUE session_id + ON DUPLICATE KEY UPDATE, so an unchecked (sequential) id let any caller
     // overwrite the rating/comment stored for someone else's session, in any company.

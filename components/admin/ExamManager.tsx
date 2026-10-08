@@ -22,7 +22,7 @@ import { ExamEmailsEditor, EmailPreviewFrame } from './ExamEmailsEditor';
 type ExamRecipient = {
   id: string; fullName: string; email: string; registrationId: string; companyId: number;
   invitedAt?: number | null; token?: string;
-  // Short-link code: the student's link is `${origin}/x/${code}` (falls back to ?token= without one).
+  // Short-link code: the student's link is `${origin}?${code}` (falls back to ?token= without one).
   code?: string;
   attemptCount?: number;
   attemptStatus?: 'NOT_STARTED' | 'IN_PROGRESS' | 'COMPLETED' | 'TERMINATED';
@@ -55,12 +55,12 @@ const filterByAudience = (recipients: ExamRecipient[], audience: MailAudience): 
   }
 };
 
-// A student's personal exam link: the short `/x/<code>` form when the server allocated a code, else
+// A student's personal exam link: the short `<origin>?<code>` form when the server allocated a code, else
 // the long signed `?token=` link (both open the same exam; codes and tokens are minted server-side).
 const examLinkFor = (r: Pick<ExamRecipient, 'code' | 'token'>): string =>
-  r.code ? `${window.location.origin}/x/${r.code}` : `${window.location.origin}?token=${r.token}`;
+  r.code ? `${window.location.origin}?${r.code}` : `${window.location.origin}?token=${r.token}`;
 // Placeholder link for previews and sample emails (never a real code).
-const sampleExamLink = () => `${window.location.origin}/x/SAMPLE12345`;
+const sampleExamLink = () => `${window.location.origin}?SAMPLE1234`;
 
 // The invitation/reminder email (defaults, per-exam template resolution and the HTML builder) lives in
 // services/examEmail.ts, shared with the editor's Emails section and mirrored by
@@ -236,6 +236,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       shuffleQuestions: true,
       showResults: d.showResults,
       certificateEnabled: false,
+      feedbackEnabled: true,
       reconnectLimit: d.reconnectLimit,
       passPercent: d.passPercent,
       proctoringConfig: {
@@ -1264,6 +1265,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
           : ['desktop', 'tablet', 'mobile'],
         showResults: exam.showResults ?? false,
         certificateEnabled: exam.certificateEnabled ?? false,
+        feedbackEnabled: exam.feedbackEnabled ?? true,
         reconnectLimit: exam.reconnectLimit ?? 0,
         passPercent: exam.passPercent ?? 60,
         proctoringConfig: {
@@ -2523,7 +2525,28 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                       <span>Show results immediately after submission</span>
                   </label>
                   <p className="text-[10px] text-slate-500 mt-1 leading-tight">
-                    If disabled, students see a thank-you message only.
+                    If disabled, students see an "exam completed" message only.
+                  </p>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-2">Candidate Feedback</label>
+                <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                  <label className="flex items-center gap-2 text-sm text-slate-700 cursor-pointer">
+                      <div className={`w-9 h-5 rounded-full relative transition-colors ${newExam.feedbackEnabled !== false ? 'bg-[var(--lsc-primary)]' : 'bg-slate-300'}`}>
+                        <input
+                          type="checkbox"
+                          className="sr-only"
+                          checked={newExam.feedbackEnabled !== false}
+                          onChange={e => setNewExam({...newExam, feedbackEnabled: e.target.checked})}
+                        />
+                        <div className={`absolute top-1 left-1 bg-white w-3 h-3 rounded-full transition-transform ${newExam.feedbackEnabled !== false ? 'translate-x-4' : 'translate-x-0'}`}></div>
+                      </div>
+                      <span>Ask for feedback after the exam</span>
+                  </label>
+                  <p className="text-[10px] text-slate-500 mt-1 leading-tight">
+                    Shows the star ratings and comments form on the completion screen. Turn off to show only the completion message.
                   </p>
                 </div>
               </div>

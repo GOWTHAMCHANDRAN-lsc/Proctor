@@ -136,6 +136,8 @@ export interface Exam {
   // Certificate issuance is on-demand only (never automatic on pass) and only reachable at all
   // when this is enabled for the exam. Set once at exam creation/edit.
   certificateEnabled?: boolean;
+  // Ask candidates for star ratings + comments on the completion screen (default true).
+  feedbackEnabled?: boolean;
   attemptPolicy?: 'LAST'; // Multi-attempt scoring policy disabled; always last attempt
   reconnectLimit?: number; // Allowed reconnection attempts for active sessions
   passPercent?: number; // Percentage required to pass the exam
@@ -227,7 +229,10 @@ export interface ExamRequestDetails {
   microphoneRequired: boolean;
   showAlerts: boolean;
   autoTerminate: boolean;
-  /** Existing batch to invite, when the email named one instead of attaching a student CSV. */
+  /**
+   * Batch named in the email. An existing batch's members are invited; a name that isn't a batch yet
+   * is created on approval with the request's CSV students as its members.
+   */
   batchName: string | null;
   notes: string;
 }

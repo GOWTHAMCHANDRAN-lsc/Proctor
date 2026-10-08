@@ -221,6 +221,94 @@ function serialize_question_row(array $q): array {
     ];
 }
 
+const EXAM_PROCTORING_MODES = ['PROCTORED', 'UNPROCTORED'];
+
+/**
+ * True once exams.proctoring_mode / show_violation_alerts / auto_terminate exist. Deliberately NOT
+ * db_column_exists(): that caches a "missing" answer, so on the very request whose
+ * ensure_exam_proctoring_mode_columns() call added the columns it would still say false and the save
+ * would silently drop the switches.
+ */
+function exam_proctoring_mode_ready(PDO $pdo): bool {
+    static $ready = null;
+    if ($ready !== null) {
+        return $ready;
+    }
+    try {
+        $stmt = $pdo->query("SHOW COLUMNS FROM exams LIKE 'auto_terminate'");
+        $ready = (bool)$stmt->fetch();
+        $stmt->closeCursor();
+    } catch (Throwable $e) {
+        $ready = false;
+    }
+    return $ready;
+}
+
+/** Normalise a stored/posted proctoring mode; anything unrecognised reads as the safe default. */
+function normalize_proctoring_mode($raw): string {
+    $mode = strtoupper(trim((string)($raw ?? '')));
+    return in_array($mode, EXAM_PROCTORING_MODES, true) ? $mode : 'PROCTORED';
+}
+
+/** Lenient boolean for JSON flags (true/false, 1/0, "true"/"false"); null/unparseable → $fallback. */
+function exam_bool_flag($raw, bool $fallback): bool {
+    if ($raw === null) return $fallback;
+    if (is_bool($raw)) return $raw;
+    $parsed = filter_var($raw, FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+    return $parsed ?? $fallback;
+}
+
+function question_bank_tables_ready(PDO $pdo): bool {
+    static $ready = null;
+    if ($ready === null) {
+        $ready = db_table_exists($pdo, 'question_bank_items') && db_table_exists($pdo, 'question_banks');
+    }
+    return $ready;
+}
+
+/**
+ * Question Bank membership for a set of question ids, in ONE query:
+ * [questionId => ['bankId' => int, 'bankName' => string, 'companyId' => int]]. A question listed in
+ * more than one bank reports the oldest bank.
+ */
+function fetch_question_bank_links(PDO $pdo, array $questionIds): array {
+    $questionIds = array_values(array_unique(array_filter(array_map('strval', $questionIds), static fn($id) => $id !== '')));
+    if (count($questionIds) === 0 || !question_bank_tables_ready($pdo)) {
+        return [];
+    }
+    $ph = implode(',', array_fill(0, count($questionIds), '?'));
+    $stmt = $pdo->prepare("SELECT qbi.question_id, qb.id AS bank_id, qb.name AS bank_name, qb.company_id
+                           FROM question_bank_items qbi
+                           JOIN question_banks qb ON qb.id = qbi.bank_id
+                           WHERE qbi.question_id IN ($ph)
+                           ORDER BY qb.id ASC");
+    $stmt->execute($questionIds);
+    $links = [];
+    foreach ($stmt->fetchAll() as $r) {
+        $qid = (string)$r['question_id'];
+        if (isset($links[$qid])) continue;
+        $links[$qid] = [
+            'bankId' => (int)$r['bank_id'],
+            'bankName' => (string)$r['bank_name'],
+            'companyId' => (int)$r['company_id'],
+        ];
+    }
+    $stmt->closeCursor();
+    return $links;
+}
+
+/** Set (or clear) a serialized question's bankId/bankName from server-side bank membership. */
+function apply_question_bank_link(array $q, array $links): array {
+    $qid = (string)($q['id'] ?? '');
+    if ($qid !== '' && isset($links[$qid])) {
+        $q['bankId'] = $links[$qid]['bankId'];
+        $q['bankName'] = $links[$qid]['bankName'];
+    } else {
+        unset($q['bankId'], $q['bankName']);
+    }
+    return $q;
+}
+
 function fetch_exam_section_questions_direct(PDO $pdo, string $sectionId): array {
     $stmt = $pdo->prepare('SELECT
             q.id,
@@ -248,6 +336,8 @@ $method = $_SERVER['REQUEST_METHOD'];
 ensure_exam_batch_assignment_schema($pdo);
 ensure_exam_invitation_schema($pdo);
 ensure_exam_mail_template_schema($pdo);
+// Per-exam PROCTORED / UNPROCTORED mode plus the "show alerts" and "end on limit" switches.
+ensure_exam_proctoring_mode_columns($pdo);
 db_add_column_if_missing($pdo, 'exams', 'timezone', 'VARCHAR(64) NULL AFTER end_time');
 db_add_column_if_missing($pdo, 'exams', 'proctor_timing_json', 'JSON NULL AFTER violation_limits_json');
 // Certificate issuance is on-demand only (never automatic on pass) and gated per-exam by this
@@ -257,7 +347,11 @@ db_add_column_if_missing($pdo, 'exams', 'certificate_enabled', 'TINYINT(1) NOT N
 // existing question keeps, so adding this changes nothing until an admin sets a value.
 db_add_column_if_missing($pdo, 'questions', 'word_limit', 'INT NULL AFTER marks');
 
-function build_exam_response(array $row, PDO $pdo, int $companyId): array {
+/**
+ * @param bool $includeBankInfo Staff responses tag Question Bank questions with bankId/bankName (the
+ *   editor shows them read-only). The candidate's token response leaves them out.
+ */
+function build_exam_response(array $row, PDO $pdo, int $companyId, bool $includeBankInfo = true): array {
     $examId = $row['id'];
     $violationLimitsRaw = db_column_exists($pdo, 'exams', 'violation_limits_json')
         ? ($row['violation_limits_json'] ?? null)
@@ -268,17 +362,41 @@ function build_exam_response(array $row, PDO $pdo, int $companyId): array {
     $allowedDevicesRaw = db_column_exists($pdo, 'exams', 'allowed_device_types_json')
         ? ($row['allowed_device_types_json'] ?? null)
         : null;
+    // UNPROCTORED switches every check off. The save path already stores the monitoring columns as
+    // off/0 for such an exam; forcing them here too keeps rows written by any other path consistent.
+    $proctoringMode = normalize_proctoring_mode($row['proctoring_mode'] ?? 'PROCTORED');
+    $unproctored = $proctoringMode === 'UNPROCTORED';
     $questions = fetch_exam_questions_direct($pdo, $examId);
-    $mappedQuestions = array_map('serialize_question_row', $questions);
     $assignments = fetch_exam_assignments_direct($pdo, $examId);
     $assignedIds = array_map(fn($a) => $a['student_id'], $assignments);
     $assignedBatchIds = fetch_assigned_batch_ids($pdo, $examId);
-    $sections = [];
     $secRows = fetch_exam_sections_direct($pdo, $examId);
+    $secQuestionRows = [];
+    foreach ($secRows as $sec) {
+        $secQuestionRows[(string)$sec['id']] = fetch_exam_section_questions_direct($pdo, (string)$sec['id']);
+    }
+
+    // One Question Bank lookup for the whole exam (exam-level and section questions together).
+    $bankLinks = [];
+    if ($includeBankInfo) {
+        $allQuestionIds = array_map(static fn($q) => (string)$q['id'], $questions);
+        foreach ($secQuestionRows as $rows) {
+            foreach ($rows as $q) {
+                $allQuestionIds[] = (string)$q['id'];
+            }
+        }
+        $bankLinks = fetch_question_bank_links($pdo, $allQuestionIds);
+    }
+    $serialize = static function (array $q) use ($bankLinks): array {
+        $mapped = serialize_question_row($q);
+        return $bankLinks ? apply_question_bank_link($mapped, $bankLinks) : $mapped;
+    };
+
+    $mappedQuestions = array_map($serialize, $questions);
+    $sections = [];
     foreach ($secRows as $sec) {
         $secId = $sec['id'];
-        $secQuestions = fetch_exam_section_questions_direct($pdo, $secId);
-        $mappedSecQuestions = array_map('serialize_question_row', $secQuestions);
+        $mappedSecQuestions = array_map($serialize, $secQuestionRows[(string)$secId] ?? []);
         $sections[] = [
             'id' => $secId,
             'title' => $sec['title'],
@@ -310,11 +428,14 @@ function build_exam_response(array $row, PDO $pdo, int $companyId): array {
         'status' => $row['status'],
         'allowedDeviceTypes' => normalize_allowed_devices($allowedDevicesRaw),
         'proctoringConfig' => [
-            'cameraRequired' => (bool)$row['camera_required'],
-            'microphoneRequired' => (bool)$row['microphone_required'],
-            'fullScreenEnforced' => (bool)$row['fullscreen_enforced'],
-            'tabSwitchLimit' => (int)$row['tab_switch_limit'],
-            'violationLimits' => normalize_violation_limits($violationLimitsRaw),
+            'mode' => $proctoringMode,
+            'showAlerts' => (bool)($row['show_violation_alerts'] ?? 1),
+            'autoTerminate' => (bool)($row['auto_terminate'] ?? 1),
+            'cameraRequired' => !$unproctored && (bool)$row['camera_required'],
+            'microphoneRequired' => !$unproctored && (bool)$row['microphone_required'],
+            'fullScreenEnforced' => !$unproctored && (bool)$row['fullscreen_enforced'],
+            'tabSwitchLimit' => $unproctored ? 0 : (int)$row['tab_switch_limit'],
+            'violationLimits' => normalize_violation_limits($unproctored ? null : $violationLimitsRaw),
             'proctorTiming' => normalize_proctor_timing($proctorTimingRaw),
         ],
         'assignedStudentIds' => $assignedIds,
@@ -346,7 +467,7 @@ if ($method === 'GET') {
         if (!$row) {
             json_response(['error' => 'Exam not found.'], 404);
         }
-        $studentExam = build_exam_response($row, $pdo, $tokenCompanyId);
+        $studentExam = build_exam_response($row, $pdo, $tokenCompanyId, false);
         // The candidate's page never uses the roster, and handing every candidate the student ids of
         // everyone else assigned to the exam let them address classmates' attempts directly through
         // the (unauthenticated) session/violation endpoints, which are keyed on examId + studentId.
@@ -763,11 +884,39 @@ if ($method === 'POST') {
         ? trim($exam['timezone'])
         : null;
     $sectionsInput = $exam['sections'] ?? [];
-    $proctor = $exam['proctoringConfig'] ?? [];
+    $proctor = is_array($exam['proctoringConfig'] ?? null) ? $exam['proctoringConfig'] : [];
     $violationLimits = normalize_violation_limits($proctor['violationLimits'] ?? null);
     $proctorTiming = normalize_proctor_timing($proctor['proctorTiming'] ?? null);
     $allowedDevices = normalize_allowed_devices($exam['allowedDeviceTypes'] ?? null);
     $notif = $exam['notificationConfig'] ?? [];
+
+    // Proctoring mode + candidate-facing switches. A field the client did not send keeps the exam's
+    // stored value (new exams: PROCTORED / alerts on / end on limit), so an older cached editor that
+    // knows nothing about these fields can't silently flip an UNPROCTORED exam back to proctored.
+    if (array_key_exists('mode', $proctor) && $proctor['mode'] !== null) {
+        $modeRaw = strtoupper(trim(is_scalar($proctor['mode']) ? (string)$proctor['mode'] : ''));
+        if (!in_array($modeRaw, EXAM_PROCTORING_MODES, true)) {
+            json_response(['error' => 'proctoringConfig.mode must be PROCTORED or UNPROCTORED.'], 400);
+        }
+    }
+    $storedModeRow = null;
+    if (exam_proctoring_mode_ready($pdo)
+        && (!isset($proctor['mode']) || !array_key_exists('showAlerts', $proctor) || !array_key_exists('autoTerminate', $proctor))) {
+        $storedStmt = $pdo->prepare('SELECT proctoring_mode, show_violation_alerts, auto_terminate FROM exams WHERE id = ? AND company_id = ? LIMIT 1');
+        $storedStmt->execute([(string)$id, $companyId]);
+        $storedModeRow = $storedStmt->fetch() ?: null;
+        $storedStmt->closeCursor();
+    }
+    $proctoringMode = normalize_proctoring_mode($proctor['mode'] ?? ($storedModeRow['proctoring_mode'] ?? 'PROCTORED'));
+    $showAlerts = exam_bool_flag($proctor['showAlerts'] ?? null, $storedModeRow ? (bool)$storedModeRow['show_violation_alerts'] : true);
+    $autoTerminate = exam_bool_flag($proctor['autoTerminate'] ?? null, $storedModeRow ? (bool)$storedModeRow['auto_terminate'] : true);
+    $unproctored = $proctoringMode === 'UNPROCTORED';
+    if ($unproctored) {
+        // No monitoring at all: store the monitoring columns as off so every consumer (emails,
+        // monitoring wall, recordings, the candidate page) sees the same thing without having to
+        // know about the mode column.
+        $violationLimits = normalize_violation_limits(null);
+    }
 
     $saveArgs = [
         'id' => $id,
@@ -784,10 +933,10 @@ if ($method === 'POST') {
         'reconnectLimit' => $reconnectLimit,
         'totalMarks' => $totalMarks,
         'status' => $status,
-        'cameraRequired' => !empty($proctor['cameraRequired']) ? 1 : 0,
-        'microphoneRequired' => !empty($proctor['microphoneRequired']) ? 1 : 0,
-        'fullscreenEnforced' => !empty($proctor['fullScreenEnforced']) ? 1 : 0,
-        'tabSwitchLimit' => (int)($proctor['tabSwitchLimit'] ?? 3),
+        'cameraRequired' => !$unproctored && !empty($proctor['cameraRequired']) ? 1 : 0,
+        'microphoneRequired' => !$unproctored && !empty($proctor['microphoneRequired']) ? 1 : 0,
+        'fullscreenEnforced' => !$unproctored && !empty($proctor['fullScreenEnforced']) ? 1 : 0,
+        'tabSwitchLimit' => $unproctored ? 0 : (int)($proctor['tabSwitchLimit'] ?? 3),
         'violationLimits' => json_encode($violationLimits),
         'proctorTiming' => json_encode($proctorTiming),
         'notificationEnabled' => !empty($notif['enabled']) ? 1 : 0,
@@ -892,6 +1041,13 @@ if ($method === 'POST') {
 
     $assignedIds = array_values(array_unique($assignedIds));
 
+    // Question Bank questions are shared by every exam that uses them and are edited only in the
+    // Question Bank tab. The exam save LINKS them (exam_questions / exam_section_questions) but never
+    // rewrites their text, options or answer key, whatever the client sent for them.
+    $questionIdList = array_values(array_map('strval', array_keys($questionMap)));
+    $bankOwnedIds = question_bank_owned_ids($pdo, $questionIdList);
+    $bankOwnedSet = array_fill_keys($bankOwnedIds, true);
+
     // Exam, question and section ids are global primary keys and the save below is an upsert. For a
     // regular admin, refuse ids that already belong to ANOTHER company: otherwise a crafted save
     // reusing another company's exam id would move that exam into this company (company_id =
@@ -904,17 +1060,36 @@ if ($method === 'POST') {
         $foreignExam = (bool)$foreignStmt->fetchColumn();
         $foreignStmt->closeCursor();
 
+        // Bank questions are never rewritten here, so what matters for them is whose bank they sit
+        // in — not which exams link them (a super admin may have linked one into another company's
+        // exam, which must not lock its own company out of its bank). Every other question keeps the
+        // "already used by another company's exam" check.
+        $plainQuestionIds = array_values(array_filter($questionIdList, static fn(string $qid) => !isset($bankOwnedSet[$qid])));
+
         $foreignChild = false;
-        $questionIdList = array_values(array_map('strval', array_keys($questionMap)));
-        if (!$foreignExam && count($questionIdList) > 0) {
-            $qPh = implode(',', array_fill(0, count($questionIdList), '?'));
+        if (!$foreignExam && count($plainQuestionIds) > 0) {
+            $qPh = implode(',', array_fill(0, count($plainQuestionIds), '?'));
             $fqStmt = $pdo->prepare("SELECT 1 FROM exam_questions eq
                                      JOIN exams e ON e.id = eq.exam_id
                                      WHERE eq.question_id IN ($qPh) AND e.company_id <> ?
                                      LIMIT 1");
-            $fqStmt->execute(array_merge($questionIdList, [$companyId]));
+            $fqStmt->execute(array_merge($plainQuestionIds, [$companyId]));
             $foreignChild = (bool)$fqStmt->fetchColumn();
             $fqStmt->closeCursor();
+        }
+
+        if (!$foreignExam && count($bankOwnedIds) > 0) {
+            $bPh = implode(',', array_fill(0, count($bankOwnedIds), '?'));
+            $fbStmt = $pdo->prepare("SELECT 1 FROM question_bank_items qbi
+                                     JOIN question_banks qb ON qb.id = qbi.bank_id
+                                     WHERE qbi.question_id IN ($bPh) AND qb.company_id <> ?
+                                     LIMIT 1");
+            $fbStmt->execute(array_merge($bankOwnedIds, [$companyId]));
+            $foreignBank = (bool)$fbStmt->fetchColumn();
+            $fbStmt->closeCursor();
+            if ($foreignBank) {
+                json_response(['error' => 'One or more questions belong to another company\'s question bank and cannot be used in this exam.'], 409);
+            }
         }
         $sectionIdList = array_values(array_map(static fn($s) => (string)$s['id'], $sections));
         if (!$foreignExam && !$foreignChild && count($sectionIdList) > 0) {
@@ -1021,6 +1196,12 @@ if ($method === 'POST') {
             $certUpdate->closeCursor();
         }
 
+        if (exam_proctoring_mode_ready($pdo)) {
+            $modeUpdate = $pdo->prepare('UPDATE exams SET proctoring_mode = ?, show_violation_alerts = ?, auto_terminate = ? WHERE id = ? AND company_id = ?');
+            $modeUpdate->execute([$proctoringMode, $showAlerts ? 1 : 0, $autoTerminate ? 1 : 0, $id, $companyId]);
+            $modeUpdate->closeCursor();
+        }
+
         $sectionIdStmt = $pdo->prepare('SELECT id FROM exam_sections WHERE exam_id = ?');
         $sectionIdStmt->execute([$id]);
         $existingSectionIds = array_map(static fn(array $row): string => (string)$row['id'], $sectionIdStmt->fetchAll());
@@ -1065,6 +1246,12 @@ if ($method === 'POST') {
 
         $order = 0;
         foreach ($questionMap as $qid => $q) {
+            if (isset($bankOwnedSet[(string)$qid])) {
+                // Question Bank question: link only, never overwrite the bank's copy.
+                $linkQuestionStmt->execute([$id, $qid, $order]);
+                $order++;
+                continue;
+            }
             $qType = strtoupper((string)($q['type'] ?? 'MCQ'));
             $optionsJson = isset($q['options']) && is_array($q['options']) ? json_encode(array_values($q['options'])) : null;
             $answerKeyJson = isset($q['answerKey']) && is_array($q['answerKey']) ? json_encode($q['answerKey']) : null;
@@ -1169,6 +1356,8 @@ if ($method === 'POST') {
             'sectionCount' => count($sections),
             'assignedCount' => is_array($assignedIds) ? count($assignedIds) : 0,
             'assignedBatchCount' => count($assignedBatchIds),
+            'proctoringMode' => $proctoringMode,
+            'bankQuestionCount' => count($bankOwnedIds),
         ]
     ]);
 
@@ -1188,8 +1377,34 @@ if ($method === 'POST') {
     ], is_array($proctor) ? $proctor : []);
     $exam['proctoringConfig']['violationLimits'] = $violationLimits;
     $exam['proctoringConfig']['proctorTiming'] = $proctorTiming;
+    // Echo what was actually stored (an UNPROCTORED exam has every monitoring switch off).
+    $exam['proctoringConfig']['mode'] = $proctoringMode;
+    $exam['proctoringConfig']['showAlerts'] = $showAlerts;
+    $exam['proctoringConfig']['autoTerminate'] = $autoTerminate;
+    $exam['proctoringConfig']['cameraRequired'] = (bool)$saveArgs['cameraRequired'];
+    $exam['proctoringConfig']['microphoneRequired'] = (bool)$saveArgs['microphoneRequired'];
+    $exam['proctoringConfig']['fullScreenEnforced'] = (bool)$saveArgs['fullscreenEnforced'];
+    $exam['proctoringConfig']['tabSwitchLimit'] = (int)$saveArgs['tabSwitchLimit'];
     if (count($sections) > 0) {
         $exam['sections'] = $sections;
+    }
+    // bankId/bankName in the echo reflect real bank membership, not whatever the client claimed.
+    $bankLinks = fetch_question_bank_links($pdo, $bankOwnedIds);
+    if (is_array($exam['questions'] ?? null)) {
+        $exam['questions'] = array_map(
+            static fn($q) => is_array($q) ? apply_question_bank_link($q, $bankLinks) : $q,
+            $exam['questions']
+        );
+    }
+    if (is_array($exam['sections'] ?? null)) {
+        foreach ($exam['sections'] as $sIdx => $section) {
+            if (is_array($section) && is_array($section['questions'] ?? null)) {
+                $exam['sections'][$sIdx]['questions'] = array_map(
+                    static fn($q) => is_array($q) ? apply_question_bank_link($q, $bankLinks) : $q,
+                    $section['questions']
+                );
+            }
+        }
     }
     json_response(['exam' => $exam]);
 }

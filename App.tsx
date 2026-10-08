@@ -333,8 +333,25 @@ const parseApiErrorPayload = (message: string) => {
   }
 };
 
+// Same reading as ExamTake: an absent mode means PROCTORED (every exam created before the setting).
+const isExamProctored = (exam: Exam): boolean =>
+  String(exam.proctoringConfig?.mode ?? 'PROCTORED').toUpperCase() !== 'UNPROCTORED';
+
 const buildPreStartInstructions = (exam: Exam): string[] => {
   const lines: string[] = [];
+  const examTz = resolveExamTimezone(exam.timezone);
+
+  lines.push(`Read all questions carefully. You have ${exam.durationMinutes} minutes to complete this exam.`);
+
+  // UNPROCTORED: nothing is monitored, so no camera / microphone / screen / fullscreen / tab rules —
+  // listing them (from stale flags on the row) would send the candidate hunting for a webcam.
+  if (!isExamProctored(exam)) {
+    lines.push('This exam is not proctored. No camera, microphone or screen sharing is needed.');
+    lines.push('The timer starts when you click Start Test. Your answers are saved automatically as you go.');
+    lines.push(`Exam window: ${formatScheduleShort(exam.startTime, examTz)} to ${formatScheduleShort(exam.endTime, examTz)}.`);
+    return lines;
+  }
+
   const proctor = exam.proctoringConfig || {
     cameraRequired: false,
     microphoneRequired: false,
@@ -343,34 +360,41 @@ const buildPreStartInstructions = (exam: Exam): string[] => {
   };
   const tabSwitchLimit = Math.max(0, Number(proctor.tabSwitchLimit ?? 0));
   const violationLimits: Record<string, number | undefined> = proctor.violationLimits || {};
+  // "Throw out on violations" off: limits never end the attempt, so don't present them as an
+  // allowance that runs out — say plainly that events are recorded for review.
+  const autoTerminate = proctor.autoTerminate !== false;
 
-  lines.push(`Read all questions carefully. You have ${exam.durationMinutes} minutes to complete this exam.`);
   if (proctor.cameraRequired) {
     lines.push('Keep your face visible in the camera throughout the exam.');
   }
   if (proctor.microphoneRequired) {
-    lines.push('Keep your microphone enabled. Mild room noise is tolerated, but speaking or conversation can trigger a violation.');
+    lines.push(autoTerminate
+      ? 'Keep your microphone enabled. Mild room noise is tolerated, but speaking or conversation can trigger a violation.'
+      : 'Keep your microphone enabled. Mild room noise is tolerated, but speaking or conversation is recorded.');
   }
   if (proctor.fullScreenEnforced) {
     lines.push('Fullscreen mode is mandatory during the exam.');
   }
-  if (tabSwitchLimit > 0) {
-    lines.push(`Do not switch tabs repeatedly. Maximum allowed tab switches: ${tabSwitchLimit}.`);
-  }
-  if (Number(violationLimits.camera ?? 0) > 0) {
-    lines.push(`Camera violations allowed: ${Number(violationLimits.camera)}.`);
-  }
-  if (Number(violationLimits.microphone ?? 0) > 0) {
-    lines.push(`Microphone violations allowed: ${Number(violationLimits.microphone)}.`);
-  }
-  if (Number(violationLimits.fullscreen ?? 0) > 0) {
-    lines.push(`Fullscreen violations allowed: ${Number(violationLimits.fullscreen)}.`);
-  }
-  if (Number(violationLimits.copyPaste ?? 0) > 0) {
-    lines.push(`Copy/paste violations allowed: ${Number(violationLimits.copyPaste)}.`);
+  if (autoTerminate) {
+    if (tabSwitchLimit > 0) {
+      lines.push(`Do not switch tabs repeatedly. Maximum allowed tab switches: ${tabSwitchLimit}.`);
+    }
+    if (Number(violationLimits.camera ?? 0) > 0) {
+      lines.push(`Camera violations allowed: ${Number(violationLimits.camera)}.`);
+    }
+    if (Number(violationLimits.microphone ?? 0) > 0) {
+      lines.push(`Microphone violations allowed: ${Number(violationLimits.microphone)}.`);
+    }
+    if (Number(violationLimits.fullscreen ?? 0) > 0) {
+      lines.push(`Fullscreen violations allowed: ${Number(violationLimits.fullscreen)}.`);
+    }
+    if (Number(violationLimits.copyPaste ?? 0) > 0) {
+      lines.push(`Copy/paste violations allowed: ${Number(violationLimits.copyPaste)}.`);
+    }
+  } else {
+    lines.push('Stay on the exam page — switching tabs or windows, copy/paste and other proctoring events are recorded for review by your examiner.');
   }
 
-  const examTz = resolveExamTimezone(exam.timezone);
   lines.push(`Exam window: ${formatScheduleShort(exam.startTime, examTz)} to ${formatScheduleShort(exam.endTime, examTz)}.`);
   return lines;
 };
@@ -1135,7 +1159,10 @@ const StudentApp: React.FC = () => {
       const { exam, student } = preStartContext;
       const deviceFingerprint = await getDeviceFingerprint();
       const deviceMetadata = buildDeviceMetadata();
-      const geoLocation = await getGeoLocation();
+      // An UNPROCTORED exam asks for no browser permission at all — not even location.
+      const geoLocation = isExamProctored(exam)
+        ? await getGeoLocation()
+        : { label: 'Not collected (unproctored exam)', lat: null, lng: null, accuracy: null };
       const macAddress = await getMacAddress();
       const start = await apiPost<{ ok: boolean; sessionId?: number | null; attempt?: number; reconnect?: boolean; remaining?: number }>('sessions.php', {
         action: 'start',

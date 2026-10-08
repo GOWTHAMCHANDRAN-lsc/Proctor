@@ -13,8 +13,9 @@ export interface ExamIntroWalkthroughProps {
 }
 
 // ── Animated illustration: the browser's camera/mic popup, with a cursor looping onto Allow ──
-const AllowAnimation: React.FC = () => (
-  <svg viewBox="0 0 320 176" width="100%" height="100%" role="img" aria-label="Animated demo: clicking Allow on the camera and microphone prompt" style={{ maxWidth: 320 }}>
+// Draws only the devices this exam asks for (a mic-only exam has no "Use your camera" row).
+const AllowAnimation: React.FC<{ camera: boolean; microphone: boolean }> = ({ camera, microphone }) => (
+  <svg viewBox="0 0 320 176" width="100%" height="100%" role="img" aria-label={`Animated demo: clicking Allow on the ${camera && microphone ? 'camera and microphone' : camera ? 'camera' : 'microphone'} prompt`} style={{ maxWidth: 320 }}>
     <defs>
       <filter id="introShadow" x="-20%" y="-20%" width="140%" height="140%">
         <feDropShadow dx="0" dy="4" stdDeviation="6" floodColor="#0f172a" floodOpacity="0.18" />
@@ -28,14 +29,22 @@ const AllowAnimation: React.FC = () => (
     <g filter="url(#introShadow)">
       <rect x="14" y="46" width="230" height="118" rx="12" fill="#ffffff" stroke="#e2e8f0" />
       <text x="30" y="72" fontFamily="system-ui, sans-serif" fontSize="12" fontWeight="700" fill="#0f172a">This site wants to</text>
-      <circle cx="36" cy="92" r="9" fill="#eff6ff" />
-      <rect x="31" y="88" width="10" height="8" rx="2" fill="#2563eb" />
-      <path d="M41 90 l4 -2 v8 l-4 -2 z" fill="#2563eb" />
-      <text x="52" y="96" fontFamily="system-ui, sans-serif" fontSize="11" fill="#334155">Use your camera</text>
-      <circle cx="36" cy="116" r="9" fill="#eff6ff" />
-      <rect x="32.5" y="110" width="7" height="11" rx="3.5" fill="#2563eb" />
-      <rect x="34.5" y="121" width="3" height="4" fill="#2563eb" />
-      <text x="52" y="120" fontFamily="system-ui, sans-serif" fontSize="11" fill="#334155">Use your microphone</text>
+      {camera && (
+        <>
+          <circle cx="36" cy="92" r="9" fill="#eff6ff" />
+          <rect x="31" y="88" width="10" height="8" rx="2" fill="#2563eb" />
+          <path d="M41 90 l4 -2 v8 l-4 -2 z" fill="#2563eb" />
+          <text x="52" y="96" fontFamily="system-ui, sans-serif" fontSize="11" fill="#334155">Use your camera</text>
+        </>
+      )}
+      {microphone && (
+        <g transform={camera ? undefined : 'translate(0 -24)'}>
+          <circle cx="36" cy="116" r="9" fill="#eff6ff" />
+          <rect x="32.5" y="110" width="7" height="11" rx="3.5" fill="#2563eb" />
+          <rect x="34.5" y="121" width="3" height="4" fill="#2563eb" />
+          <text x="52" y="120" fontFamily="system-ui, sans-serif" fontSize="11" fill="#334155">Use your microphone</text>
+        </g>
+      )}
       <rect x="120" y="136" width="52" height="20" rx="10" fill="#f1f5f9" stroke="#e2e8f0" />
       <text x="146" y="149" textAnchor="middle" fontFamily="system-ui, sans-serif" fontSize="10" fill="#64748b">Block</text>
       <rect x="180" y="136" width="52" height="20" rx="10" fill="#2563eb" />
@@ -92,6 +101,8 @@ export const ExamIntroWalkthrough: React.FC<ExamIntroWalkthroughProps> = ({
   examTitle, scheduleLabel, needsCamera, needsMicrophone, needsScreen, needsFullscreen, isMobile, onContinue,
 }) => {
   const needsCamOrMic = needsCamera || needsMicrophone;
+  // Proctored, but nothing for the browser to grant (e.g. only tab-switch / fullscreen rules).
+  const needsAnyPermission = needsCamOrMic || needsScreen;
   const camMicLabel = needsCamera && needsMicrophone ? 'camera and microphone' : needsCamera ? 'camera' : 'microphone';
 
   const steps: Step[] = [
@@ -102,9 +113,18 @@ export const ExamIntroWalkthrough: React.FC<ExamIntroWalkthroughProps> = ({
       body: (
         <div className="space-y-3">
           <p className="text-slate-600 text-sm leading-relaxed">
-            This exam is monitored to keep it fair for everyone. In the next few steps we'll ask your browser
-            for a few permissions — this short walkthrough shows you exactly what to expect and how to allow
-            each one, before any popup appears.
+            {needsAnyPermission ? (
+              <>
+                This exam is monitored to keep it fair for everyone. In the next few steps we'll ask your browser
+                for a few permissions — this short walkthrough shows you exactly what to expect and how to allow
+                each one, before any popup appears.
+              </>
+            ) : (
+              <>
+                This exam is monitored to keep it fair for everyone. No camera, microphone or screen sharing is
+                needed — this short walkthrough explains the rules before you begin.
+              </>
+            )}
           </p>
           <div className="grid grid-cols-2 gap-2 pt-1">
             {needsCamera && (
@@ -148,7 +168,7 @@ export const ExamIntroWalkthrough: React.FC<ExamIntroWalkthroughProps> = ({
           This lets the system confirm you're present — your feed is only used for monitoring this exam.
         </p>
       ),
-      illustration: <AllowAnimation />,
+      illustration: <AllowAnimation camera={needsCamera} microphone={needsMicrophone} />,
     });
   } else if (needsCamOrMic && isMobile) {
     steps.push({

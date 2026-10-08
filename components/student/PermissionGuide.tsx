@@ -41,7 +41,9 @@ const browserLabel: Record<BrowserId, string> = {
 };
 
 // ── Illustration: the browser's own permission popup (what the student will see) ──
-const AllowPopupIllustration: React.FC<{ mobile: boolean }> = ({ mobile }) => (
+// Only the devices this exam actually asks for are drawn (a mic-only exam used to be shown a
+// "Use your camera" row it would never see).
+const AllowPopupIllustration: React.FC<{ mobile: boolean; camera: boolean; microphone: boolean }> = ({ mobile, camera, microphone }) => (
   <svg viewBox="0 0 320 176" width="100%" height="100%" role="img"
        aria-label="Browser permission dialog with the Allow button highlighted"
        style={{ maxWidth: 320 }}>
@@ -63,15 +65,23 @@ const AllowPopupIllustration: React.FC<{ mobile: boolean }> = ({ mobile }) => (
         {mobile ? 'Allow access?' : 'This site wants to'}
       </text>
       {/* camera row */}
-      <circle cx="36" cy="92" r="9" fill="#eff6ff" />
-      <rect x="31" y="88" width="10" height="8" rx="2" fill="#2563eb" />
-      <path d="M41 90 l4 -2 v8 l-4 -2 z" fill="#2563eb" />
-      <text x="52" y="96" fontFamily="system-ui, sans-serif" fontSize="11" fill="#334155">Use your camera</text>
-      {/* mic row */}
-      <circle cx="36" cy="116" r="9" fill="#eff6ff" />
-      <rect x="32.5" y="110" width="7" height="11" rx="3.5" fill="#2563eb" />
-      <rect x="34.5" y="121" width="3" height="4" fill="#2563eb" />
-      <text x="52" y="120" fontFamily="system-ui, sans-serif" fontSize="11" fill="#334155">Use your microphone</text>
+      {camera && (
+        <>
+          <circle cx="36" cy="92" r="9" fill="#eff6ff" />
+          <rect x="31" y="88" width="10" height="8" rx="2" fill="#2563eb" />
+          <path d="M41 90 l4 -2 v8 l-4 -2 z" fill="#2563eb" />
+          <text x="52" y="96" fontFamily="system-ui, sans-serif" fontSize="11" fill="#334155">Use your camera</text>
+        </>
+      )}
+      {/* mic row (moves up into the first row when there is no camera row) */}
+      {microphone && (
+        <g transform={camera ? undefined : 'translate(0 -24)'}>
+          <circle cx="36" cy="116" r="9" fill="#eff6ff" />
+          <rect x="32.5" y="110" width="7" height="11" rx="3.5" fill="#2563eb" />
+          <rect x="34.5" y="121" width="3" height="4" fill="#2563eb" />
+          <text x="52" y="120" fontFamily="system-ui, sans-serif" fontSize="11" fill="#334155">Use your microphone</text>
+        </g>
+      )}
       {/* buttons */}
       <rect x="120" y="136" width="52" height="20" rx="10" fill="#f1f5f9" stroke="#e2e8f0" />
       <text x="146" y="149" textAnchor="middle" fontFamily="system-ui, sans-serif" fontSize="10" fill="#64748b">Block</text>
@@ -259,7 +269,7 @@ export const PermissionGuide: React.FC<PermissionGuideProps> = ({
 
           {/* Illustration */}
           <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 flex items-center justify-center min-h-[150px]">
-            {!denied && <AllowPopupIllustration mobile={device.isMobile} />}
+            {!denied && <AllowPopupIllustration mobile={device.isMobile} camera={needsCamera || !needsMicrophone} microphone={needsMicrophone} />}
             {denied && wrongSurface && <ScreenPickerIllustration />}
             {denied && !wrongSurface && hardwareIssue && <CameraTroubleIllustration busy={problem === 'device-busy'} />}
             {denied && !wrongSurface && !hardwareIssue && device.isIOS && <IOSResetIllustration />}

@@ -305,8 +305,20 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   const resumePayloadRef = useRef<any | null>(null);
   const resumeOverrideRef = useRef<number | null>(null);
   const resumeAppliedRef = useRef(false);
+  // ── Per-exam proctoring policy (absent fields = today's behaviour: PROCTORED / alerts / auto-end) ──
+  // UNPROCTORED switches EVERY monitoring feature off: no permission prompts or capture, no recording,
+  // no fullscreen, no browser-event tracking or lockdown, no AI calls, no live-wall push and no
+  // violations — the candidate just answers the questions (timer, autosave, sections, submit and
+  // results still work). Every capture/AI/violation path below is gated on these flags, not only on
+  // the camera/mic booleans, so a stale exam row that still says cameraRequired can't re-enable it.
+  const isProctored = String(exam.proctoringConfig?.mode ?? 'PROCTORED').toUpperCase() !== 'UNPROCTORED';
+  // false = violations are still recorded and sent exactly as before, but the candidate is never
+  // shown a violation toast or count. Functional blocking overlays (fullscreen, lost camera) remain.
+  const showViolationAlerts = exam.proctoringConfig?.showAlerts !== false;
+  // false = violation limits never end the attempt; violations are only recorded for review.
+  const autoTerminateOnLimit = exam.proctoringConfig?.autoTerminate !== false;
   const [tabSwitchCount, setTabSwitchCount] = useState(0);
-  const tabSwitchLimit = Math.max(0, Number(exam.proctoringConfig?.tabSwitchLimit ?? 0));
+  const tabSwitchLimit = isProctored ? Math.max(0, Number(exam.proctoringConfig?.tabSwitchLimit ?? 0)) : 0;
   const tabSwitchLockedRef = useRef(false);
   const terminationQueuedRef = useRef(false);
   const finishOnceRef = useRef(false);
@@ -396,7 +408,9 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   const lastViolationTimeByType = useRef<Partial<Record<ViolationLog['type'], number>>>({});
   const audioContextRef = useRef<AudioContext | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const [permissionStatus, setPermissionStatus] = useState<'pending' | 'granted' | 'denied'>('pending');
+  // An unproctored exam needs no device permission at all, so it starts 'granted' — otherwise the
+  // first render would flash the PermissionGuide and examBlocked would hold the timer for a frame.
+  const [permissionStatus, setPermissionStatus] = useState<'pending' | 'granted' | 'denied'>(isProctored ? 'pending' : 'granted');
   const [permissionBusy, setPermissionBusy] = useState(false);
   // Walk the candidate through what's about to happen (camera/mic/entire-screen, why, how to
   // allow each) BEFORE any browser permission dialog appears — so the first thing they see isn't
@@ -404,6 +418,9 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   // sitting through it again; a fresh localStorage (new device/browser) shows it again, which is fine.
   const introStorageKey = `pg_intro_seen_${exam.id}_${student.id}`;
   const [introDone, setIntroDone] = useState(() => {
+    // Unproctored: there is nothing to walk through (no permissions, no rules to explain) — the
+    // candidate goes straight into the questions after "Start Test" on the pre-start screen.
+    if (!isProctored) return true;
     try {
       return typeof window !== 'undefined' && window.localStorage.getItem(introStorageKey) === '1';
     } catch {
@@ -445,14 +462,15 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   // Recording + AI detection are camera-scoped: they only run when the exam actually requires
   // the camera. If an admin unchecks camera (and microphone), the candidate is never prompted for
   // any device and no capture is attempted.
-  const recordingEnabled = exam.proctoringConfig.cameraRequired;
+  // An UNPROCTORED exam captures nothing, whatever the camera/mic/fullscreen flags say.
+  const recordingEnabled = isProctored && !!exam.proctoringConfig.cameraRequired;
   // Screen recording is desktop-only; camera recording still runs on mobile.
   const screenRecordingEnabled = recordingEnabled && device.canScreenRecord;
   // Fullscreen is only enforced where the browser actually supports it (iOS Safari
   // has no Fullscreen API — enforcing it there would permanently block the exam).
-  const fullscreenEnforced = exam.proctoringConfig.fullScreenEnforced && device.canFullscreen;
-  const cameraCaptureRequired = exam.proctoringConfig.cameraRequired;
-  const microphoneCaptureRequired = exam.proctoringConfig.microphoneRequired;
+  const fullscreenEnforced = isProctored && !!exam.proctoringConfig.fullScreenEnforced && device.canFullscreen;
+  const cameraCaptureRequired = isProctored && !!exam.proctoringConfig.cameraRequired;
+  const microphoneCaptureRequired = isProctored && !!exam.proctoringConfig.microphoneRequired;
   // Screen share is required on desktop where it's supported — the student must share their screen
   // for the full recording to be captured (camera + mic + screen).
   const screenCaptureRequired = screenRecordingEnabled;
@@ -494,7 +512,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   });
   const [fullscreenBlocked, setFullscreenBlocked] = useState(false);
   // Biometric identity enrollment + verification.
-  const faceVerificationEnabled = exam.proctoringConfig.cameraRequired;
+  const faceVerificationEnabled = cameraCaptureRequired;
   const [identityEnrollment, setIdentityEnrollment] =
     useState<'idle' | 'checking' | 'required' | 'enrolled' | 'unavailable'>('idle');
   const [enrollBusy, setEnrollBusy] = useState(false);
@@ -1272,6 +1290,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   // stayed on after the exam), and a second AudioContext + detectAudio loop + VAD ran forever.
   const permissionRequestRef = useRef<Promise<void> | null>(null);
   const requestAllPermissions = (): Promise<void> => {
+    // Hard stop: an unproctored exam must never open a camera/mic/screen prompt.
+    if (!isProctored) return Promise.resolve();
     if (permissionRequestRef.current) return permissionRequestRef.current;
     const request = acquireAllPermissions().finally(() => {
       permissionRequestRef.current = null;
@@ -1466,6 +1486,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   };
 
   const requestFullscreen = async () => {
+    // Only an exam that enforces fullscreen ever asks for it (and could be blocked on failure).
+    if (!fullscreenEnforced) return true;
     const el = document.documentElement as any;
     const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
     if (!req) {
@@ -1510,7 +1532,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     // Only wire the audio graph when a mic track actually exists: createMediaStreamSource() THROWS
     // on a stream with no audio track, and that throw used to surface as a permission failure —
     // so a candidate with a working, allowed camera but no mic was shown "Permissions Blocked".
-    if (exam.proctoringConfig.microphoneRequired && stream.getAudioTracks().length > 0) {
+    if (microphoneCaptureRequired && stream.getAudioTracks().length > 0) {
       const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
       audioContextRef.current = audioContext;
       await audioContext.resume().catch(() => {});
@@ -1767,7 +1789,9 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
         if (!introDone) {
           return;
         }
-        if (!permissionsRequired) {
+        // Nothing to capture (always the case for an UNPROCTORED exam — every *CaptureRequired flag
+        // above is false there): no prompt, the exam simply opens.
+        if (!isProctored || !permissionsRequired) {
           setPermissionStatus('granted');
           return;
         }
@@ -1828,7 +1852,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     // object / AUDIO violations must work for every candidate. Identity matching is layered on
     // once an SFace template exists (already on file, or auto-enrolled from the first clear frame).
     // Never re-arm a finished attempt (teardown exits fullscreen, which flips fullscreenBlocked).
-    if (permissionStatus === 'granted' && !fullscreenBlocked && !finishOnceRef.current) {
+    // An UNPROCTORED exam is never armed, so no violation can be raised for it.
+    if (isProctored && permissionStatus === 'granted' && !fullscreenBlocked && !finishOnceRef.current) {
       proctoringArmedRef.current = true;
       // Reset proctor timers so stale pre-exam state doesn't fire immediately
       faceAbsenceStartRef.current = null;
@@ -1839,7 +1864,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
       voiceActiveLastSeenRef.current = 0;
       lastMouthOpenAtRef.current = 0;
     }
-  }, [permissionStatus, fullscreenBlocked]);
+  }, [permissionStatus, fullscreenBlocked, isProctored]);
 
   useEffect(() => {
     if (permissionStatus !== 'granted') return;
@@ -1916,7 +1941,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   // External display detection (best effort)
 
   useEffect(() => {
-    if (permissionStatus !== 'granted' || !sessionId || !navigator.geolocation) return;
+    // Location tracking is monitoring — never runs (or prompts) for an UNPROCTORED exam.
+    if (!isProctored || permissionStatus !== 'granted' || !sessionId || !navigator.geolocation) return;
     let lastSentAt = 0;
     let cancelled = false;
 
@@ -1967,11 +1993,12 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
       cancelled = true;
       navigator.geolocation.clearWatch(watchId);
     };
-  }, [permissionStatus, sessionId, exam.id, student.id]);
+  }, [permissionStatus, sessionId, exam.id, student.id, isProctored]);
 
   // 1b. Load face-api.js models + BlazeFace fallback, then start the detection loop.
   useEffect(() => {
-    if (permissionStatus !== 'granted' || !exam.proctoringConfig.cameraRequired) return;
+    // cameraCaptureRequired is false for every UNPROCTORED exam → no AI health check / calls.
+    if (permissionStatus !== 'granted' || !cameraCaptureRequired) return;
     let cancelled = false;
 
     // Python AI (MediaPipe) is the ONLY detection engine — no browser-side fallback models.
@@ -2003,7 +2030,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     }, 20000);
 
     return () => { cancelled = true; window.clearInterval(retryTimer); };
-  }, [permissionStatus, exam.proctoringConfig.cameraRequired]);
+  }, [permissionStatus, cameraCaptureRequired]);
 
   // 1c. Main proctoring detection loop — runs like a human proctor watching the student.
   //
@@ -2014,7 +2041,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   // Violation logic: timer-based grace periods, not frame counters.
   //   A proctor watching a video doesn't flag a 0.5-second glance — they flag sustained behaviour.
   useEffect(() => {
-    if (permissionStatus !== 'granted' || !exam.proctoringConfig.cameraRequired || !faceMlReady) return;
+    if (permissionStatus !== 'granted' || !cameraCaptureRequired || !faceMlReady) return;
     let cancelled = false;
     let tickRunning = false; // guard against concurrent inferences
 
@@ -2209,7 +2236,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
 
     void loop();
     return () => { cancelled = true; };
-  }, [permissionStatus, exam.proctoringConfig.cameraRequired, faceMlReady]);
+  }, [permissionStatus, cameraCaptureRequired, faceMlReady]);
 
   // 1c. Object detection (phone, study material, second device) is handled server-side by the
   //     Python AI engine inside the main detection loop above (result.phoneDetected /
@@ -2219,7 +2246,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   // so a proctor can watch active candidates in near-real-time (frame-push transport). Best-effort:
   // a failed push never affects the exam. A final STOP drops the student off the wall on exit.
   useEffect(() => {
-    if (permissionStatus !== 'granted' || !sessionId || !exam.proctoringConfig.cameraRequired) return;
+    // No live-wall push (frames or heartbeat) for an UNPROCTORED exam: cameraCaptureRequired is false.
+    if (permissionStatus !== 'granted' || !sessionId || !cameraCaptureRequired) return;
     let cancelled = false;
 
     // Idle cadence keeps every candidate on the wall cheaply; when a proctor opens this candidate the
@@ -2283,7 +2311,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
       // Drop off the wall promptly when the exam view unmounts.
       void apiPost('live.php', { action: 'STOP', sessionId }).catch(() => {});
     };
-  }, [permissionStatus, sessionId, exam.id, student.id, exam.proctoringConfig.cameraRequired]);
+  }, [permissionStatus, sessionId, exam.id, student.id, cameraCaptureRequired]);
 
   // 1d. Biometric identity: check enrollment, then either require enrollment or arm verification.
   useEffect(() => {
@@ -2643,7 +2671,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   // even when the candidate never submits. Best-effort; starts once the server session exists.
   useEffect(() => {
     if (resumePending) return;
-    if (permissionStatus !== 'granted' || !sessionId) return;
+    // deviceBlocked: an unproctored exam starts 'granted', but a blocked device never sees questions.
+    if (permissionStatus !== 'granted' || !sessionId || deviceBlocked) return;
     const questionIds = activeSections.flatMap(section => section.questions.map(q => q.id));
     if (questionIds.length === 0) return;
     const saveToServer = () => {
@@ -2659,10 +2688,27 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     };
     const interval = window.setInterval(saveToServer, 20000);
     return () => window.clearInterval(interval);
-  }, [resumePending, permissionStatus, sessionId, exam.id, student.id]);
+  }, [resumePending, permissionStatus, sessionId, exam.id, student.id, deviceBlocked]);
 
   // 3. Security Event Listeners
   useEffect(() => {
+    // Guard against accidental reload / closing / external navigation mid-exam.
+    // Stays armed while a submission is still flushing (finish clicked but not yet handed off):
+    // leaving at that point used to lose the submission silently, with no warning.
+    // Kept for UNPROCTORED exams too — it protects the candidate's work, it doesn't monitor them.
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (allowUnloadRef.current || finishDeliveredRef.current) return;
+      e.preventDefault();
+      e.returnValue = '';
+    };
+
+    // UNPROCTORED: no tab/blur/visibility tracking and no copy-paste / context-menu / dev-tools /
+    // print lockdown — none of these events are watched, blocked or recorded.
+    if (!isProctored) {
+      window.addEventListener("beforeunload", handleBeforeUnload);
+      return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+    }
+
     const handleVisibilityChange = () => {
       // Never flag while a browser permission/screen-picker dialog is open, or during the
       // warm-up / screen-share-bar grace window.
@@ -2723,7 +2769,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
         (ctrlOrMeta && key === 'u');
       if (isDevTools) {
         e.preventDefault();
-        showStudentNotice('Developer tools are disabled during the exam.');
+        // A deterrent warning, so it follows the exam's "show alerts" setting.
+        if (showViolationAlerts) showStudentNotice('Developer tools are disabled during the exam.');
         return;
       }
 
@@ -2736,15 +2783,6 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
         triggerProctorFeedback('COPY_PASTE', 'Printing, saving, or screenshotting exam content is blocked.');
         return;
       }
-    };
-
-    // Guard against accidental reload / closing / external navigation mid-exam.
-    // Stays armed while a submission is still flushing (finish clicked but not yet handed off):
-    // leaving at that point used to lose the submission silently, with no warning.
-    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (allowUnloadRef.current || finishDeliveredRef.current) return;
-      e.preventDefault();
-      e.returnValue = '';
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
@@ -2766,7 +2804,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
       window.removeEventListener("keydown", handleKeyDown, true);
       window.removeEventListener("beforeunload", handleBeforeUnload);
     };
-  }, []);
+  }, [isProctored, showViolationAlerts]);
 
   // Pick the camera <video> that is actually decoding frames right now.
   // On phones the sidebar preview lives inside a `display:none` container whenever the tools
@@ -2855,12 +2893,15 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
 
   // Retry queued violation uploads when connectivity returns and on a periodic tick.
   useEffect(() => {
+    // (An unproctored exam never queues violations, so the flush below is a no-op there.)
     const onOnline = () => {
-      showStudentNotice('Connection restored. Syncing exam activity.');
+      showStudentNotice(isProctored ? 'Connection restored. Syncing exam activity.' : 'Connection restored.');
       void flushPendingViolations();
     };
     const onOffline = () => {
-      showStudentNotice('Network lost. Your answers and activity are saved and will sync automatically.');
+      showStudentNotice(isProctored
+        ? 'Network lost. Your answers and activity are saved and will sync automatically.'
+        : 'Network lost. Your answers are saved and will sync automatically.');
     };
     window.addEventListener('online', onOnline);
     window.addEventListener('offline', onOffline);
@@ -2870,7 +2911,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
       window.removeEventListener('offline', onOffline);
       window.clearInterval(id);
     };
-  }, []);
+  }, [isProctored]);
 
   const violationCategoriesByType: Record<ViolationLog['type'], ViolationCategory[]> = {
     TAB_SWITCH: ['tabSwitch'],
@@ -2896,6 +2937,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   });
 
   const queueViolationTermination = (category: ViolationCategory, type: ViolationLog['type'], limit: number) => {
+    // "Throw out on violations" is off for this exam (or it isn't proctored): limits only flag it.
+    if (!isProctored || !autoTerminateOnLimit) return;
     if (terminationQueuedRef.current) return;
     terminationQueuedRef.current = true;
     tabSwitchLockedRef.current = true;
@@ -2910,7 +2953,13 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
             ? 'Microphone'
             : 'Camera';
     const reason = `${label} violation limit reached (${limit}). Exam terminated.`;
-    setFeedbackBanner({ show: true, msg: reason, type: 'error' });
+    // With alerts hidden the candidate gets no toast here; the "Ending your exam…" overlay and the
+    // final termination screen (which carries this reason) still tell them the attempt ended.
+    if (showViolationAlerts) {
+      setFeedbackBanner({ show: true, msg: reason, type: 'error' });
+    } else {
+      setFeedbackBanner(prev => ({ ...prev, show: false }));
+    }
     window.setTimeout(() => {
       handleFinish({
         terminated: true,
@@ -2926,6 +2975,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     description: string,
     options?: { bypassActive?: boolean; confidence?: number; metadata?: Record<string, any> }
   ) => {
+    // An UNPROCTORED exam records no violation of any kind — not even a bypassActive one.
+    if (!isProctored) return;
     if (!options?.bypassActive && !proctoringArmedRef.current) return;
     const now = Date.now();
     // Per-type cooldowns. Low-signal "human" events (gaze, audio) re-fire slowly so an honest
@@ -2986,17 +3037,27 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
         setTabSwitchCount(nextCount);
       }
       const limit = categoryLimits[category];
-      if (limit > 0 && nextCount >= limit) {
+      // autoTerminate off: the limit is still counted (and reported in the summary) but never
+      // ends the attempt — the candidate simply continues.
+      if (autoTerminateOnLimit && limit > 0 && nextCount >= limit) {
         queueViolationTermination(category, type, limit);
       }
     });
+    // Recorded and sent exactly the same whether or not the candidate is shown an alert.
     deliverViolation({ examId: exam.id, studentId: student.id, sessionId: sessionId ?? null, violation: newViolation });
     if (terminationQueuedRef.current) return;
+    // "Show alerts" off: silent recording — no toast for the candidate.
+    if (!showViolationAlerts) return;
 
     if (feedbackTimeoutRef.current) clearTimeout(feedbackTimeoutRef.current);
-    
-    setFeedbackBanner({ show: true, msg: description, type: type === 'COPY_PASTE' ? 'error' : 'warning' });
-    
+
+    // The stored description stays as-is (it's the evidence text). When the exam won't end on
+    // violations, the toast adds neutral "recorded" copy so it never reads as a threat.
+    const toastMsg = autoTerminateOnLimit || /logged|recorded/i.test(description)
+      ? description
+      : `${description} This has been recorded.`;
+    setFeedbackBanner({ show: true, msg: toastMsg, type: type === 'COPY_PASTE' ? 'error' : 'warning' });
+
     feedbackTimeoutRef.current = setTimeout(() => {
         setFeedbackBanner(prev => ({ ...prev, show: false }));
     }, 4000);
@@ -3299,6 +3360,9 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
       select();
     }
   };
+  // Pasting into answer fields is blocked on proctored exams only; an UNPROCTORED exam has no
+  // clipboard lockdown at all.
+  const blockPaste = isProctored ? (e: React.ClipboardEvent) => e.preventDefault() : undefined;
   const optCardCls = (selected: boolean) =>
     `group flex items-center gap-4 p-4 rounded-xl border transition-all cursor-pointer ${
       selected ? 'border-blue-500 bg-blue-50/70 shadow-sm ring-1 ring-blue-500' : 'border-slate-200 bg-white hover:border-blue-300 hover:shadow-sm'
@@ -3380,7 +3444,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
                 aria-label={`Blank ${i + 1}`}
                 className="flex-1 min-w-0 p-3 text-base bg-white border border-slate-300 rounded-xl outline-none"
                 value={arr[i] || ''}
-                onPaste={(e) => e.preventDefault()}
+                onPaste={blockPaste}
                 onChange={e => { const next = [...arr]; next[i] = e.target.value; handleAnswer(next); }}
               />
             </div>
@@ -3492,7 +3556,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
             placeholder="Type your answer…"
             value={answerText}
             onChange={e => handleAnswer(limit !== null ? truncateToWords(e.target.value, limit) : e.target.value)}
-            onPaste={(e) => e.preventDefault()}
+            onPaste={blockPaste}
           />
         ) : (
           <textarea
@@ -3501,7 +3565,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
             placeholder="Type your answer here..."
             value={answerText}
             onChange={e => handleAnswer(limit !== null ? truncateToWords(e.target.value, limit) : e.target.value)}
-            onPaste={(e) => { e.preventDefault(); }}
+            onPaste={blockPaste}
           />
         )}
         <div className={`absolute bottom-3 right-3 text-xs px-2 py-1 rounded border bg-white ${atLimit ? 'text-rose-600 border-rose-200 font-semibold' : 'text-slate-400'}`}>
@@ -3531,7 +3595,11 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   );
 
   return (
-    <div className="flex flex-col lg:flex-row h-[100dvh] bg-slate-50 select-none overflow-hidden" onContextMenu={e => e.preventDefault()}>
+    // Text-selection / context-menu lockdown is a proctoring feature — lifted for UNPROCTORED exams.
+    <div
+      className={`flex flex-col lg:flex-row h-[100dvh] bg-slate-50 overflow-hidden ${isProctored ? 'select-none' : ''}`}
+      onContextMenu={isProctored ? e => e.preventDefault() : undefined}
+    >
       {resumePending && (
         <div className="fixed inset-0 z-[190] bg-slate-900/40 flex items-center justify-center p-4">
           <div className="bg-white/95 backdrop-blur rounded-2xl shadow-2xl p-8 max-w-md w-full border border-slate-200 text-center">
@@ -3561,7 +3629,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
           </div>
         </div>
       )}
-      {!introDone && (
+      {isProctored && !introDone && (
         <ExamIntroWalkthrough
           examTitle={exam.title}
           scheduleLabel={`${formatScheduleLabel(exam.startTime, resolveExamTimezone(exam.timezone))} — ${formatScheduleLabel(exam.endTime, resolveExamTimezone(exam.timezone))}`}
@@ -3576,7 +3644,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
           }}
         />
       )}
-      {introDone && permissionStatus !== 'granted' && (
+      {/* Never for an UNPROCTORED exam (it starts 'granted' anyway — this is belt and braces). */}
+      {isProctored && introDone && permissionStatus !== 'granted' && (
         <PermissionGuide
           status={permissionStatus === 'denied' ? 'denied' : 'pending'}
           problem={mediaProblem}
@@ -3735,7 +3804,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
               {finishPhase === 'terminating' ? 'Ending your exam…' : 'Submitting your exam…'}
             </h2>
             <p className="text-slate-600 mt-2 text-sm">
-              Saving your answers and finishing the recording. Please keep this window open — this can take a few seconds.
+              {recordingEnabled ? 'Saving your answers and finishing the recording.' : 'Saving your answers.'} Please keep this window open — this can take a few seconds.
             </p>
           </div>
         </div>
@@ -3895,7 +3964,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
          <div className="p-4 bg-slate-50 border-b border-slate-200">
              <div className="flex justify-between items-center mb-3">
                 <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest flex items-center gap-2">
-                   <Monitor size={12} /> Proctoring Active
+                   <Monitor size={12} /> {isProctored ? 'Proctoring Active' : 'Exam Tools'}
                 </span>
                 <div className="flex items-center gap-2">
                   {/* Only claim to be recording when a recording actually runs (camera-required exams). */}
@@ -4054,22 +4123,29 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
                <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">
                   Session Status
                </h3>
-               <span className="text-[10px] font-bold text-teal-600 bg-teal-500/10 px-1.5 py-0.5 rounded">
-                 Monitoring
+               <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${isProctored ? 'text-teal-600 bg-teal-500/10' : 'text-slate-600 bg-slate-500/10'}`}>
+                 {isProctored ? 'Monitoring' : 'Not proctored'}
                </span>
             </div>
             <div className="flex items-start gap-2 text-xs text-slate-600 p-2 rounded bg-white border border-slate-200">
-              <CheckCircle2 size={14} className="text-teal-600 mt-0.5" />
+              <CheckCircle2 size={14} className="text-teal-600 mt-0.5 shrink-0" />
               <span>
-                Proctoring is active. Alerts are reviewed by administrators after submission.
+                {!isProctored
+                  ? 'This exam is not proctored. Your answers are saved automatically as you go.'
+                  : showViolationAlerts
+                    ? 'Proctoring is active. Alerts are reviewed by administrators after submission.'
+                    : 'Proctoring is active. Your session is reviewed by administrators after submission.'}
               </span>
             </div>
-            <div className="mt-2 flex items-center justify-between text-xs p-2 rounded bg-white border border-slate-200">
-              <span className="text-slate-500">Alerts this session</span>
-              <span className={`font-bold px-1.5 py-0.5 rounded ${violations.length > 0 ? 'text-rose-600 bg-rose-500/10' : 'text-teal-600 bg-teal-500/10'}`}>
-                {violations.length}
-              </span>
-            </div>
+            {/* The running alert count is itself a violation message — only when alerts are shown. */}
+            {isProctored && showViolationAlerts && (
+              <div className="mt-2 flex items-center justify-between text-xs p-2 rounded bg-white border border-slate-200">
+                <span className="text-slate-500">Alerts this session</span>
+                <span className={`font-bold px-1.5 py-0.5 rounded ${violations.length > 0 ? 'text-rose-600 bg-rose-500/10' : 'text-teal-600 bg-teal-500/10'}`}>
+                  {violations.length}
+                </span>
+              </div>
+            )}
          </div>
       </aside>
     </div>

@@ -1,9 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Batch, Exam, ExamMailKind, Question, QuestionType, Student, NotificationTemplate, UserRole, CompanyDirectoryRecord } from '../../types';
-import { Plus, Trash2, Save, FileSpreadsheet, Upload, Download, CheckCircle, AlertCircle, Share2, Calendar, Clock, XCircle, FileWarning, Users, Search, Lock, Mail, Send, Loader2, Shuffle, Bell, ListOrdered, Eye, Copy, Monitor, Tablet, Smartphone, Pencil, Award } from 'lucide-react';
-import type { DeviceType } from '../../types';
+import { Plus, Trash2, Save, FileSpreadsheet, Upload, Download, CheckCircle, AlertCircle, Share2, Calendar, Clock, XCircle, FileWarning, Users, Search, Lock, Mail, Send, Loader2, Shuffle, Bell, ListOrdered, Eye, Copy, Monitor, Tablet, Smartphone, Pencil, Award, Library, Camera, Mic, Maximize, ShieldCheck, ShieldOff, Info } from 'lucide-react';
+import type { DeviceType, ProctoringMode, QuestionBank, QuestionBankDetail } from '../../types';
 import { ExamTake } from '../student/ExamTake';
-import { apiGet, apiPost } from '../../services/api';
+import { ApiError, apiGet, apiPost, getApiErrorMessage } from '../../services/api';
 import { Pagination, usePagination } from './Pagination';
 import { useSettings } from '../../services/appSettings';
 import { buildQuestionCsvTemplate, parseCsvLine, parseQuestionCsv } from '../../services/questionCsv';
@@ -77,20 +77,27 @@ export const DEFAULT_REMINDER_MESSAGE =
   + 'Your secure exam link was shared in your invitation email. Kindly ignore this message if you '
   + 'have already taken the assessment.';
 
+// An unproctored exam has no camera, microphone or screen monitoring, so its built-in copy must not
+// call it "proctored".
+const isUnproctoredExam = (exam: Partial<Exam>) => exam.proctoringConfig?.mode === 'UNPROCTORED';
+const unproctoredCopy = (text: string) => text.replace(/proctored online examination/g, 'online examination');
+
 // Resolve the subject/message actually used for one exam + mail kind, in priority order:
 // per-exam override (Mail Composer) → legacy notificationConfig (invitations only) → built-in default.
 // Placeholders are left unsubstituted here so the composer can show the editable template text.
 export const resolveExamMailTemplate = (exam: Partial<Exam>, reminder: boolean): { subject: string; message: string } => {
   const saved = exam.mailTemplates?.[reminder ? 'REMINDER' : 'INVITE'];
+  const unproctored = isUnproctoredExam(exam);
   if (reminder) {
     return {
       subject: saved?.subject?.trim() || 'Reminder — {ExamTitle}',
-      message: saved?.message?.trim() || DEFAULT_REMINDER_MESSAGE,
+      message: saved?.message?.trim() || (unproctored ? unproctoredCopy(DEFAULT_REMINDER_MESSAGE) : DEFAULT_REMINDER_MESSAGE),
     };
   }
   return {
     subject: saved?.subject?.trim() || exam.notificationConfig?.customSubject?.trim() || 'Your Exam Invitation — {ExamTitle}',
-    message: saved?.message?.trim() || exam.notificationConfig?.customMessage?.trim() || DEFAULT_INVITE_MESSAGE,
+    message: saved?.message?.trim() || exam.notificationConfig?.customMessage?.trim()
+      || (unproctored ? unproctoredCopy(DEFAULT_INVITE_MESSAGE) : DEFAULT_INVITE_MESSAGE),
   };
 };
 
@@ -240,12 +247,63 @@ const buildExamEmailContent = (
       <td style="padding:3px 0;font-size:13px;color:#334155;">&#10003; &nbsp;This exam can <strong>only</strong> be taken on ${deviceListText} — other devices will be blocked before you can start.</td>
     </tr>` : '';
 
-  const preheader = reminder
-    ? `Reminder: your proctored exam "${safeTitle}" is open from ${winOpenLabel} to ${winCloseLabel}. Duration ${formatDuration(durationMin)}.`
-    : `Your proctored exam "${safeTitle}" is scheduled for ${dateStr} at ${timeStr}. Duration ${formatDuration(durationMin)}. Open the secure portal to begin.`;
+  // The requirements and the monitoring notice follow the exam's own proctoring settings: an
+  // UNPROCTORED exam needs no camera or microphone (and has no monitoring at all), and a proctored
+  // exam only asks for the hardware it actually requires. A config-less exam keeps the classic copy.
+  const proctoring = exam.proctoringConfig;
+  const unproctored = proctoring?.mode === 'UNPROCTORED';
+  const needsCamera = !unproctored && (proctoring ? !!proctoring.cameraRequired : true);
+  const needsMic = !unproctored && (proctoring ? !!proctoring.microphoneRequired : true);
+  const hardwareHtml = needsCamera && needsMic
+    ? ' with a working <strong>camera</strong> and <strong>microphone</strong>'
+    : needsCamera ? ' with a working <strong>camera</strong>'
+    : needsMic ? ' with a working <strong>microphone</strong>'
+    : '';
+  const permissionText = needsCamera && needsMic ? 'camera and microphone' : needsCamera ? 'camera' : needsMic ? 'microphone' : '';
+  const requirementRow = (html: string) => `
+            <tr>
+              <td style="padding:3px 0;font-size:13px;color:#334155;">&#10003; &nbsp;${html}</td>
+            </tr>`;
+  const requirementRows = [
+    requirementRow(`${deviceListText.charAt(0).toUpperCase() + deviceListText.slice(1)}${hardwareHtml}`) + deviceRestrictionRow,
+    requirementRow(browserLine),
+    permissionText ? requirementRow(`Allow ${permissionText} access when your browser prompts you`) : '',
+    unproctored
+      ? requirementRow('A <strong>stable internet connection</strong> and a quiet place where you can focus')
+      : requirementRow(`A ${needsCamera ? '<strong>well-lit, quiet room</strong>' : '<strong>quiet room</strong>'} and a <strong>stable internet connection</strong>`),
+    unproctored ? '' : requirementRow('Stay on the exam screen — do <strong>not</strong> switch tabs, apps, or leave the window'),
+  ].join('');
+  const monitoredParts = [needsCamera ? 'webcam' : '', needsMic ? 'microphone' : '', 'screen activity'].filter(Boolean);
+  const monitoredText = monitoredParts.length === 1
+    ? monitoredParts[0]
+    : `${monitoredParts.slice(0, -1).join(', ')}${monitoredParts.length > 2 ? ',' : ''} and ${monitoredParts[monitoredParts.length - 1]}`;
+  const noticeBlock = unproctored ? `
+      <!-- Notice -->
+      <tr>
+        <td class="lsc-pad" style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 40px;">
+          <p style="margin:0;font-size:12px;color:#334155;line-height:1.6;">
+            <strong>&#9432; Please note:</strong> This exam is <strong>not proctored</strong> — there is no camera, microphone or screen monitoring. Answer the questions on your own and submit before the exam window closes.
+          </p>
+        </td>
+      </tr>` : `
+      <!-- Warning Banner -->
+      <tr>
+        <td class="lsc-pad" style="background:#fef2f2;border-top:1px solid #fecaca;padding:16px 40px;">
+          <p style="margin:0;font-size:12px;color:#b91c1c;line-height:1.6;">
+            <strong>&#9888; Important:</strong> This exam is proctored by AI. Your ${monitoredText} will be monitored continuously. Any suspicious behaviour will be flagged as a violation and reported to the exam administrator.
+          </p>
+        </td>
+      </tr>`;
+  const examKind = unproctored ? 'exam' : 'proctored exam';
 
-  // Downloadable instructions (linked, not attached — keeps the email tiny and fast to send).
-  const instructionsBlock = `
+  const preheader = reminder
+    ? `Reminder: your ${examKind} "${safeTitle}" is open from ${winOpenLabel} to ${winCloseLabel}. Duration ${formatDuration(durationMin)}.`
+    : `Your ${examKind} "${safeTitle}" is scheduled for ${dateStr} at ${timeStr}. Duration ${formatDuration(durationMin)}. Open the secure portal to begin.`;
+
+  // Downloadable instructions (linked, not attached — keeps the email tiny and fast to send). The
+  // guide is all about camera / microphone / screen permissions and violations, so an unproctored
+  // exam leaves it out rather than contradict the "no monitoring" notice.
+  const instructionsBlock = unproctored ? '' : `
 <tr>
 <td class="lsc-pad" style="background:#ffffff;padding:4px 40px 24px;">
   <table width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;">
@@ -292,9 +350,9 @@ const buildExamEmailContent = (
       <!-- Header -->
       <tr>
         <td class="lsc-pad" style="background:linear-gradient(135deg,#1e3a8a 0%,#2563eb 60%,#3b82f6 100%);padding:36px 40px 28px;">
-          <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:3px;color:#bfdbfe;text-transform:uppercase;">Proctored Online Examination</p>
+          <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:3px;color:#bfdbfe;text-transform:uppercase;">${unproctored ? 'Online Examination' : 'Proctored Online Examination'}</p>
           <h1 class="lsc-h1" style="margin:0;font-size:26px;font-weight:700;color:#ffffff;line-height:1.3;">${safeTitle}</h1>
-          <p style="margin:8px 0 0;font-size:13px;color:#93c5fd;">Secure · Proctored · Online</p>
+          <p style="margin:8px 0 0;font-size:13px;color:#93c5fd;">${unproctored ? 'Secure · Online' : 'Secure · Proctored · Online'}</p>
         </td>
       </tr>
 
@@ -326,35 +384,12 @@ const buildExamEmailContent = (
       <tr>
         <td class="lsc-pad" style="background:#eff6ff;padding:20px 40px;border-top:1px solid #dbeafe;">
           <p style="margin:0 0 10px;font-size:12px;font-weight:700;color:#1d4ed8;text-transform:uppercase;letter-spacing:1px;">Before You Begin — What You Need</p>
-          <table width="100%" cellpadding="0" cellspacing="0">
-            <tr>
-              <td style="padding:3px 0;font-size:13px;color:#334155;">&#10003; &nbsp;${deviceListText.charAt(0).toUpperCase() + deviceListText.slice(1)} with a working <strong>camera</strong> and <strong>microphone</strong></td>
-            </tr>${deviceRestrictionRow}
-            <tr>
-              <td style="padding:3px 0;font-size:13px;color:#334155;">&#10003; &nbsp;${browserLine}</td>
-            </tr>
-            <tr>
-              <td style="padding:3px 0;font-size:13px;color:#334155;">&#10003; &nbsp;Allow camera and microphone access when your browser prompts you</td>
-            </tr>
-            <tr>
-              <td style="padding:3px 0;font-size:13px;color:#334155;">&#10003; &nbsp;A <strong>well-lit, quiet room</strong> and a <strong>stable internet connection</strong></td>
-            </tr>
-            <tr>
-              <td style="padding:3px 0;font-size:13px;color:#334155;">&#10003; &nbsp;Stay on the exam screen — do <strong>not</strong> switch tabs, apps, or leave the window</td>
-            </tr>
+          <table width="100%" cellpadding="0" cellspacing="0">${requirementRows}
           </table>
         </td>
       </tr>
       ${instructionsBlock}
-
-      <!-- Warning Banner -->
-      <tr>
-        <td class="lsc-pad" style="background:#fef2f2;border-top:1px solid #fecaca;padding:16px 40px;">
-          <p style="margin:0;font-size:12px;color:#b91c1c;line-height:1.6;">
-            <strong>&#9888; Important:</strong> This exam is proctored by AI. Your webcam, microphone, and screen activity will be monitored continuously. Any suspicious behaviour will be flagged as a violation and reported to the exam administrator.
-          </p>
-        </td>
-      </tr>
+${noticeBlock}
 
       <!-- Footer -->
       <tr>
@@ -438,6 +473,9 @@ const defaultProctorTiming = {
 };
 
 const defaultProctoringConfig: Exam['proctoringConfig'] = {
+  mode: 'PROCTORED',
+  showAlerts: true,
+  autoTerminate: true,
   cameraRequired: true,
   microphoneRequired: false,
   fullScreenEnforced: true,
@@ -445,6 +483,22 @@ const defaultProctoringConfig: Exam['proctoringConfig'] = {
   violationLimits: { ...defaultViolationLimits },
   proctorTiming: { ...defaultProctorTiming },
 };
+
+// What an exam actually enforces. UNPROCTORED switches every monitoring check off; the server stores
+// it that way too, but the editor keeps the admin's proctored settings in its draft so flipping the
+// mode back and forth while editing doesn't lose them — so normalise on the way out (save, preview).
+const effectiveProctoringConfig = (config: Exam['proctoringConfig']): Exam['proctoringConfig'] => (
+  config.mode === 'UNPROCTORED'
+    ? {
+        ...config,
+        cameraRequired: false,
+        microphoneRequired: false,
+        fullScreenEnforced: false,
+        tabSwitchLimit: 0,
+        violationLimits: { ...defaultViolationLimits },
+      }
+    : config
+);
 
 interface CsvError {
   row: number;
@@ -481,6 +535,31 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   const effectiveCompanyId = isSuperAdmin ? (selectedCompanyId === '' ? null : selectedCompanyId) : null;
   // Extra query string / payload field that pins super-admin requests to the chosen company.
   const companyQuery = isSuperAdmin && effectiveCompanyId ? `?companyId=${effectiveCompanyId}` : '';
+
+  React.useEffect(() => {
+    // templates.php is company-scoped: a super admin must name the company (as every other call here
+    // does), and has nothing to load until one is picked — otherwise it fails with "companyId is required".
+    if (isSuperAdmin && !effectiveCompanyId) {
+      setTemplates([]);
+      return;
+    }
+    let cancelled = false;
+    const loadTemplates = async () => {
+      try {
+        const scope = isSuperAdmin && effectiveCompanyId ? `&companyId=${effectiveCompanyId}` : '';
+        const data = await apiGet<{ templates: NotificationTemplate[] }>(`templates.php?channel=EMAIL${scope}`);
+        if (!cancelled) {
+          setTemplates(data?.templates || []);
+        }
+      } catch (e) {
+        console.error('Failed to load templates:', e);
+      }
+    };
+    loadTemplates();
+    return () => {
+      cancelled = true;
+    };
+  }, [isSuperAdmin, effectiveCompanyId]);
   // Merge the selected companyId into a POST body so the backend scopes the write correctly.
   const withCompany = <T extends object>(body: T): T & { companyId?: number } =>
     isSuperAdmin && effectiveCompanyId ? { ...body, companyId: effectiveCompanyId } : body;
@@ -502,6 +581,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       reconnectLimit: d.reconnectLimit,
       passPercent: d.passPercent,
       proctoringConfig: {
+        mode: 'PROCTORED',
+        showAlerts: true,
+        autoTerminate: true,
         cameraRequired: d.cameraRequired,
         microphoneRequired: d.microphoneRequired,
         fullScreenEnforced: d.fullScreenEnforced,
@@ -567,6 +649,21 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   // New Exam State — seeded from the configurable defaults.
   const [newExam, setNewExam] = useState<Partial<Exam>>(buildExamDefaults);
 
+  // "Add from Question Bank" picker. Banks belong to one company (a super admin sees the company
+  // picked above). Adding a bank appends ALL of its questions, linked rather than copied: they keep
+  // their ids, stay read-only here and are edited in the Question Bank tab.
+  const [bankPickerOpen, setBankPickerOpen] = useState(false);
+  const [bankList, setBankList] = useState<QuestionBank[]>([]);
+  const [bankListLoading, setBankListLoading] = useState(false);
+  const [bankListError, setBankListError] = useState<string | null>(null);
+  const [bankSearch, setBankSearch] = useState('');
+  const [selectedBankId, setSelectedBankId] = useState<number | null>(null);
+  const [bankAdding, setBankAdding] = useState(false);
+  const [bankAddError, setBankAddError] = useState<string | null>(null);
+  const [bankNotice, setBankNotice] = useState<string | null>(null);
+  // Bumped on every bank request so a slow response from an earlier open can't overwrite a newer one.
+  const bankRequestRef = useRef(0);
+
   // "Archive (Hide from list)" must stay hidden after a reload too — the API returns archived exams,
   // so the grid filters them out unless the admin opts to show them.
   const archivedCount = exams.filter(e => e.status === 'ARCHIVED').length;
@@ -579,8 +676,147 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   const jumpToLastQuestionPage = (newTotal: number) =>
     questionPaging.setPage(Math.max(0, Math.ceil(newTotal / questionPaging.pageSize) - 1));
 
+  const bankSearchTerm = bankSearch.trim().toLowerCase();
+  const filteredBanks = bankSearchTerm
+    ? bankList.filter(b => b.name.toLowerCase().includes(bankSearchTerm) || (b.description || '').toLowerCase().includes(bankSearchTerm))
+    : bankList;
+  const bankPaging = usePagination(filteredBanks, `${bankPickerOpen}:${bankSearchTerm}`, 6);
+
   const sections = newExam.sections || [];
   const useSections = sections.length > 0;
+
+  const proctoringConfig: Exam['proctoringConfig'] = { ...defaultProctoringConfig, ...(newExam.proctoringConfig || {}) };
+  const proctoringMode: ProctoringMode = proctoringConfig.mode === 'UNPROCTORED' ? 'UNPROCTORED' : 'PROCTORED';
+  const isUnproctored = proctoringMode === 'UNPROCTORED';
+  const autoTerminate = proctoringConfig.autoTerminate !== false;
+
+  const patchProctoring = (patch: Partial<Exam['proctoringConfig']>) =>
+    setNewExam(prev => ({ ...prev, proctoringConfig: { ...defaultProctoringConfig, ...(prev.proctoringConfig || {}), ...patch } }));
+
+  const setProctoringMode = (mode: ProctoringMode) => {
+    setNewExam(prev => {
+      const current = { ...defaultProctoringConfig, ...(prev.proctoringConfig || {}) };
+      if ((current.mode === 'UNPROCTORED' ? 'UNPROCTORED' : 'PROCTORED') === mode) return prev;
+      let next: Exam['proctoringConfig'] = { ...current, mode };
+      // An exam saved as UNPROCTORED comes back with every monitoring switch off. Turning proctoring
+      // back on should not produce a "proctored" exam that checks nothing, so start from the
+      // workspace's exam defaults in that case.
+      const limits = current.violationLimits || defaultViolationLimits;
+      const nothingOn = !current.cameraRequired && !current.microphoneRequired && !current.fullScreenEnforced && !current.tabSwitchLimit;
+      if (mode === 'PROCTORED' && nothingOn) {
+        const d = settings.examDefaults;
+        next = {
+          ...next,
+          cameraRequired: d.cameraRequired,
+          microphoneRequired: d.microphoneRequired,
+          fullScreenEnforced: d.fullScreenEnforced,
+          tabSwitchLimit: d.tabSwitchLimit,
+          violationLimits: Object.values(limits).every(v => !v) ? { ...d.violationLimits } : limits,
+        };
+      }
+      return { ...prev, proctoringConfig: next };
+    });
+  };
+
+  // Super admin requests carry the company picked in this screen, like every other call here.
+  const companyScopedPath = (path: string) =>
+    isSuperAdmin && effectiveCompanyId ? `${path}${path.includes('?') ? '&' : '?'}companyId=${effectiveCompanyId}` : path;
+
+  const loadQuestionBanks = async () => {
+    const reqId = ++bankRequestRef.current;
+    setBankListLoading(true);
+    setBankListError(null);
+    try {
+      const data = await apiGet<{ banks: QuestionBank[] }>(companyScopedPath('question_banks.php'));
+      if (bankRequestRef.current !== reqId) return;
+      setBankList(Array.isArray(data?.banks) ? data.banks : []);
+    } catch (e) {
+      if (bankRequestRef.current !== reqId) return;
+      setBankList([]);
+      // A bare (non-JSON) 404 means this server has no question-bank endpoint at all.
+      const missing = e instanceof ApiError && e.status === 404 && !e.message.trim().startsWith('{');
+      setBankListError(missing
+        ? 'Question banks are not available on this server yet.'
+        : getApiErrorMessage(e, 'Could not load the question banks. Please try again.'));
+    } finally {
+      if (bankRequestRef.current === reqId) setBankListLoading(false);
+    }
+  };
+
+  const openBankPicker = () => {
+    setBankSearch('');
+    setSelectedBankId(null);
+    setBankAddError(null);
+    setBankPickerOpen(true);
+    loadQuestionBanks();
+  };
+
+  const closeBankPicker = () => {
+    if (bankAdding) return;
+    bankRequestRef.current++;
+    setBankListLoading(false);
+    setBankPickerOpen(false);
+  };
+
+  // The section bank questions land in: the active one, or the first if the active id went stale.
+  const bankTargetSection = useSections
+    ? (sections.find(s => s.id === activeSectionId) || sections[0])
+    : undefined;
+
+  const addSelectedBank = async () => {
+    if (bankAdding || selectedBankId === null) return;
+    const reqId = ++bankRequestRef.current;
+    setBankAdding(true);
+    setBankAddError(null);
+    try {
+      const data = await apiGet<{ bank: QuestionBankDetail }>(
+        companyScopedPath(`question_banks.php?id=${encodeURIComponent(String(selectedBankId))}`),
+      );
+      if (bankRequestRef.current !== reqId) return;
+      const bank = data?.bank;
+      if (!bank || !Array.isArray(bank.questions)) {
+        throw new Error('The server returned an unexpected response for this question bank.');
+      }
+      const targetSectionId = bankTargetSection?.id;
+      const existingIds = new Set((newExam.questions || []).map(q => q.id));
+      const seen = new Set<string>();
+      const toAdd: Question[] = [];
+      bank.questions.forEach(q => {
+        if (!q?.id || existingIds.has(q.id) || seen.has(q.id)) return;
+        seen.add(q.id);
+        toAdd.push({
+          ...q,
+          bankId: q.bankId ?? bank.id,
+          bankName: q.bankName ?? bank.name,
+          sectionId: targetSectionId,
+          sectionTitle: undefined,
+        });
+      });
+      const skipped = bank.questions.length - toAdd.length;
+      if (toAdd.length > 0) {
+        setNewExam(prev => {
+          const prevIds = new Set((prev.questions || []).map(q => q.id));
+          return { ...prev, questions: [...(prev.questions || []), ...toAdd.filter(q => !prevIds.has(q.id))] };
+        });
+        jumpToLastQuestionPage((newExam.questions?.length || 0) + toAdd.length);
+      }
+      const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+      setBankNotice(
+        bank.questions.length === 0
+          ? `“${bank.name}” has no questions yet — add some in the Question Bank tab.`
+          : toAdd.length === 0
+            ? `All ${plural(bank.questions.length, 'question')} from “${bank.name}” are already in this exam.`
+            : `Added ${plural(toAdd.length, 'question')} from “${bank.name}”${bankTargetSection ? ` to ${bankTargetSection.title || 'the active section'}` : ''}.`
+              + (skipped > 0 ? ` ${skipped} already in this exam ${skipped === 1 ? 'was' : 'were'} skipped.` : ''),
+      );
+      setBankPickerOpen(false);
+    } catch (e) {
+      if (bankRequestRef.current !== reqId) return;
+      setBankAddError(getApiErrorMessage(e, 'Could not load this bank’s questions. Please try again.'));
+    } finally {
+      if (bankRequestRef.current === reqId) setBankAdding(false);
+    }
+  };
 
   // Manual Question State — one object holding the fields for every question type.
   // Only the field(s) relevant to `type` are read when building the Question on save.
@@ -615,23 +851,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   const [uploadMsg, setUploadMsg] = useState('');
   const [csvErrors, setCsvErrors] = useState<CsvError[]>([]);
 
-  React.useEffect(() => {
-    let cancelled = false;
-    const loadTemplates = async () => {
-      try {
-        const data = await apiGet<{ templates: NotificationTemplate[] }>('templates.php?channel=EMAIL');
-        if (!cancelled) {
-          setTemplates(data?.templates || []);
-        }
-      } catch (e) {
-        console.error('Failed to load templates:', e);
-      }
-    };
-    loadTemplates();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+
 
   // Super admin: load the company list for the selector, and default to the first company.
   useEffect(() => {
@@ -710,6 +930,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
+      if (bankPickerOpen) { closeBankPicker(); return; }
       if (showMailPreview) { setShowMailPreview(false); return; }
       if (mailComposer) { closeComposer(); return; }
       if (inviteScopeTarget) { setInviteScopeTarget(null); return; }
@@ -717,7 +938,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [showMailPreview, mailComposer, inviteScopeTarget, deleteTarget, deleteBusy]);
+  }, [showMailPreview, mailComposer, inviteScopeTarget, deleteTarget, deleteBusy, bankPickerOpen, bankAdding]);
 
   // Batch Assign State
   const studentBatchInputRef = useRef<HTMLInputElement>(null);
@@ -954,6 +1175,27 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
 
   const inputCls = "w-full px-3 py-2 border rounded-lg outline-none text-sm";
   const smallBtn = "text-xs text-slate-500 hover:text-red-600 px-2";
+
+  // A labelled on/off row (icon, title, one-line explanation, switch) for the proctoring options.
+  const renderSwitchRow = ({ icon, label, hint, checked, onChange }: {
+    icon: React.ReactNode; label: string; hint: string; checked: boolean; onChange: (checked: boolean) => void;
+  }) => (
+    <label
+      className={`flex items-start gap-3 rounded-lg border p-3 cursor-pointer transition-colors focus-within:ring-2 focus-within:ring-blue-200 ${
+        checked ? 'border-blue-200 bg-blue-50/60' : 'border-slate-200 bg-white hover:bg-slate-50'
+      }`}
+    >
+      <span className={`mt-0.5 shrink-0 ${checked ? 'text-[var(--lsc-primary)]' : 'text-slate-400'}`} aria-hidden="true">{icon}</span>
+      <span className="flex-1 min-w-0">
+        <span className="block text-sm font-medium text-slate-800 leading-snug">{label}</span>
+        <span className="block text-[11px] text-slate-500 leading-snug mt-0.5">{hint}</span>
+      </span>
+      <span className={`w-9 h-5 rounded-full relative transition-colors shrink-0 mt-0.5 ${checked ? 'bg-[var(--lsc-primary)]' : 'bg-slate-300'}`}>
+        <input type="checkbox" role="switch" className="sr-only" checked={checked} onChange={e => onChange(e.target.checked)} />
+        <span className={`absolute top-1 left-1 bg-white w-3 h-3 rounded-full transition-transform ${checked ? 'translate-x-4' : 'translate-x-0'}`}></span>
+      </span>
+    </label>
+  );
 
   // The per-question-type answer editor rendered inside the manual-entry form.
   const renderQuestionTypeEditor = () => {
@@ -1294,6 +1536,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       status: newExam.status || 'DRAFT',
       totalMarks: newExam.questions.reduce((sum, q) => sum + q.marks, 0),
       sections: sectionsPayload,
+      proctoringConfig: effectiveProctoringConfig(proctoringConfig),
       assignedBatchIds: newExam.assignedBatchIds || [],
       // Union, not replacement: batch members PLUS anyone assigned individually. The server re-expands
       // the batches too, so students added to an assigned batch since the last save get picked up.
@@ -1388,6 +1631,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     setIsCreating(true);
     setUploadStatus('IDLE');
     setCsvErrors([]);
+    setBankNotice(null);
   };
 
   const resetForm = () => {
@@ -1400,6 +1644,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     editorSnapshotRef.current = JSON.stringify(fresh);
     setUploadStatus('IDLE');
     setCsvErrors([]);
+    setBankNotice(null);
   };
 
   // Cancel used to drop every unsaved edit (a whole question paper) on a single misclick.
@@ -1421,11 +1666,14 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     const questionIdMap = new Map<string, string>();
     const sectionIdMap = new Map<string, string>();
 
-    (source.questions || []).forEach(q => questionIdMap.set(q.id, makeId()));
+    // Question Bank questions are linked, not copied: the copy keeps their ids so it uses the same
+    // shared bank questions. Every other question gets a fresh id (a real copy).
+    const cloneId = (q: Question) => (q.bankId ? q.id : makeId());
+    (source.questions || []).forEach(q => questionIdMap.set(q.id, cloneId(q)));
     (source.sections || []).forEach(section => {
       sectionIdMap.set(section.id, makeId());
       (section.questions || []).forEach(q => {
-        if (!questionIdMap.has(q.id)) questionIdMap.set(q.id, makeId());
+        if (!questionIdMap.has(q.id)) questionIdMap.set(q.id, cloneId(q));
       });
     });
 
@@ -2072,7 +2320,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         }
       });
 
-      const mappedQuestions: Question[] = sourceQuestions.map(q => ({
+      // Imported questions become this exam's own copies (fresh ids), including any that came from a
+      // Question Bank — the file may come from another company whose bank this one can't use — so
+      // the bank tags are dropped along with the old ids.
+      const mappedQuestions: Question[] = sourceQuestions.map(({ bankId: _bankId, bankName: _bankName, ...q }) => ({
         ...q,
         id: (q.id && questionMap.get(q.id)) || makeId(),
         sectionId: q.sectionId ? sectionMap.get(q.sectionId) : undefined
@@ -2083,7 +2334,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         id: (section.id && sectionMap.get(section.id)) || makeId(),
         displayOrder: section.displayOrder ?? idx,
         questions: Array.isArray(section.questions)
-          ? section.questions.map((q: any) => ({
+          ? section.questions.map(({ bankId: _bankId, bankName: _bankName, ...q }: any) => ({
               ...q,
               id: (q.id && questionMap.get(q.id)) || makeId()
             }))
@@ -2274,14 +2525,17 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
             status: 'PUBLISHED',
             questions: newExam.questions || [],
             sections: previewSections,
-            proctoringConfig: newExam.proctoringConfig || {
-              cameraRequired: false,
-              microphoneRequired: false,
-              fullScreenEnforced: false,
-              tabSwitchLimit: 3,
-              violationLimits: { ...defaultViolationLimits },
-              proctorTiming: { ...defaultProctorTiming }
-            }
+            // Preview what candidates will get: an UNPROCTORED draft previews with monitoring off.
+            proctoringConfig: newExam.proctoringConfig
+              ? effectiveProctoringConfig(proctoringConfig)
+              : {
+                  cameraRequired: false,
+                  microphoneRequired: false,
+                  fullScreenEnforced: false,
+                  tabSwitchLimit: 3,
+                  violationLimits: { ...defaultViolationLimits },
+                  proctorTiming: { ...defaultProctorTiming }
+                }
         } as Exam;
         
         const previewStudent: Student = {
@@ -2593,7 +2847,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                                   setNewExam({ ...newExam, sections: updated });
                                 }}
                               />
-                              <p className="text-[10px] text-slate-400 mt-1">0 means all questions in this section.</p>
+                              <p className="text-[10px] text-slate-400 mt-1">0 means all questions in this section. Add a whole bank and set e.g. 25 — with Randomize order on, each candidate gets 25 random ones.</p>
                             </div>
                             <div>
                               <label className="block text-[10px] text-slate-500 mb-1">Shuffle Questions</label>
@@ -2736,10 +2990,19 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                      <p className="text-[10px] text-slate-500 mt-1 leading-tight">
                         {useSections
                           ? 'Section settings override global question limits.'
-                          : newExam.questionCount === 0 
-                            ? `Students see all ${newExam.questions?.length || 0} questions.` 
+                          : newExam.questionCount === 0
+                            ? `Students see all ${newExam.questions?.length || 0} questions.`
                             : `Students see ${newExam.questionCount} questions selected ${newExam.shuffleQuestions ? 'randomly' : 'sequentially'} from the pool.`}
                      </p>
+                     {!useSections && (
+                       <p className="text-[10px] text-slate-500 mt-1.5 leading-tight flex items-start gap-1">
+                         <Info size={11} className="shrink-0 mt-px text-blue-500" aria-hidden="true" />
+                         <span>
+                           Each candidate gets this many random questions from the pool — e.g. add a whole question bank and set 25
+                           {newExam.shuffleQuestions ? '' : ' (turn on Randomize Order so every candidate gets a different set)'}.
+                         </span>
+                       </p>
+                     )}
                   </div>
                 </div>
               </div>
@@ -2747,22 +3010,101 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
 
             <div className="lsc-panel p-6 space-y-4">
               <h3 className="font-semibold text-slate-800 flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></div>
+                <div className={`w-2 h-2 rounded-full ${isUnproctored ? 'bg-slate-400' : 'bg-red-500 animate-pulse'}`}></div>
                 Proctoring Rules
               </h3>
               <div className="space-y-4">
-                <label className="flex items-center gap-2 text-sm text-slate-700">
-                  <input type="checkbox" checked={newExam.proctoringConfig?.cameraRequired} onChange={e => setNewExam({...newExam, proctoringConfig: {...newExam.proctoringConfig!, cameraRequired: e.target.checked}})} />
-                  Require Camera
-                </label>
-                <label className="flex items-center gap-2 text-sm text-slate-700">
-                  <input type="checkbox" checked={newExam.proctoringConfig?.microphoneRequired} onChange={e => setNewExam({...newExam, proctoringConfig: {...newExam.proctoringConfig!, microphoneRequired: e.target.checked}})} />
-                  Require Microphone
-                </label>
-                <label className="flex items-center gap-2 text-sm text-slate-700">
-                  <input type="checkbox" checked={newExam.proctoringConfig?.fullScreenEnforced} onChange={e => setNewExam({...newExam, proctoringConfig: {...newExam.proctoringConfig!, fullScreenEnforced: e.target.checked}})} />
-                  Enforce Fullscreen
-                </label>
+                {/* Proctored vs Unproctored — decides whether any monitoring runs at all. */}
+                <div role="radiogroup" aria-label="Proctoring mode" className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-slate-100 border border-slate-200">
+                  {([
+                    { id: 'PROCTORED', label: 'Proctored', hint: 'Camera, mic & screen checks', icon: <ShieldCheck size={15} /> },
+                    { id: 'UNPROCTORED', label: 'Unproctored', hint: 'Questions only, no monitoring', icon: <ShieldOff size={15} /> },
+                  ] as { id: ProctoringMode; label: string; hint: string; icon: React.ReactNode }[]).map(opt => {
+                    const active = proctoringMode === opt.id;
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        role="radio"
+                        aria-checked={active}
+                        onClick={() => setProctoringMode(opt.id)}
+                        className={`flex flex-col items-start gap-0.5 rounded-lg px-3 py-2 text-left transition-colors ${
+                          active ? 'bg-white shadow-sm ring-1 ring-slate-200 text-slate-900' : 'text-slate-500 hover:text-slate-800'
+                        }`}
+                      >
+                        <span className={`flex items-center gap-1.5 text-sm font-semibold ${active ? (opt.id === 'PROCTORED' ? 'text-[var(--lsc-primary)]' : 'text-slate-800') : ''}`}>
+                          {opt.icon} {opt.label}
+                        </span>
+                        <span className="text-[10px] leading-tight text-slate-500">{opt.hint}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {isUnproctored ? (
+                  <div className="flex items-start gap-2 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600 leading-relaxed">
+                    <ShieldOff size={14} className="shrink-0 mt-0.5 text-slate-500" aria-hidden="true" />
+                    <span>No camera, microphone, screen recording, fullscreen or tab monitoring — candidates just answer the questions.</span>
+                  </div>
+                ) : (
+                  <>
+                    <div>
+                      <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Monitoring</p>
+                      <div className="space-y-2">
+                        {renderSwitchRow({
+                          icon: <Camera size={16} />,
+                          label: 'Camera',
+                          hint: 'Enable the webcam — face, gaze and object detection plus live snapshots.',
+                          checked: !!proctoringConfig.cameraRequired,
+                          onChange: checked => patchProctoring({ cameraRequired: checked }),
+                        })}
+                        {renderSwitchRow({
+                          icon: <Mic size={16} />,
+                          label: 'Microphone',
+                          hint: 'Listens for sustained talking near the candidate.',
+                          checked: !!proctoringConfig.microphoneRequired,
+                          onChange: checked => patchProctoring({ microphoneRequired: checked }),
+                        })}
+                        {renderSwitchRow({
+                          icon: <Maximize size={16} />,
+                          label: 'Fullscreen',
+                          hint: 'Keeps the exam in fullscreen and counts every exit.',
+                          checked: !!proctoringConfig.fullScreenEnforced,
+                          onChange: checked => patchProctoring({ fullScreenEnforced: checked }),
+                        })}
+                      </div>
+                      {!proctoringConfig.cameraRequired && (
+                        <p className="text-[11px] text-amber-600 mt-2 flex items-start gap-1">
+                          <AlertCircle size={12} className="shrink-0 mt-px" /> Camera off — no face, gaze or object checks will run for this exam.
+                        </p>
+                      )}
+                    </div>
+
+                    <div>
+                      <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">When a violation happens</p>
+                      <div className="space-y-2">
+                        {renderSwitchRow({
+                          icon: <Bell size={16} />,
+                          label: 'Show violation alerts to the candidate',
+                          hint: proctoringConfig.showAlerts !== false
+                            ? 'Candidates see a warning each time a violation is recorded.'
+                            : 'Off — violations are recorded silently; candidates see no warnings.',
+                          checked: proctoringConfig.showAlerts !== false,
+                          onChange: checked => patchProctoring({ showAlerts: checked }),
+                        })}
+                        {renderSwitchRow({
+                          icon: <XCircle size={16} />,
+                          label: 'End the exam automatically when a violation limit is reached',
+                          hint: autoTerminate
+                            ? 'The attempt is terminated as soon as any limit below is reached.'
+                            : 'Off — limits only flag the attempt for review; the candidate can finish.',
+                          checked: autoTerminate,
+                          onChange: checked => patchProctoring({ autoTerminate: checked }),
+                        })}
+                      </div>
+                    </div>
+                  </>
+                )}
 
                 {/* Allowed Devices — restrict which device classes may sit this exam. */}
                 {(() => {
@@ -2832,6 +3174,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                       Number of times a student can reconnect to an active session after disconnect.
                     </p>
                   </div>
+                  {!isUnproctored && (<>
                   <div>
                     <label className="text-sm text-slate-700 font-medium block mb-1">Tab Switch Limit</label>
                     <input
@@ -2848,7 +3191,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                       })}
                     />
                     <p className="text-[10px] text-slate-500 mt-1">
-                      Kicks the student after this many tab switches. Use 0 to disable.
+                      {autoTerminate ? 'Ends the attempt' : 'Flags the attempt for review'} after this many tab switches. Use 0 to disable.
                     </p>
                   </div>
                   <div>
@@ -2914,7 +3257,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                       })}
                     />
                     <p className="text-[10px] text-slate-500 mt-1">
-                      Auto-kick after this many fullscreen exits. Use 0 to disable.
+                      {autoTerminate ? 'Ends the attempt' : 'Flags the attempt for review'} after this many fullscreen exits. Use 0 to disable.
                     </p>
                   </div>
                   <div>
@@ -2936,10 +3279,12 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                       })}
                     />
                     <p className="text-[10px] text-slate-500 mt-1">
-                      Auto-kick after this many copy/paste attempts. Use 0 to disable.
+                      {autoTerminate ? 'Ends the attempt' : 'Flags the attempt for review'} after this many copy/paste attempts. Use 0 to disable.
                     </p>
                   </div>
+                  </>)}
                 </div>
+                {!isUnproctored && (
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
                   <div>
                     <label className="text-sm text-slate-700 font-medium block mb-1">Gaze Away Sensitivity (sec)</label>
@@ -2988,6 +3333,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                     </p>
                   </div>
                 </div>
+                )}
               </div>
             </div>
 
@@ -3314,8 +3660,44 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                 </div>
                 
                 <div className="p-6 space-y-8">
+                  {/* Question Bank: link a whole shared bank instead of re-typing or re-uploading it. */}
+                  <div className="space-y-3">
+                    <div className="rounded-lg border border-blue-100 bg-blue-50/50 p-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0">
+                        <h4 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
+                          <Library size={16} className="text-[var(--lsc-primary)]" aria-hidden="true" /> Question Bank
+                        </h4>
+                        <p className="text-xs text-slate-500 mt-1 leading-snug">
+                          Reuse a shared bank. Its questions stay linked — edit them in the Question Bank tab and every exam using them updates.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={openBankPicker}
+                        disabled={isPublished}
+                        className="shrink-0 px-4 py-2 lsc-button-ghost text-sm flex items-center justify-center gap-2 disabled:opacity-50"
+                      >
+                        <Library size={16} aria-hidden="true" /> Add from Question Bank
+                      </button>
+                    </div>
+                    {bankNotice && (
+                      <div className="p-3 bg-teal-50 text-teal-700 text-sm rounded-lg flex items-start gap-2 border border-teal-100" role="status">
+                        <CheckCircle size={16} className="shrink-0 mt-0.5" aria-hidden="true" />
+                        <span className="flex-1">{bankNotice}</span>
+                        <button
+                          type="button"
+                          onClick={() => setBankNotice(null)}
+                          className="shrink-0 text-teal-600 hover:text-teal-800"
+                          aria-label="Dismiss message"
+                        >
+                          <XCircle size={16} />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
                   {/* Manual Entry Form */}
-                  <div className="space-y-4">
+                  <div className="space-y-4 border-t border-slate-100 pt-6">
                      <div className="flex justify-between items-center">
                         <h4 className="text-sm font-semibold text-slate-600 uppercase tracking-wide">Manual Entry</h4>
                         
@@ -3499,8 +3881,12 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                {questionPaging.pageItems.map((q, pageIdx) => {
                  // Numbering must stay global — Q1 is the first question of the exam, not of the page.
                  const idx = questionPaging.page * questionPaging.pageSize + pageIdx;
+                 // Question Bank questions are shared with other exams, so this editor only links or
+                 // unlinks them; their content (incl. marks / word limit) is edited in the bank.
+                 const fromBank = !!q.bankId;
+                 const bankLockTitle = fromBank ? 'Shared Question Bank question — edit it in the Question Bank tab' : undefined;
                  return (
-                 <div key={q.id} className="bg-white p-4 rounded-lg border border-slate-200 shadow-sm relative group">
+                 <div key={q.id} className={`bg-white p-4 rounded-lg border shadow-sm relative group ${fromBank ? 'border-blue-100' : 'border-slate-200'}`}>
                    {!isPublished && (
                      // Hover-only reveal left the delete control invisible on touch screens and to
                      // keyboard users; it now stays visible on small screens and on focus.
@@ -3508,17 +3894,23 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                        <button
                          onClick={() => removeQuestion(q.id)}
                          className="text-red-500 hover:bg-red-50 p-1 rounded transition-colors"
-                         aria-label={`Delete question ${idx + 1}`}
-                         title="Delete question"
+                         aria-label={fromBank ? `Remove question ${idx + 1} from this exam` : `Delete question ${idx + 1}`}
+                         title={fromBank ? 'Remove from this exam (stays in the Question Bank)' : 'Delete question'}
                        >
                          <Trash2 size={16} />
                        </button>
                      </div>
                    )}
-                   <div className="flex gap-3 mb-2 flex-wrap items-center">
+                   <div className="flex gap-3 mb-2 flex-wrap items-center pr-8">
                      <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded text-xs font-mono">Q{idx + 1}</span>
                      <span className="bg-blue-50 text-blue-600 px-2 py-0.5 rounded text-xs font-mono">{q.type}</span>
                      <span className="bg-teal-50 text-teal-600 px-2 py-0.5 rounded text-xs font-mono">{q.marks} marks</span>
+                     {fromBank && (
+                       <span className="lsc-chip-primary max-w-full" title={`From the “${q.bankName || 'Question Bank'}” question bank`}>
+                         <Library size={12} className="shrink-0" aria-hidden="true" />
+                         <span className="truncate">From bank: {q.bankName || `#${q.bankId}`}</span>
+                       </span>
+                     )}
                      {q.type !== QuestionType.SHORT_TEXT && q.type !== QuestionType.LONG_TEXT && q.type !== QuestionType.TEXT && (
                        // Editable in place, same reasoning as the word-limit field below: a penalty
                        // often gets tuned while reviewing the paper, not just at authoring time.
@@ -3529,7 +3921,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                            min="0"
                            step="0.25"
                            placeholder="0"
-                           disabled={isPublished}
+                           disabled={isPublished || fromBank}
+                           title={bankLockTitle}
+                           aria-label={`Negative marks for question ${idx + 1}`}
                            value={q.negativeMarks ?? 0}
                            onChange={e => {
                              const parsed = parseFloat(e.target.value);
@@ -3555,7 +3949,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                            type="number"
                            min="1"
                            placeholder="none"
-                           disabled={isPublished}
+                           disabled={isPublished || fromBank}
+                           title={bankLockTitle}
+                           aria-label={`Word limit for question ${idx + 1}`}
                            value={q.wordLimit ?? ''}
                            onChange={e => {
                              const parsed = parseInt(e.target.value, 10);
@@ -3603,20 +3999,174 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                    )}
                    <p className="text-slate-800 font-medium mb-3 whitespace-pre-wrap">{q.text}</p>
                    {renderAddedQuestionAnswer(q)}
+                   {fromBank && (
+                     <p className="mt-2 text-[11px] text-slate-500 flex items-start gap-1">
+                       <Lock size={11} className="shrink-0 mt-px" aria-hidden="true" />
+                       <span>Read-only here — edit it in the Question Bank tab. Removing it only takes it out of this exam.</span>
+                     </p>
+                   )}
                  </div>
                  );
                })}
                <Pagination state={questionPaging} label="questions" hidePageSize />
 
                {newExam.questions?.length === 0 && (
-                 <div className="text-center py-8 text-slate-400 border-2 border-dashed border-slate-200 rounded-xl">
-                   No questions added yet. Use the manual form or upload a CSV.
+                 <div className="text-center py-8 px-4 text-slate-400 border-2 border-dashed border-slate-200 rounded-xl">
+                   No questions added yet. Add a question bank, use the manual form or upload a CSV.
                  </div>
                )}
              </div>
           </div>
         </div>
       </div>
+
+      {bankPickerOpen && (() => {
+        const selectedBank = bankList.find(b => b.id === selectedBankId) || null;
+        const selectedCount = selectedBank ? Math.max(0, Number(selectedBank.questionCount) || 0) : 0;
+        return (
+          <div
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/50 p-4"
+            onClick={closeBankPicker}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="bank-picker-title"
+              onClick={e => e.stopPropagation()}
+              className="w-full max-w-lg max-h-[90vh] rounded-2xl bg-white shadow-xl border border-slate-200 flex flex-col overflow-hidden"
+            >
+              <div className="p-4 border-b border-slate-100 flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h3 id="bank-picker-title" className="text-lg font-semibold text-slate-900 flex items-center gap-2">
+                    <Library size={18} className="text-[var(--lsc-primary)]" aria-hidden="true" /> Add from Question Bank
+                  </h3>
+                  <p className="text-sm text-slate-500 mt-0.5">
+                    Pick a bank to add all of its questions{bankTargetSection ? <> to <span className="font-medium text-slate-700">{bankTargetSection.title || 'the active section'}</span></> : ''}.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeBankPicker}
+                  disabled={bankAdding}
+                  className="shrink-0 p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-600 disabled:opacity-50"
+                  aria-label="Close question bank picker"
+                >
+                  <XCircle size={20} />
+                </button>
+              </div>
+
+              <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+                {bankListLoading ? (
+                  <div className="flex items-center justify-center gap-2 text-sm text-slate-500 py-10">
+                    <Loader2 size={16} className="animate-spin" /> Loading question banks…
+                  </div>
+                ) : bankListError ? (
+                  <div className="p-3 rounded-lg bg-rose-50 border border-rose-100 text-sm text-rose-700 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between" role="alert">
+                    <span className="flex items-start gap-2"><AlertCircle size={16} className="shrink-0 mt-0.5" /> {bankListError}</span>
+                    <button type="button" onClick={loadQuestionBanks} className="shrink-0 self-start px-3 py-1.5 rounded-lg border border-rose-200 bg-white text-xs font-semibold text-rose-700 hover:bg-rose-50">
+                      Try again
+                    </button>
+                  </div>
+                ) : bankList.length === 0 ? (
+                  <div className="text-center py-8 px-4 border-2 border-dashed border-slate-200 rounded-xl">
+                    <Library size={28} className="mx-auto text-slate-300 mb-2" aria-hidden="true" />
+                    <p className="text-sm font-semibold text-slate-700">No question banks yet</p>
+                    <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                      Create one in the <span className="font-semibold text-slate-700">Question Bank</span> tab in the sidebar, then come back here.
+                      Save this exam as a draft first so you don’t lose your changes.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="relative">
+                      <Search className="absolute left-2.5 top-2.5 text-slate-400" size={14} aria-hidden="true" />
+                      <input
+                        type="text"
+                        placeholder="Search banks…"
+                        aria-label="Search question banks"
+                        className="w-full pl-8 pr-3 py-2 text-sm border rounded-lg outline-none"
+                        value={bankSearch}
+                        onChange={e => setBankSearch(e.target.value)}
+                      />
+                    </div>
+                    {filteredBanks.length === 0 ? (
+                      <p className="text-sm text-slate-500 text-center py-6">No banks match “{bankSearch.trim()}”.</p>
+                    ) : (
+                      <div role="radiogroup" aria-label="Question banks" className="space-y-2">
+                        {bankPaging.pageItems.map(bank => {
+                          const active = bank.id === selectedBankId;
+                          const count = Math.max(0, Number(bank.questionCount) || 0);
+                          return (
+                            <button
+                              key={bank.id}
+                              type="button"
+                              role="radio"
+                              aria-checked={active}
+                              onClick={() => { setSelectedBankId(bank.id); setBankAddError(null); }}
+                              className={`w-full text-left px-3 py-2.5 rounded-lg border transition-colors ${
+                                active ? 'border-[var(--lsc-primary)] bg-blue-50 ring-1 ring-[var(--lsc-primary)]/30' : 'border-slate-200 bg-white hover:bg-slate-50'
+                              }`}
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <span className={`text-sm font-medium break-words min-w-0 ${active ? 'text-slate-900' : 'text-slate-700'}`}>{bank.name}</span>
+                                <span className={`shrink-0 text-xs font-semibold ${active ? 'text-[var(--lsc-primary)]' : 'text-slate-500'}`}>
+                                  {count} question{count === 1 ? '' : 's'}
+                                </span>
+                              </div>
+                              {bank.description && (
+                                <p className="text-xs text-slate-500 mt-0.5 line-clamp-2 break-words">{bank.description}</p>
+                              )}
+                              {bank.examCount > 0 && (
+                                <p className="text-[11px] text-slate-400 mt-0.5">Used in {bank.examCount} exam{bank.examCount === 1 ? '' : 's'}</p>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                    {bankPaging.totalPages > 1 && <Pagination state={bankPaging} label="banks" hidePageSize />}
+                  </>
+                )}
+
+                {bankAddError && (
+                  <div className="p-3 rounded-lg bg-rose-50 border border-rose-100 text-xs text-rose-700 flex items-start gap-2" role="alert">
+                    <AlertCircle size={14} className="shrink-0 mt-0.5" /> {bankAddError}
+                  </div>
+                )}
+              </div>
+
+              <div className="p-4 border-t border-slate-100 bg-slate-50 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <p className="text-xs text-slate-500 min-w-0 flex-1">
+                  {selectedBank
+                    ? (selectedCount === 0 ? 'This bank has no questions yet.' : 'Questions already in this exam are skipped.')
+                    : bankList.length > 0 && !bankListLoading && !bankListError
+                      ? 'Then set the question count to give each candidate a random subset.'
+                      : ''}
+                </p>
+                <div className="flex items-center gap-2 justify-end shrink-0">
+                  <button
+                    type="button"
+                    onClick={closeBankPicker}
+                    disabled={bankAdding}
+                    className="px-4 py-2 rounded-lg text-sm text-slate-500 hover:bg-slate-100 disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={addSelectedBank}
+                    disabled={!selectedBank || selectedCount === 0 || bankAdding || bankListLoading}
+                    className="px-4 py-2 lsc-button-primary text-sm whitespace-nowrap flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {bankAdding ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+                    {bankAdding ? 'Adding…' : selectedBank ? `Add all ${selectedCount} question${selectedCount === 1 ? '' : 's'}` : 'Add questions'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {showMailPreview && (() => {
         const mailPreviewExam = {
@@ -3625,6 +4175,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
           startTime: newExam.startTime || Date.now(),
           endTime: newExam.endTime || Date.now() + 3600000,
           durationMinutes: newExam.durationMinutes || 60,
+          proctoringConfig: effectiveProctoringConfig(proctoringConfig),
         } as Exam;
         const sampleLink = `${window.location.origin}?token=SAMPLE-TOKEN`;
         const { subject, body } = buildExamEmailContent(
@@ -4039,12 +4590,19 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
           >
             <div className="p-5 border-b border-slate-100 relative">
               <div className="flex justify-between items-start mb-2">
-                <span className={`px-2 py-1 text-xs font-bold rounded uppercase tracking-wide ${
-                  exam.status === 'PUBLISHED' ? 'bg-teal-100 text-teal-700' :
-                  exam.status === 'DRAFT' ? 'bg-orange-100 text-orange-700' : 'bg-slate-100 text-slate-600'
-                }`}>
-                  {exam.status}
-                </span>
+                <div className="flex flex-wrap items-center gap-2 min-w-0">
+                  <span className={`px-2 py-1 text-xs font-bold rounded uppercase tracking-wide ${
+                    exam.status === 'PUBLISHED' ? 'bg-teal-100 text-teal-700' :
+                    exam.status === 'DRAFT' ? 'bg-orange-100 text-orange-700' : 'bg-slate-100 text-slate-600'
+                  }`}>
+                    {exam.status}
+                  </span>
+                  {exam.proctoringConfig?.mode === 'UNPROCTORED' && (
+                    <span className="lsc-chip-neutral" title="No camera, microphone, screen or tab monitoring">
+                      <ShieldOff size={12} aria-hidden="true" /> Unproctored
+                    </span>
+                  )}
+                </div>
                 <button
                   onClick={e => {
                     e.stopPropagation();

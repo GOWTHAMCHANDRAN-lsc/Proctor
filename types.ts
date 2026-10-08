@@ -102,6 +102,13 @@ export interface Question {
   wordLimit?: number | null;
   sectionId?: string;
   sectionTitle?: string;
+  /**
+   * Set when this question lives in a Question Bank (server-computed, read-only). Bank questions are
+   * shared by every exam that uses them, so the exam editor shows them read-only — they are edited
+   * in the Question Bank tab.
+   */
+  bankId?: number | null;
+  bankName?: string | null;
 }
 
 export interface NotificationConfig {

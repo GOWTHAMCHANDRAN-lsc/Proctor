@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Batch, Exam, ExamMailKind, Question, QuestionType, Student, NotificationTemplate, UserRole, CompanyDirectoryRecord } from '../../types';
-import { Plus, Trash2, Save, FileSpreadsheet, Upload, Download, CheckCircle, AlertCircle, Share2, Calendar, Clock, XCircle, FileWarning, Users, Search, Lock, Mail, Send, Loader2, Shuffle, Bell, ListOrdered, Eye, AlignLeft, CheckSquare, Copy, Monitor, Tablet, Smartphone, Pencil, Award } from 'lucide-react';
+import { Plus, Trash2, Save, FileSpreadsheet, Upload, Download, CheckCircle, AlertCircle, Share2, Calendar, Clock, XCircle, FileWarning, Users, Search, Lock, Mail, Send, Loader2, Shuffle, Bell, ListOrdered, Eye, Copy, Monitor, Tablet, Smartphone, Pencil, Award } from 'lucide-react';
 import type { DeviceType } from '../../types';
 import { ExamTake } from '../student/ExamTake';
 import { apiGet, apiPost } from '../../services/api';
@@ -93,6 +93,16 @@ export const resolveExamMailTemplate = (exam: Partial<Exam>, reminder: boolean):
   };
 };
 
+// Student names (CSV / LMS webhook imports) and exam titles are plain text; escape them wherever they
+// land in the email HTML so a name like "<b>Ana</b>" or "R&D" can't inject markup or break the layout.
+// The admin-authored message template itself is left as-is (saved templates may carry HTML).
+const escapeEmailHtml = (value: string) => value
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;');
+
 // Builds the exact invitation/reminder email HTML sent by dispatchEmails. Also used by the
 // live preview in the Email Notifications editor and the Mail Composer, so what admins see is
 // exactly what sends. `override` lets the composer preview unsaved edits without persisting them.
@@ -122,11 +132,16 @@ const buildExamEmailContent = (
   const winCloseLabel = formatScheduleLabel(exam.endTime, examTz);
 
   const startLabel = `${dateStr} at ${timeStr}`;
-  const fillTemplate = (tpl: string) => tpl
-    .replace(/\{StudentName\}/g, recipientName)
-    .replace(/\{ExamTitle\}/g, exam.title)
-    .replace(/\{StartTime\}/g, startLabel)
-    .replace(/\{Link\}/g, link);
+  const safeName = escapeEmailHtml(recipientName);
+  const safeTitle = escapeEmailHtml(exam.title);
+  const safeLink = escapeEmailHtml(link);
+  // Function replacers: a plain replacement string would expand "$&" / "$1" sequences that can
+  // legitimately appear in a title or name. `html` escapes the substituted values for the body.
+  const fillTemplate = (tpl: string, html = false) => tpl
+    .replace(/\{StudentName\}/g, () => (html ? safeName : recipientName))
+    .replace(/\{ExamTitle\}/g, () => (html ? safeTitle : exam.title))
+    .replace(/\{StartTime\}/g, () => startLabel)
+    .replace(/\{Link\}/g, () => (html ? safeLink : link));
 
   // Composer edits (override) win over the saved per-exam template, which wins over the default.
   const resolved = resolveExamMailTemplate(exam, reminder);
@@ -136,8 +151,8 @@ const buildExamEmailContent = (
   // In the HTML body the candidate's name is emphasised, matching how the salutation has always
   // rendered. The subject stays plain text.
   const message = recipientName.trim() === ''
-    ? fillTemplate(messageTpl)
-    : fillTemplate(messageTpl).split(recipientName).join(`<strong>${recipientName}</strong>`);
+    ? fillTemplate(messageTpl, true)
+    : fillTemplate(messageTpl, true).split(safeName).join(`<strong>${safeName}</strong>`);
 
   // The message carries its own greeting ("Dear {StudentName},"), so it is rendered on its own —
   // no separate intro block, which is what used to produce the doubled greeting. The first
@@ -176,7 +191,7 @@ const buildExamEmailContent = (
             </td>
             <td class="lsc-stack" style="padding:16px 24px;width:50%;">
               <p style="margin:0 0 3px;font-size:10px;font-weight:700;letter-spacing:2px;color:#94a3b8;text-transform:uppercase;">Candidate</p>
-              <p style="margin:0;font-size:14px;font-weight:600;color:#0f172a;">${recipientName}</p>
+              <p style="margin:0;font-size:14px;font-weight:600;color:#0f172a;">${safeName}</p>
             </td>
           </tr>
         </table>
@@ -188,11 +203,11 @@ const buildExamEmailContent = (
 <!-- CTA Button -->
 <tr>
 <td class="lsc-pad" style="background:#ffffff;padding:8px 40px 32px;text-align:center;">
-  <a href="${link}" target="_blank" class="lsc-cta" style="display:inline-block;background:linear-gradient(135deg,#1d4ed8,#2563eb);color:#ffffff;font-size:16px;font-weight:700;text-decoration:none;padding:16px 48px;border-radius:8px;letter-spacing:0.3px;box-shadow:0 4px 14px rgba(37,99,235,0.4);">
+  <a href="${safeLink}" target="_blank" class="lsc-cta" style="display:inline-block;background:linear-gradient(135deg,#1d4ed8,#2563eb);color:#ffffff;font-size:16px;font-weight:700;text-decoration:none;padding:16px 48px;border-radius:8px;letter-spacing:0.3px;box-shadow:0 4px 14px rgba(37,99,235,0.4);">
     Open Exam Portal &rarr;
   </a>
   <p style="margin:16px 0 0;font-size:12px;color:#94a3b8;">Button not working? Copy and paste this link into your browser:</p>
-  <p style="margin:6px 0 0;"><a href="${link}" style="font-size:12px;color:#2563eb;word-break:break-all;">${link}</a></p>
+  <p style="margin:6px 0 0;"><a href="${safeLink}" style="font-size:12px;color:#2563eb;word-break:break-all;">${safeLink}</a></p>
 </td>
 </tr>`;
 
@@ -225,8 +240,8 @@ const buildExamEmailContent = (
     </tr>` : '';
 
   const preheader = reminder
-    ? `Reminder: your proctored exam "${exam.title}" is open from ${winOpenLabel} to ${winCloseLabel}. Duration ${formatDuration(durationMin)}.`
-    : `Your proctored exam "${exam.title}" is scheduled for ${dateStr} at ${timeStr}. Duration ${formatDuration(durationMin)}. Open the secure portal to begin.`;
+    ? `Reminder: your proctored exam "${safeTitle}" is open from ${winOpenLabel} to ${winCloseLabel}. Duration ${formatDuration(durationMin)}.`
+    : `Your proctored exam "${safeTitle}" is scheduled for ${dateStr} at ${timeStr}. Duration ${formatDuration(durationMin)}. Open the secure portal to begin.`;
 
   // Downloadable instructions (linked, not attached — keeps the email tiny and fast to send).
   const instructionsBlock = `
@@ -251,7 +266,7 @@ const buildExamEmailContent = (
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <meta name="x-apple-disable-message-reformatting" />
 <meta name="color-scheme" content="light only" />
-<title>${subject}</title>
+<title>${escapeEmailHtml(subject)}</title>
 <style>
   body { margin:0; padding:0; -webkit-text-size-adjust:100%; }
   img { border:0; line-height:100%; outline:none; text-decoration:none; }
@@ -277,7 +292,7 @@ const buildExamEmailContent = (
       <tr>
         <td class="lsc-pad" style="background:linear-gradient(135deg,#1e3a8a 0%,#2563eb 60%,#3b82f6 100%);padding:36px 40px 28px;">
           <p style="margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:3px;color:#bfdbfe;text-transform:uppercase;">Proctored Online Examination</p>
-          <h1 class="lsc-h1" style="margin:0;font-size:26px;font-weight:700;color:#ffffff;line-height:1.3;">${exam.title}</h1>
+          <h1 class="lsc-h1" style="margin:0;font-size:26px;font-weight:700;color:#ffffff;line-height:1.3;">${safeTitle}</h1>
           <p style="margin:8px 0 0;font-size:13px;color:#93c5fd;">Secure · Proctored · Online</p>
         </td>
       </tr>
@@ -296,7 +311,7 @@ const buildExamEmailContent = (
             <tr>
               <td style="padding:20px 24px;border-bottom:1px solid #e2e8f0;">
                 <p style="margin:0 0 3px;font-size:10px;font-weight:700;letter-spacing:2px;color:#94a3b8;text-transform:uppercase;">Exam</p>
-                <p style="margin:0;font-size:15px;font-weight:600;color:#0f172a;">${exam.title}</p>
+                <p style="margin:0;font-size:15px;font-weight:600;color:#0f172a;">${safeTitle}</p>
               </td>
             </tr>
             ${detailsGrid}
@@ -368,6 +383,33 @@ const readTextFile = async (file: File) => {
     return decoder.decode(buffer).replace(/^\uFEFF/, '');
   }
 };
+
+// apiGet/apiPost throw the raw response body, which for this API is JSON like {"error":"..."}.
+// Surface the server's own reason (e.g. "endTime must be later than startTime.") instead of either a
+// generic message or a raw JSON blob; fall back when the body is HTML/JSON without an error field.
+const apiErrorMessage = (e: unknown, fallback: string): string => {
+  const raw = (e instanceof Error ? e.message : typeof e === 'string' ? e : '').trim();
+  if (!raw) return fallback;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed.error === 'string' && parsed.error.trim() ? parsed.error.trim() : fallback;
+  } catch {
+    return raw.startsWith('<') || raw.length > 300 ? fallback : raw;
+  }
+};
+
+// Build a CSV download href. encodeURIComponent (not encodeURI) is required: encodeURI leaves '#'
+// unescaped, and browsers treat '#' in a data: URL as the start of a fragment — silently truncating
+// the file at the first '#' (e.g. the question template's '#' guide rows, or a '#' in an exam title).
+const csvDataUri = (content: string) => 'data:text/csv;charset=utf-8,' + encodeURIComponent(String.fromCharCode(0xFEFF) + content);
+
+// Quote one CSV cell, doubling embedded quotes so a name like `Ann "Annie" Lee` stays one column.
+const csvCell = (value: unknown) => `"${String(value ?? '').replace(/"/g, '""')}"`;
+
+// datetime-local value that never throws: Intl throws RangeError on an Invalid Date, and there is no
+// error boundary above this screen, so a NaN/undefined instant would blank the whole admin panel.
+const zonedInputValue = (epoch: number | undefined, tz: string): string =>
+  typeof epoch === 'number' && Number.isFinite(epoch) ? epochToZonedInput(epoch, tz) : '';
 
 const getAdminCompanyId = () => {
   if (typeof window === 'undefined') return 1;
@@ -517,6 +559,15 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   const [selectedTemplateId, setSelectedTemplateId] = useState<number | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Exam | null>(null);
   const [deleteBusy, setDeleteBusy] = useState(false);
+  // In-flight guards: each of these POSTs/downloads used to be re-triggerable by a double click
+  // (a double-clicked Save on a NEW exam minted two client ids and created the exam twice).
+  const [savingExam, setSavingExam] = useState(false);
+  const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
+  const [exportingLinksId, setExportingLinksId] = useState<string | null>(null);
+  // Archived exams are hidden from the grid unless the admin asks to see them.
+  const [showArchived, setShowArchived] = useState(false);
+  // JSON snapshot of the exam as it was when the editor opened, so Cancel can warn about unsaved edits.
+  const editorSnapshotRef = useRef<string>('');
   // Set when an exam has both already-invited and newly-assigned students: the admin picks who to mail.
   const [inviteScopeTarget, setInviteScopeTarget] = useState<{ exam: Exam; recipients: ExamRecipient[]; pending: ExamRecipient[] } | null>(null);
   // Per-exam Mail Composer: pick the audience (e.g. only students who never attempted), edit the
@@ -543,8 +594,13 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   // New Exam State — seeded from the configurable defaults.
   const [newExam, setNewExam] = useState<Partial<Exam>>(buildExamDefaults);
 
+  // "Archive (Hide from list)" must stay hidden after a reload too — the API returns archived exams,
+  // so the grid filters them out unless the admin opts to show them.
+  const archivedCount = exams.filter(e => e.status === 'ARCHIVED').length;
+  const visibleExams = showArchived ? exams : exams.filter(e => e.status !== 'ARCHIVED');
+
   // The exam grid and the editor's question list both grow without bound; each pages on its own.
-  const examPaging = usePagination(exams, '');
+  const examPaging = usePagination(visibleExams, showArchived ? 'all' : 'active');
   const questionPaging = usePagination(newExam.questions || [], newExam.id || '');
   // Show the page a freshly appended question landed on.
   const jumpToLastQuestionPage = (newTotal: number) =>
@@ -676,6 +732,20 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     };
   }, [isSuperAdmin, effectiveCompanyId]);
 
+  // Escape closes the top-most dialog (none of them handled it). The composer asks before discarding
+  // unsaved edits, and the remove dialog stays put while its request is in flight.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (showMailPreview) { setShowMailPreview(false); return; }
+      if (mailComposer) { closeComposer(); return; }
+      if (inviteScopeTarget) { setInviteScopeTarget(null); return; }
+      if (deleteTarget && !deleteBusy) setDeleteTarget(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showMailPreview, mailComposer, inviteScopeTarget, deleteTarget, deleteBusy]);
+
   // Batch Assign State
   const studentBatchInputRef = useRef<HTMLInputElement>(null);
   const examImportRef = useRef<HTMLInputElement>(null);
@@ -722,16 +792,23 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     const t = manualQ.type;
     switch (t) {
       case QuestionType.MCQ: {
-        const opts = manualQ.options.map(o => o.trim());
-        if (opts.filter(Boolean).length < 2) return { error: 'Provide at least 2 options.' };
-        if (!opts[manualQ.correctIdx]?.trim()) return { error: 'The correct option cannot be empty.' };
-        return { fields: { options: opts, correctOptionIndex: manualQ.correctIdx } };
+        // Blank option rows (e.g. the 4th default slot on a 3-choice question) are dropped — they used
+        // to ship to candidates as empty, clickable answer cards — and the correct index is remapped
+        // onto the compacted list.
+        const raw = manualQ.options.map(o => o.trim());
+        const keptIdx = raw.map((o, i) => (o ? i : -1)).filter(i => i >= 0);
+        if (keptIdx.length < 2) return { error: 'Provide at least 2 options.' };
+        if (manualQ.correctIdx < 0 || !raw[manualQ.correctIdx]) return { error: 'Mark a non-empty option as the correct answer.' };
+        return { fields: { options: keptIdx.map(i => raw[i]), correctOptionIndex: keptIdx.indexOf(manualQ.correctIdx) } };
       }
       case QuestionType.MULTI_SELECT: {
-        const opts = manualQ.options.map(o => o.trim());
-        if (opts.filter(Boolean).length < 2) return { error: 'Provide at least 2 options.' };
+        const raw = manualQ.options.map(o => o.trim());
+        const keptIdx = raw.map((o, i) => (o ? i : -1)).filter(i => i >= 0);
+        if (keptIdx.length < 2) return { error: 'Provide at least 2 options.' };
         if (manualQ.correctIndices.length < 1) return { error: 'Select at least one correct option.' };
-        return { fields: { options: opts, answerKey: { correctIndices: [...manualQ.correctIndices].sort((a, b) => a - b) } } };
+        if (manualQ.correctIndices.some(i => !raw[i])) return { error: 'A ticked correct option is empty — fill it in or untick it.' };
+        const correctIndices = manualQ.correctIndices.map(i => keptIdx.indexOf(i)).sort((a, b) => a - b);
+        return { fields: { options: keptIdx.map(i => raw[i]), answerKey: { correctIndices } } };
       }
       case QuestionType.TRUE_FALSE:
         return { fields: { options: ['True', 'False'], correctOptionIndex: manualQ.correctIdx } };
@@ -774,13 +851,21 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       }
       case QuestionType.DRAG_DROP: {
         const items = manualQ.dragItems.map(s => s.trim());
-        const buckets = manualQ.dragBuckets.map(s => s.trim()).filter(Boolean);
-        const validItems = items.map((it, i) => ({ it, bucket: manualQ.dragItemBucket[i] ?? 0 })).filter(x => x.it);
+        // Blank bucket rows are dropped, so each item's bucket index is remapped onto the compacted
+        // list. Without this an item mapped to the bucket after a blank row silently landed one
+        // bucket off (wrong answer key) or was rejected as out of range.
+        const bucketRemap = new Map<number, number>();
+        const buckets: string[] = [];
+        manualQ.dragBuckets.forEach((b, i) => {
+          const name = b.trim();
+          if (name) { bucketRemap.set(i, buckets.length); buckets.push(name); }
+        });
+        const validItems = items.map((it, i) => ({ it, bucket: bucketRemap.get(manualQ.dragItemBucket[i] ?? 0) })).filter(x => x.it);
         if (validItems.length < 2) return { error: 'Provide at least 2 items.' };
         if (buckets.length < 2) return { error: 'Provide at least 2 buckets.' };
-        if (validItems.some(x => x.bucket >= buckets.length)) return { error: 'Every item must map to a valid bucket.' };
+        if (validItems.some(x => x.bucket === undefined)) return { error: 'Every item must map to a non-empty bucket.' };
         const placements: Record<number, number> = {};
-        validItems.forEach((x, i) => { placements[i] = x.bucket; });
+        validItems.forEach((x, i) => { placements[i] = x.bucket as number; });
         return { fields: { matchOptions: { items: validItems.map(x => x.it), buckets }, answerKey: { placements } } };
       }
       default:
@@ -791,6 +876,13 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   const handleAddManualQuestion = () => {
     if (!manualQ.text.trim()) {
       alert("Please enter the question text.");
+      return;
+    }
+
+    // Marks are stored as INT and graded all-or-nothing, so 0, negatives, blanks (NaN) and fractions
+    // (silently truncated server-side, desyncing the exam's total) are rejected up front.
+    if (!Number.isInteger(manualQ.marks) || manualQ.marks < 1) {
+      alert("Marks must be a whole number of at least 1.");
       return;
     }
 
@@ -851,6 +943,41 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       return { ...prev, [field]: list };
     });
   };
+  // Removing an MCQ/Multi-Select option shifts every later option up one slot, so the answer key has
+  // to shift with it — otherwise the "correct" mark silently moves to a different option. Removing the
+  // correct option itself clears the mark (-1) so the admin must pick again rather than inherit A.
+  const removeOption = (idx: number) => {
+    setManualQ(prev => {
+      if (prev.options.length <= 1) return prev;
+      return {
+        ...prev,
+        options: prev.options.filter((_, i) => i !== idx),
+        correctIdx: prev.correctIdx === idx ? -1 : prev.correctIdx > idx ? prev.correctIdx - 1 : prev.correctIdx,
+        correctIndices: prev.correctIndices.filter(x => x !== idx).map(x => (x > idx ? x - 1 : x)),
+      };
+    });
+  };
+  // Same index-shift problem for Drag & Drop: items point at buckets by position.
+  const removeDragBucket = (idx: number) => {
+    setManualQ(prev => {
+      if (prev.dragBuckets.length <= 1) return prev;
+      return {
+        ...prev,
+        dragBuckets: prev.dragBuckets.filter((_, i) => i !== idx),
+        dragItemBucket: prev.dragItemBucket.map(b => (b === idx ? 0 : b > idx ? b - 1 : b)),
+      };
+    });
+  };
+  const removeDragItem = (idx: number) => {
+    setManualQ(prev => {
+      if (prev.dragItems.length <= 1) return prev;
+      return {
+        ...prev,
+        dragItems: prev.dragItems.filter((_, i) => i !== idx),
+        dragItemBucket: prev.dragItemBucket.filter((_, i) => i !== idx),
+      };
+    });
+  };
 
   const inputCls = "w-full px-3 py-2 border rounded-lg outline-none text-sm";
   const smallBtn = "text-xs text-slate-500 hover:text-red-600 px-2";
@@ -894,13 +1021,11 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               <input
                 type="text" className={inputCls}
                 placeholder={`Option ${String.fromCharCode(65 + i)}`}
+                aria-label={`Option ${String.fromCharCode(65 + i)}`}
                 value={opt}
                 onChange={e => updateOption(i, e.target.value)}
               />
-              <button type="button" className={smallBtn} onClick={() => {
-                removeListItem('options', i);
-                setManualQ(prev => ({ ...prev, correctIndices: prev.correctIndices.filter(x => x !== i).map(x => x > i ? x - 1 : x) }));
-              }}>✕</button>
+              <button type="button" className={smallBtn} aria-label={`Remove option ${String.fromCharCode(65 + i)}`} onClick={() => removeOption(i)}>✕</button>
             </div>
           ))}
           <button type="button" className="text-xs text-blue-600 hover:underline" onClick={() => addListItem('options')}>+ Add option</button>
@@ -933,7 +1058,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
             <div key={i} className="flex items-center gap-2">
               <span className="text-xs text-slate-400 w-14">Blank {i + 1}</span>
               <input type="text" className={inputCls} placeholder="e.g. Paris, paris city" value={b} onChange={e => updateListField('blanks', i, e.target.value)} />
-              <button type="button" className={smallBtn} onClick={() => removeListItem('blanks', i)}>✕</button>
+              <button type="button" className={smallBtn} aria-label={`Remove blank ${i + 1}`} onClick={() => removeListItem('blanks', i)}>✕</button>
             </div>
           ))}
           <button type="button" className="text-xs text-blue-600 hover:underline" onClick={() => addListItem('blanks')}>+ Add blank</button>
@@ -983,7 +1108,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               <input type="text" className={inputCls} placeholder={`Left ${i + 1}`} value={l} onChange={e => updateListField('matchLeft', i, e.target.value)} />
               <span className="text-slate-400">↔</span>
               <input type="text" className={inputCls} placeholder={`Right ${i + 1}`} value={manualQ.matchRight[i] || ''} onChange={e => updateListField('matchRight', i, e.target.value)} />
-              <button type="button" className={smallBtn} onClick={() => { removeListItem('matchLeft', i); removeListItem('matchRight', i); }}>✕</button>
+              <button type="button" className={smallBtn} aria-label={`Remove pair ${i + 1}`} onClick={() => { removeListItem('matchLeft', i); removeListItem('matchRight', i); }}>✕</button>
             </div>
           ))}
           <button type="button" className="text-xs text-blue-600 hover:underline" onClick={() => { addListItem('matchLeft'); addListItem('matchRight'); }}>+ Add pair</button>
@@ -999,7 +1124,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
             <div key={i} className="flex items-center gap-2">
               <span className="text-xs text-slate-400 w-5">{i + 1}.</span>
               <input type="text" className={inputCls} placeholder={`Item ${i + 1}`} value={it} onChange={e => updateListField('orderItems', i, e.target.value)} />
-              <button type="button" className={smallBtn} onClick={() => removeListItem('orderItems', i)}>✕</button>
+              <button type="button" className={smallBtn} aria-label={`Remove item ${i + 1}`} onClick={() => removeListItem('orderItems', i)}>✕</button>
             </div>
           ))}
           <button type="button" className="text-xs text-blue-600 hover:underline" onClick={() => addListItem('orderItems')}>+ Add item</button>
@@ -1016,7 +1141,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
             {buckets.map((b, i) => (
               <div key={i} className="flex items-center gap-2">
                 <input type="text" className={inputCls} placeholder={`Bucket ${i + 1}`} value={b} onChange={e => updateListField('dragBuckets', i, e.target.value)} />
-                <button type="button" className={smallBtn} onClick={() => removeListItem('dragBuckets', i)}>✕</button>
+                <button type="button" className={smallBtn} aria-label={`Remove bucket ${i + 1}`} onClick={() => removeDragBucket(i)}>✕</button>
               </div>
             ))}
             <button type="button" className="text-xs text-blue-600 hover:underline" onClick={() => addListItem('dragBuckets')}>+ Add bucket</button>
@@ -1032,10 +1157,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                 }}>
                   {buckets.map((bk, bi) => <option key={bi} value={bi}>{bk.trim() || `Bucket ${bi + 1}`}</option>)}
                 </select>
-                <button type="button" className={smallBtn} onClick={() => {
-                  removeListItem('dragItems', i);
-                  setManualQ(prev => { const arr = [...prev.dragItemBucket]; arr.splice(i, 1); return { ...prev, dragItemBucket: arr }; });
-                }}>✕</button>
+                <button type="button" className={smallBtn} aria-label={`Remove item ${i + 1}`} onClick={() => removeDragItem(i)}>✕</button>
               </div>
             ))}
             <button type="button" className="text-xs text-blue-600 hover:underline" onClick={() => { addListItem('dragItems'); addListItem('dragItemBucket', 0); }}>+ Add item</button>
@@ -1149,16 +1271,37 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   };
 
   const handleSaveExam = async () => {
-    if (!newExam.title || !newExam.questions?.length) return;
+    if (savingExam) return;
+    if (!newExam.questions?.length) return;
+    if (!newExam.title?.trim()) {
+        alert("Please enter an exam title.");
+        return;
+    }
     if (isSuperAdmin && !effectiveCompanyId) {
         alert("Select a company first to create or edit an exam.");
+        return;
+    }
+    if (!Number.isFinite(newExam.startTime) || !Number.isFinite(newExam.endTime)) {
+        alert("Please set a valid start and end time.");
         return;
     }
     if (newExam.startTime! >= newExam.endTime!) {
         alert("End time must be after start time");
         return;
     }
+    // The API rejects duration <= 0 (and truncates fractions), which used to surface only as the
+    // generic "Failed to save" alert.
+    const durationNum = Number(newExam.durationMinutes);
+    if (!Number.isInteger(durationNum) || durationNum < 1) {
+        alert("Duration must be a whole number of minutes (at least 1).");
+        return;
+    }
 
+    // With sections on, the API persists ONLY the questions listed inside a section. A question whose
+    // sectionId matches no section would be silently dropped while still counted in totalMarks, so
+    // route any such orphan into the first section instead.
+    const sectionIdSet = new Set(sections.map(s => s.id));
+    const resolveSectionId = (q: Question) => (q.sectionId && sectionIdSet.has(q.sectionId) ? q.sectionId : sections[0]?.id);
     const sectionsPayload = useSections
       ? sections.map((section, idx) => ({
           id: section.id,
@@ -1168,7 +1311,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
           shuffleQuestions: section.shuffleQuestions ?? true,
           timeLimitMinutes: section.timeLimitMinutes ?? 0,
           lockOnComplete: section.lockOnComplete ?? true,
-          questions: (newExam.questions || []).filter(q => q.sectionId === section.id)
+          questions: (newExam.questions || []).filter(q => resolveSectionId(q) === section.id)
         }))
       : [];
 
@@ -1187,6 +1330,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       ])),
     };
 
+    setSavingExam(true);
     try {
       const result = await apiPost<{ exam: Exam }>('exams.php', withCompany({ exam: payload }));
       const savedExam = result.exam || payload;
@@ -1196,10 +1340,12 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       });
     } catch (e) {
       console.error(e);
-      alert('Failed to save exam to database.');
+      alert(`Failed to save exam: ${apiErrorMessage(e, 'the server did not accept the request. Please try again.')}`);
       return;
+    } finally {
+      setSavingExam(false);
     }
-    
+
     resetForm();
   };
 
@@ -1224,8 +1370,8 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       ...q,
       sectionId: sectionMap.get(q.id)
     }));
-    setNewExam({ 
-        ...exam, 
+    const editable: Partial<Exam> = {
+        ...exam,
         sections: normalizedSections,
         assignedStudentIds: exam.assignedStudentIds || [],
         assignedBatchIds: exam.assignedBatchIds || [],
@@ -1257,7 +1403,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         customSubject: `Reminder: ${exam.title}`,
         customMessage: 'Please ensure your environment is ready 15 minutes before the exam starts.'
       }
-    });
+    };
+    setNewExam(editable);
+    editorSnapshotRef.current = JSON.stringify(editable);
     if (exam.sections && exam.sections.length > 0) {
       setActiveSectionId(exam.sections[0].id);
     } else {
@@ -1274,12 +1422,22 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     setShowPreview(false);
     setActiveSectionId(null);
     setSelectedTemplateId(null);
-    setNewExam(buildExamDefaults());
+    const fresh = buildExamDefaults();
+    setNewExam(fresh);
+    editorSnapshotRef.current = JSON.stringify(fresh);
     setUploadStatus('IDLE');
     setCsvErrors([]);
   };
 
+  // Cancel used to drop every unsaved edit (a whole question paper) on a single misclick.
+  const handleCancelEdit = () => {
+    if (JSON.stringify(newExam) !== editorSnapshotRef.current
+      && !confirm('Discard your unsaved changes to this exam?')) return;
+    resetForm();
+  };
+
   const handleDuplicateExam = async (source: Exam) => {
+    if (duplicatingId) return;
     const makeId = () => Math.random().toString(36).substr(2, 9);
     const now = Date.now();
     const durationMs = (source.durationMinutes || 0) * 60000;
@@ -1331,6 +1489,12 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       totalMarks: clonedQuestions.reduce((sum, q) => sum + (q.marks || 0), 0),
       assignedStudentIds: [],
       assignedBatchIds: [],
+      // Server-computed roster counters and per-exam mail overrides belong to the SOURCE exam. The
+      // API echoes the payload back, so spreading them made the brand-new, unassigned copy show the
+      // source's "N to invite" / "N not attempted" badges and mail template until the next reload.
+      pendingInviteCount: 0,
+      notAttemptedCount: 0,
+      mailTemplates: {},
       notificationConfig: {
         enabled: false,
         reminders: source.notificationConfig?.reminders || { hours24: false, hours1: false },
@@ -1339,13 +1503,16 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       }
     };
 
+    setDuplicatingId(source.id);
     try {
       const result = await apiPost<{ exam: Exam }>('exams.php', withCompany({ exam: payload }));
       const savedExam = result.exam || payload;
       onUpdateExams(prev => [savedExam, ...prev]);
     } catch (e) {
       console.error(e);
-      alert('Failed to duplicate exam.');
+      alert(`Failed to duplicate exam: ${apiErrorMessage(e, 'please try again.')}`);
+    } finally {
+      setDuplicatingId(null);
     }
   };
 
@@ -1356,16 +1523,16 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   const handleArchiveExam = async () => {
     if (!deleteTarget || deleteBusy) return;
     setDeleteBusy(true);
-    const archivedExam: Exam = {
-      ...deleteTarget,
-      status: 'ARCHIVED',
-    };
     try {
-      await apiPost<{ exam: Exam }>('exams.php', withCompany({ exam: archivedExam }));
-      onUpdateExams(prev => prev.filter(e => e.id !== deleteTarget.id));
+      // Status-only ARCHIVE action rather than re-POSTing the whole exam: the full upsert rewrites
+      // every question/section/assignment row just to flip a flag, and it re-validates the schedule,
+      // so a legacy exam with a bad window (end <= start, 0 duration) could never be archived.
+      await apiPost('exams.php', withCompany({ action: 'ARCHIVE', id: deleteTarget.id }));
+      // Keep it in state as ARCHIVED (what a reload returns too); the grid hides archived exams.
+      onUpdateExams(prev => prev.map(e => (e.id === deleteTarget.id ? { ...e, status: 'ARCHIVED' } : e)));
     } catch (e) {
       console.error('Failed to archive exam:', e);
-      alert('Failed to archive exam. Please try again.');
+      alert(`Failed to archive exam: ${apiErrorMessage(e, 'please try again.')}`);
     } finally {
       setDeleteBusy(false);
       setDeleteTarget(null);
@@ -1374,13 +1541,16 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
 
   const handlePermanentDeleteExam = async () => {
     if (!deleteTarget || deleteBusy) return;
+    // exam_sessions (and through them session_answers / violation_logs) are ON DELETE CASCADE from
+    // exams, so this wipes every candidate's attempt and result for the exam — irreversibly.
+    if (!confirm(`Permanently delete "${deleteTarget.title}"?\n\nThis also erases every candidate attempt, answer, violation log and result recorded for this exam. It cannot be undone — choose Archive instead to keep them.`)) return;
     setDeleteBusy(true);
     try {
       await apiPost('exams.php', withCompany({ action: 'DELETE', id: deleteTarget.id, permanent: true }));
       onUpdateExams(prev => prev.filter(e => e.id !== deleteTarget.id));
     } catch (e) {
       console.error('Failed to delete exam permanently:', e);
-      alert('Failed to delete exam permanently. Please try again.');
+      alert(`Failed to delete exam permanently: ${apiErrorMessage(e, 'please try again.')}`);
     } finally {
       setDeleteBusy(false);
       setDeleteTarget(null);
@@ -1469,7 +1639,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       recipients = await resolveRecipients(exam, true);
     } catch (e: any) {
       console.error(e);
-      alert(e?.message || 'Failed to load the recipient list for this exam.');
+      alert(apiErrorMessage(e, 'Failed to load the recipient list for this exam.'));
       return;
     } finally {
       setEmailSendingId(null);
@@ -1490,7 +1660,12 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       return;
     }
 
-    if (!confirm(`Are you sure you want to send exam invitations to ${recipients.length} students?`)) return;
+    // When every student already has a link, say so — the old prompt read like a first send and made
+    // it easy to re-mail a whole roster that may already be sitting the exam.
+    const confirmText = pending.length === 0
+      ? `All ${recipients.length} assigned students have already been sent a link. Resend the same invitation to all of them?`
+      : `Are you sure you want to send exam invitations to ${recipients.length} students?`;
+    if (!confirm(confirmText)) return;
     await dispatchEmails(exam, recipients, false);
   };
 
@@ -1520,7 +1695,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
           return { to: student.email.trim().toLowerCase(), subject, body };
         });
 
-        const result = await apiPost<{ sent: number; failed?: { to: string; error: string }[] }>('notify.php', { messages });
+        // withCompany: notify.php scopes SMTP + delivery logs by company, like every other write here;
+        // without it a super admin's send was rejected ("companyId is required") or logged under
+        // whichever company the top bar happened to hold.
+        const result = await apiPost<{ sent: number; failed?: { to: string; error: string }[] }>('notify.php', withCompany({ messages }));
 
         // Record who actually received a link. Addresses that bounced stay uninvited so the next send
         // retries them instead of quietly leaving those students without a way in.
@@ -1583,9 +1761,17 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     } catch (e: any) {
       console.error(e);
       setMailComposer(prev => (prev && prev.exam.id === exam.id
-        ? { ...prev, loading: false, error: e?.message || 'Failed to load the recipient list for this exam.' }
+        ? { ...prev, loading: false, error: apiErrorMessage(e, 'Failed to load the recipient list for this exam.') }
         : prev));
     }
+  };
+
+  // Closing (X / Cancel / Escape) used to drop an edited subject/message without a word, while
+  // switching kinds below already asked first — ask on close too. Not while a save/mint is running.
+  const closeComposer = () => {
+    if (!mailComposer || mailComposer.saving) return;
+    if (mailComposer.dirty && !confirm('Discard your unsaved changes to this email?')) return;
+    setMailComposer(null);
   };
 
   // Switching between Invitation and Reminder swaps in that kind's template. Unsaved edits would be
@@ -1619,7 +1805,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       setMailComposer(prev => (prev ? { ...prev, saving: false, dirty: false, notice: 'Saved as this exam’s default email.' } : prev));
     } catch (e: any) {
       console.error(e);
-      setMailComposer(prev => (prev ? { ...prev, saving: false, error: e?.message || 'Could not save this email template.' } : prev));
+      setMailComposer(prev => (prev ? { ...prev, saving: false, error: apiErrorMessage(e, 'Could not save this email template.') } : prev));
     }
   };
 
@@ -1650,7 +1836,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         : prev));
     } catch (e: any) {
       console.error(e);
-      setMailComposer(prev => (prev ? { ...prev, saving: false, error: e?.message || 'Could not reset this email template.' } : prev));
+      setMailComposer(prev => (prev ? { ...prev, saving: false, error: apiErrorMessage(e, 'Could not reset this email template.') } : prev));
     }
   };
 
@@ -1680,7 +1866,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         sendTargets = await mintAccessTokens(composer.exam, targets);
       } catch (e: any) {
         console.error(e);
-        setMailComposer(prev => (prev ? { ...prev, saving: false, error: e?.message || 'Could not generate secure exam links. Nothing was sent.' } : prev));
+        setMailComposer(prev => (prev ? { ...prev, saving: false, error: apiErrorMessage(e, 'Could not generate secure exam links. Nothing was sent.') } : prev));
         return;
       }
     }
@@ -1694,6 +1880,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
 
   // --- Link Generation & Export ---
   const handleExportLinks = async (exam: Exam) => {
+    if (exportingLinksId) return;
     // CSV Header
     const csvRows = [
       ["Student Name", "Registration ID", "Email", "Exam Link", "Valid From", "Valid Until", "Invite Status"]
@@ -1702,12 +1889,15 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     // Resolve recipients server-side so cross-company assignments carry each student's own companyId.
     // requireTokens=true: a mint failure throws here rather than exporting rows with empty links.
     let targetStudents: ExamRecipient[];
+    setExportingLinksId(exam.id);
     try {
       targetStudents = await resolveRecipients(exam, true);
     } catch (e: any) {
       console.error(e);
-      alert(e?.message || 'Failed to generate exam links for export.');
+      alert(apiErrorMessage(e, 'Failed to generate exam links for export.'));
       return;
+    } finally {
+      setExportingLinksId(null);
     }
 
     if (targetStudents.length === 0) {
@@ -1726,18 +1916,17 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         : 'Not sent';
 
       csvRows.push([
-        `"${student.fullName}"`,
-        `"${student.registrationId}"`,
-        `"${student.email}"`,
-        `"${link}"`,
-        `"${formatScheduleShort(exam.startTime, resolveExamTimezone(exam.timezone))}"`,
-        `"${formatScheduleShort(exam.endTime, resolveExamTimezone(exam.timezone))}"`,
-        `"${inviteStatus}"`
+        csvCell(student.fullName),
+        csvCell(student.registrationId),
+        csvCell(student.email),
+        csvCell(link),
+        csvCell(formatScheduleShort(exam.startTime, resolveExamTimezone(exam.timezone))),
+        csvCell(formatScheduleShort(exam.endTime, resolveExamTimezone(exam.timezone))),
+        csvCell(inviteStatus)
       ]);
     });
 
-    const csvContent = "data:text/csv;charset=utf-8," + "\uFEFF" + csvRows.map(e => e.join(",")).join("\n");
-    const encodedUri = encodeURI(csvContent);
+    const encodedUri = csvDataUri(csvRows.map(e => e.join(",")).join("\n"));
     const link = document.createElement("a");
     link.setAttribute("href", encodedUri);
     link.setAttribute("download", `${exam.title.replace(/\s+/g, '_')}_Links.csv`);
@@ -1795,8 +1984,8 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       withSection('DATE,"On what date did India gain independence?",1947-08-15,,,,,3,,', 2),
       withSection('TIME,"At what time (24h) does solar noon occur (approx)?",12:00,,,,,2,,', 0),
     ].join("\n");
-    const csvContent = "data:text/csv;charset=utf-8," + "\uFEFF" + headers + guide + samples;
-    const encodedUri = encodeURI(csvContent);
+    // csvDataUri escapes '#': with encodeURI every '#' guide row (and all samples after it) was cut off.
+    const encodedUri = csvDataUri(headers + guide + samples);
     const link = document.createElement("a");
     link.setAttribute("href", encodedUri);
     link.setAttribute("download", "exam_questions_template.csv");
@@ -1835,8 +2024,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   const downloadStudentTemplate = () => {
     const headers = 'Full Name,Email,Registration ID\n';
     const sample = '"Ada Lovelace",ada@example.com,REG-1001\n';
-    const csvContent = 'data:text/csv;charset=utf-8,' + '\uFEFF' + headers + sample;
-    const encodedUri = encodeURI(csvContent);
+    const encodedUri = csvDataUri(headers + sample);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
     link.setAttribute('download', 'exam_students_template.csv');
@@ -1868,7 +2056,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       // The 9th "WordLimit", 10th "Negative Marks" and 11th "Section" columns are all OPTIONAL,
       // so CSVs written before any of these features still import.
       const [typeRaw, qText, optA, optB, optC, optD, correctStr, marksStr, wordLimitStr, negativeMarksStr, sectionStr] = cols;
-      const marks = parseInt(marksStr);
+      // Number (not parseInt) so "2.5" or "5 pts" is rejected instead of silently becoming 2 / 5 —
+      // marks are whole numbers end to end (INT column, all-or-nothing grading).
+      const marks = Number((marksStr ?? '').trim());
       const wordLimitTrim = (wordLimitStr ?? '').trim();
       const wordLimit = parseInt(wordLimitTrim, 10);
       const negativeMarksTrim = (negativeMarksStr ?? '').trim();
@@ -1906,8 +2096,8 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       const type = CSV_TYPE_ALIASES[typeRaw.toUpperCase().replace(/[\s_\-/]/g, '')];
 
       // Validate Marks
-      if (isNaN(marks) || marks <= 0) {
-        errors.push({ row: i + 1, message: "Invalid marks. Must be a positive number.", rawData: line });
+      if ((marksStr ?? '').trim() === '' || !Number.isInteger(marks) || marks <= 0) {
+        errors.push({ row: i + 1, message: "Invalid marks. Must be a positive whole number.", rawData: line });
         continue;
       }
 
@@ -2145,6 +2335,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     }
     const list = Array.isArray(data) ? data : [data];
     const created: Exam[] = [];
+    const failed: string[] = [];
     for (const raw of list) {
       if (!raw || typeof raw !== 'object') continue;
       const makeId = () => Math.random().toString(36).substr(2, 9);
@@ -2170,20 +2361,20 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         }
       });
 
-      const mappedQuestions = sourceQuestions.map(q => ({
+      const mappedQuestions: Question[] = sourceQuestions.map(q => ({
         ...q,
-        id: q.id && questionMap.has(q.id) ? questionMap.get(q.id) : makeId(),
-        sectionId: q.sectionId && sectionMap.has(q.sectionId) ? sectionMap.get(q.sectionId) : undefined
+        id: (q.id && questionMap.get(q.id)) || makeId(),
+        sectionId: q.sectionId ? sectionMap.get(q.sectionId) : undefined
       }));
 
       const mappedSections = sourceSections.map((section: any, idx: number) => ({
         ...section,
-        id: section.id && sectionMap.has(section.id) ? sectionMap.get(section.id) : makeId(),
+        id: (section.id && sectionMap.get(section.id)) || makeId(),
         displayOrder: section.displayOrder ?? idx,
         questions: Array.isArray(section.questions)
           ? section.questions.map((q: any) => ({
               ...q,
-              id: q.id && questionMap.has(q.id) ? questionMap.get(q.id) : makeId()
+              id: (q.id && questionMap.get(q.id)) || makeId()
             }))
           : []
       }));
@@ -2201,7 +2392,11 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         // cross-company data leak. Always import an exam with a clean, unassigned roster.
         assignedBatchIds: [],
         assignedStudentIds: [],
-        pendingInviteCount: 0
+        // Export files carry the source exam's server-computed counters and mail overrides; the API
+        // echoes them back, so reset them or the imported (unassigned) exam shows stale badges.
+        pendingInviteCount: 0,
+        notAttemptedCount: 0,
+        mailTemplates: {},
       };
 
       try {
@@ -2211,14 +2406,15 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         }
       } catch (e) {
         console.error('Failed to import exam', e);
+        failed.push(`${raw.title || '(untitled)'}: ${apiErrorMessage(e, 'rejected by the server')}`);
       }
     }
     if (created.length > 0) {
       onUpdateExams(prev => [...created, ...prev]);
-      alert(`Imported ${created.length} exams.`);
-    } else {
-      alert('No exams imported.');
     }
+    // Report per-exam failures — they used to be swallowed into a bare "No exams imported."
+    const failedNote = failed.length > 0 ? `\n\nFailed (${failed.length}):\n${failed.slice(0, 10).join('\n')}` : '';
+    alert(created.length > 0 ? `Imported ${created.length} exams.${failedNote}` : `No exams imported.${failedNote}`);
   };
 
   // --- Batch Student Upload Logic ---
@@ -2397,6 +2593,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                        onClick={() => setShowPreview(false)}
                        className="bg-slate-900 text-white p-2 rounded-full hover:bg-slate-700 shadow-lg transition-colors"
                        title="Exit Preview"
+                       aria-label="Exit preview"
                     >
                        <XCircle size={24} />
                     </button>
@@ -2428,7 +2625,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       <div className="space-y-6">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <h2 className="lsc-title">{newExam.id ? 'Edit Exam' : 'Create New Exam'}</h2>
-          <button onClick={resetForm} className="px-4 py-2 lsc-button-ghost text-sm">Cancel</button>
+          <button onClick={handleCancelEdit} disabled={savingExam} className="px-4 py-2 lsc-button-ghost text-sm disabled:opacity-50">Cancel</button>
         </div>
 
         {/* Warning for Published Exams */}
@@ -2493,12 +2690,16 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                     const newTz = e.target.value;
                     const oldTz = resolveExamTimezone(newExam.timezone);
                     // Keep the wall-clock numbers the admin already typed, but
-                    // re-interpret them in the newly chosen zone.
+                    // re-interpret them in the newly chosen zone. (Guarded: Intl throws on an
+                    // invalid instant, which would blank the whole screen.)
+                    const reinterpret = (epoch?: number) => (typeof epoch === 'number' && Number.isFinite(epoch)
+                      ? zonedInputToEpoch(epochToZonedInput(epoch, oldTz), newTz)
+                      : epoch);
                     setNewExam({
                       ...newExam,
                       timezone: newTz,
-                      startTime: zonedInputToEpoch(epochToZonedInput(newExam.startTime!, oldTz), newTz),
-                      endTime: zonedInputToEpoch(epochToZonedInput(newExam.endTime!, oldTz), newTz),
+                      startTime: reinterpret(newExam.startTime),
+                      endTime: reinterpret(newExam.endTime),
                     });
                   }}
                 >
@@ -2517,8 +2718,14 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                     <input
                       type="datetime-local"
                       className="w-full px-3 py-2 border rounded-lg outline-none text-sm"
-                      value={epochToZonedInput(newExam.startTime!, resolveExamTimezone(newExam.timezone))}
-                      onChange={e => setNewExam({...newExam, startTime: zonedInputToEpoch(e.target.value, resolveExamTimezone(newExam.timezone))})}
+                      value={zonedInputValue(newExam.startTime, resolveExamTimezone(newExam.timezone))}
+                      onChange={e => {
+                        // A cleared/partially-cleared picker reports '' → NaN. Storing NaN crashed the
+                        // next render (Intl RangeError) and took the whole admin panel down, losing
+                        // every unsaved edit — keep the last valid time instead.
+                        const next = zonedInputToEpoch(e.target.value, resolveExamTimezone(newExam.timezone));
+                        if (Number.isFinite(next)) setNewExam({...newExam, startTime: next});
+                      }}
                     />
                  </div>
                  <div>
@@ -2528,8 +2735,11 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                     <input
                       type="datetime-local"
                       className="w-full px-3 py-2 border rounded-lg outline-none text-sm"
-                      value={epochToZonedInput(newExam.endTime!, resolveExamTimezone(newExam.timezone))}
-                      onChange={e => setNewExam({...newExam, endTime: zonedInputToEpoch(e.target.value, resolveExamTimezone(newExam.timezone))})}
+                      value={zonedInputValue(newExam.endTime, resolveExamTimezone(newExam.timezone))}
+                      onChange={e => {
+                        const next = zonedInputToEpoch(e.target.value, resolveExamTimezone(newExam.timezone));
+                        if (Number.isFinite(next)) setNewExam({...newExam, endTime: next});
+                      }}
                     />
                  </div>
               </div>
@@ -2538,8 +2748,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                 <label className="block text-sm font-medium text-slate-700 mb-1 flex items-center gap-1">
                     <Clock size={14} /> Duration (mins)
                 </label>
-                <input 
-                  type="number" 
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
                   className="w-full px-3 py-2 border rounded-lg outline-none"
                   value={newExam.durationMinutes}
                   onChange={e => setNewExam({...newExam, durationMinutes: Number(e.target.value)})}
@@ -2806,7 +3018,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                       max={newExam.questions?.length}
                       className="w-full px-3 py-2 border rounded-lg outline-none text-sm"
                       value={newExam.questionCount}
-                      onChange={e => !useSections && setNewExam({...newExam, questionCount: Number(e.target.value)})}
+                      onChange={e => !useSections && setNewExam({...newExam, questionCount: Math.max(0, Math.floor(Number(e.target.value) || 0))})}
                       disabled={useSections}
                       placeholder="0 for all"
                      />
@@ -3161,13 +3373,21 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               <div className="text-xs text-slate-500 text-right">
                 {(() => {
                   const selected = newExam.assignedBatchIds || [];
+                  const explicit = newExam.assignedStudentIds || [];
+                  // With no assignment at all, Notify/Links go to EVERY student in the company
+                  // (resolveRecipients' fallback) — "0 students will receive this exam" was wrong.
+                  if (selected.length === 0 && explicit.length === 0) {
+                    return 'No batches selected — invitations will go to every student in this company';
+                  }
                   // Cross-company batches aren't in the local `students` prop, so for a super admin we
                   // trust the per-batch counts from the API instead of expanding against local students.
+                  // Otherwise count the real union the save sends: batch members PLUS individually
+                  // assigned students (the old count ignored the latter).
                   const count = isSuperAdmin
-                    ? batches.filter(b => selected.includes(b.id)).reduce((sum, b) => sum + (b.studentCount || 0), 0)
-                    : getStudentIdsForBatchIds(selected).length;
-                  return count;
-                })()} students will receive this exam
+                    ? Math.max(batches.filter(b => selected.includes(b.id)).reduce((sum, b) => sum + (b.studentCount || 0), 0), explicit.length)
+                    : new Set([...explicit, ...getStudentIdsForBatchIds(selected)]).size;
+                  return `${count} students will receive this exam`;
+                })()}
               </div>
             </div>
             
@@ -3349,14 +3569,20 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                 <Eye size={18} />
                 Preview Exam
             </button>
-            <button 
+            <button
               onClick={handleSaveExam}
-              disabled={!newExam.title || !newExam.questions?.length}
+              disabled={!newExam.title || !newExam.questions?.length || savingExam}
               className="w-full py-3 lsc-button-primary disabled:bg-slate-300 disabled:cursor-not-allowed flex justify-center items-center gap-2"
             >
-              <Save size={18} />
-              Save Exam
+              {savingExam ? <Loader2 size={18} className="animate-spin" /> : <Save size={18} />}
+              {savingExam ? 'Saving…' : 'Save Exam'}
             </button>
+            {(!newExam.title || !newExam.questions?.length) && (
+              // The disabled button gave no hint as to why it could not be clicked.
+              <p className="text-xs text-slate-500 text-center">
+                Add a title and at least one question to save.
+              </p>
+            )}
           </div>
 
           {/* Right Col: Questions */}
@@ -3384,6 +3610,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                         
                         {/* Type Selector */}
                         <select
+                           aria-label="Question type"
                            value={manualQ.type}
                            onChange={e => setManualQ({ ...manualQDefaults, type: e.target.value as QuestionType })}
                            className="px-3 py-1.5 border border-slate-200 rounded-lg text-xs font-medium bg-white outline-none"
@@ -3564,8 +3791,15 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                  return (
                  <div key={q.id} className="bg-white p-4 rounded-lg border border-slate-200 shadow-sm relative group">
                    {!isPublished && (
-                     <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity">
-                       <button onClick={() => removeQuestion(q.id)} className="text-red-500 hover:bg-red-50 p-1 rounded transition-colors">
+                     // Hover-only reveal left the delete control invisible on touch screens and to
+                     // keyboard users; it now stays visible on small screens and on focus.
+                     <div className="absolute top-4 right-4 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                       <button
+                         onClick={() => removeQuestion(q.id)}
+                         className="text-red-500 hover:bg-red-50 p-1 rounded transition-colors"
+                         aria-label={`Delete question ${idx + 1}`}
+                         title="Delete question"
+                       >
                          <Trash2 size={16} />
                        </button>
                      </div>
@@ -3632,7 +3866,11 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                      <div className="flex items-center gap-2 mb-2">
                        <span className="text-[10px] text-slate-500 uppercase tracking-widest">Section</span>
                        <select
-                         className="px-2 py-1 border border-slate-200 rounded text-xs bg-white"
+                         aria-label={`Section for question ${idx + 1}`}
+                         // Moving a question between sections is a question edit — locked once
+                         // published, like add/delete and the inline marks fields above.
+                         disabled={isPublished}
+                         className="px-2 py-1 border border-slate-200 rounded text-xs bg-white disabled:bg-slate-50"
                          value={q.sectionId || sections[0]?.id}
                          onChange={e => {
                            const sectionId = e.target.value;
@@ -3754,7 +3992,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               <p className="text-sm text-slate-500 mt-0.5 truncate">{exam.title}</p>
             </div>
             <button
-              onClick={() => setMailComposer(null)}
+              onClick={closeComposer}
               className="shrink-0 p-1.5 rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-600"
               aria-label="Close composer"
             >
@@ -3762,7 +4000,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
             </button>
           </div>
 
-          <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-2 gap-0 overflow-hidden">
+          {/* Stacked on small screens, so the body scrolls as a whole there; side-by-side panes scroll
+              independently from lg up. (With overflow-hidden at every size, a phone squeezed the
+              editor pane to a sliver above the fixed-height preview.) */}
+          <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-2 gap-0 overflow-y-auto lg:overflow-hidden">
             {/* Editor */}
             <div className="min-h-0 overflow-y-auto p-4 space-y-4 border-b lg:border-b-0 lg:border-r border-slate-100">
               <div>
@@ -3821,7 +4062,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                   value={subject}
                   onChange={e => setMailComposer(prev => (prev ? { ...prev, subject: e.target.value, dirty: true, notice: null } : prev))}
                   className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-300"
-                  placeholder="Reminder — {ExamTitle}"
+                  placeholder={reminder ? 'Reminder — {ExamTitle}' : 'Your Exam Invitation — {ExamTitle}'}
                 />
               </div>
 
@@ -3887,7 +4128,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
             </p>
             <div className="flex items-center gap-2">
               <button
-                onClick={() => setMailComposer(null)}
+                onClick={closeComposer}
                 className="px-4 py-2 rounded-lg text-sm text-slate-500 hover:bg-slate-100"
               >
                 Cancel
@@ -3981,6 +4222,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               >
                 Delete Permanently
               </button>
+              <p className="text-xs text-slate-500 text-center px-2">
+                Archiving keeps every attempt and result. Deleting permanently also erases all candidate attempts, answers and results for this exam.
+              </p>
               <button
                 onClick={() => !deleteBusy && setDeleteTarget(null)}
                 disabled={deleteBusy}
@@ -4025,9 +4269,21 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               if (examImportRef.current) examImportRef.current.value = '';
             }}
           />
+          {archivedCount > 0 && (
+            <button
+              onClick={() => setShowArchived(v => !v)}
+              aria-pressed={showArchived}
+              className="px-4 py-2 lsc-button-ghost flex items-center gap-2 text-sm"
+            >
+              {showArchived ? 'Hide archived' : `Show archived (${archivedCount})`}
+            </button>
+          )}
           <button
             onClick={() => examImportRef.current?.click()}
-            className="px-4 py-2 lsc-button-ghost flex items-center gap-2 text-sm"
+            // Same gate as Create: with no company picked, a super admin's import would land in
+            // whatever company the request headers resolve to and never appear in this (empty) grid.
+            disabled={isSuperAdmin && !effectiveCompanyId}
+            className="px-4 py-2 lsc-button-ghost flex items-center gap-2 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Upload size={16} /> Import
           </button>
@@ -4055,6 +4311,13 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         <div className="bg-white rounded-xl border border-slate-200 p-10 text-center text-slate-500">
           Loading exams…
         </div>
+      ) : visibleExams.length === 0 ? (
+        // An empty grid used to render as blank space with no hint of what to do next.
+        <div className="bg-white rounded-xl border border-dashed border-slate-300 p-10 text-center text-slate-500">
+          {exams.length === 0
+            ? 'No exams yet. Click “Create Exam” to build your first one.'
+            : 'All exams are archived. Use “Show archived” to view them.'}
+        </div>
       ) : (
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {examPaging.pageItems.map(exam => (
@@ -4078,6 +4341,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                   }}
                   className="p-1 rounded-full text-rose-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
                   title="Delete exam"
+                  aria-label={`Delete exam ${exam.title}`}
                 >
                   <Trash2 size={16} />
                 </button>
@@ -4085,7 +4349,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               <h3 className="font-bold text-slate-800 text-lg truncate" title={exam.title}>{exam.title}</h3>
               <div className="flex items-center gap-4 mt-3 text-sm text-slate-500">
                 <div className="flex items-center gap-1"><Clock size={14}/> {exam.durationMinutes}m</div>
-                <div className="flex items-center gap-1"><Users size={14}/> {exam.assignedBatchIds?.length ? `${exam.assignedBatchIds.length} batches` : 'All'}</div>
+                {/* Individually assigned students (no batch) were shown as "All", though only they get mailed. */}
+                <div className="flex items-center gap-1"><Users size={14}/> {exam.assignedBatchIds?.length
+                  ? `${exam.assignedBatchIds.length} batches`
+                  : exam.assignedStudentIds?.length ? `${exam.assignedStudentIds.length} students` : 'All'}</div>
                 {!!exam.pendingInviteCount && (
                   <div
                     className="flex items-center gap-1 text-amber-600 font-medium"
@@ -4123,9 +4390,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                     e.stopPropagation();
                     handleDuplicateExam(exam);
                   }}
-                  className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/80 text-[11px] sm:text-xs font-medium text-slate-600 hover:text-blue-600 hover:bg-white shadow-xs"
+                  disabled={!!duplicatingId}
+                  className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/80 text-[11px] sm:text-xs font-medium text-slate-600 hover:text-blue-600 hover:bg-white disabled:opacity-50 shadow-xs"
                 >
-                  <Copy size={12} /> Duplicate
+                  {duplicatingId === exam.id ? <Loader2 size={12} className="animate-spin" /> : <Copy size={12} />} Duplicate
                 </button>
                 <button
                   onClick={e => {
@@ -4156,9 +4424,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                     e.stopPropagation();
                     handleExportLinks(exam);
                   }}
-                  className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/80 text-[11px] sm:text-xs font-medium text-slate-600 hover:text-blue-600 hover:bg-white shadow-xs"
+                  disabled={!!exportingLinksId}
+                  className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/80 text-[11px] sm:text-xs font-medium text-slate-600 hover:text-blue-600 hover:bg-white disabled:opacity-50 shadow-xs"
                 >
-                  <Share2 size={12} /> Links
+                  {exportingLinksId === exam.id ? <Loader2 size={12} className="animate-spin" /> : <Share2 size={12} />} Links
                 </button>
               </div>
             </div>

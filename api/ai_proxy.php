@@ -37,7 +37,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-$endpoint = trim($_GET['endpoint'] ?? '');
+// `?endpoint[]=x` makes this an array; trim(array) is a fatal TypeError (uncaught here — this file has
+// no JSON error handler), so coerce non-strings to '' and let the validation below reject it.
+$endpoint = is_string($_GET['endpoint'] ?? null) ? trim($_GET['endpoint']) : '';
 if ($endpoint === '' || !preg_match('/^[a-z_\/]+$/', $endpoint)) {
     http_response_code(400);
     echo json_encode(['error' => 'Invalid endpoint.']);
@@ -55,7 +57,10 @@ if (!in_array($base, $allowed, true)) {
 $method  = $_SERVER['REQUEST_METHOD'];
 $aiUrl   = 'http://127.0.0.1:8765/' . ltrim($endpoint, '/');
 $body    = file_get_contents('php://input');
-$timeout = 25;
+// Slightly above the browser's own abort (services/aiProctor.ts: 5 s analyze, 8 s verify, 12 s batch
+// enroll). PHP can't see that the browser gave up, so a longer timeout just kept an FPM worker
+// blocked on a frame nobody was waiting for — under load that starves every other PHP API.
+$timeout = $base === 'enroll' ? 14 : 10;
 
 $ch = curl_init($aiUrl);
 curl_setopt_array($ch, [

@@ -131,7 +131,7 @@ function send_certificate_email(PDO $pdo, array $env, int $companyId, array $iss
         ? "<p style=\"margin:0 0 20px;\"><a href=\"{$safeVerificationUrl}\" style=\"display:inline-block;padding:11px 22px;background:#0f172a;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:600;font-size:14px;\">View Certificate</a></p>"
         : '';
     $body = <<<HTML
-<!doctype html><html><head><meta charset="utf-8"><title>{$subject}</title></head>
+<!doctype html><html><head><meta charset="utf-8"><title>Your certificate is ready: {$safeExamTitle}</title></head>
 <body style="margin:0;padding:24px;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;font-size:14px;line-height:1.6;color:#0f172a;background-color:#f8fafc;">
 <div style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;padding:32px;">
   <h2 style="margin:0 0 16px;font-size:20px;color:#1e293b;">Congratulations!</h2>
@@ -161,10 +161,9 @@ HTML;
 
     // sp_add_delivery_log is the shared logging path notify.php uses for every send — call the same
     // procedure here instead of a hand-rolled INSERT so delivery_logs stays consistent everywhere.
-    $log = $pdo->prepare('CALL sp_add_delivery_log(?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    $log->execute([$companyId, 'EMAIL', $email, $subject, $body, $status, $error, null, null]);
-    while ($log->nextRowset()) {}
-    $log->closeCursor();
+    // add_delivery_log() is best-effort: a log failure (e.g. a >255-char subject from a long exam
+    // title) used to throw into maybe_issue_certificate()'s catch and flip an ISSUED row to FAILED.
+    add_delivery_log($pdo, $companyId, 'EMAIL', $email, $subject, $body, $status, $error);
 
     $upd = $pdo->prepare('UPDATE certificate_issuances SET last_emailed_at = NOW(), email_count = email_count + 1 WHERE id = ?');
     $upd->execute([$issuance['id']]);

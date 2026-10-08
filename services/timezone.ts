@@ -110,6 +110,10 @@ export function zonedInputToEpoch(input: string, tz: string): number {
 // Convert an epoch (ms) to a <input type="datetime-local"> value ("YYYY-MM-DDTHH:mm")
 // showing the wall-clock time in `tz`.
 export function epochToZonedInput(epoch: number, tz: string): string {
+  // An empty/cleared datetime-local input parses to NaN (zonedInputToEpoch('') → NaN). Feeding that
+  // back in here made Intl's formatToParts throw "RangeError: Invalid time value" DURING RENDER,
+  // white-screening the exam editor as soon as a date segment was cleared. Show an empty field.
+  if (epoch === null || epoch === undefined || !Number.isFinite(Number(epoch))) return '';
   const dtf = new Intl.DateTimeFormat('en-CA', {
     timeZone: tz, hourCycle: 'h23',
     year: 'numeric', month: '2-digit', day: '2-digit',

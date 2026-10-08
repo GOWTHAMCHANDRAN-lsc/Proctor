@@ -60,6 +60,9 @@ if ($method === 'GET') {
     $sessionId = isset($_GET['sessionId']) ? (int)$_GET['sessionId'] : null;
     $studentFilter = isset($_GET['studentId']) ? trim((string)$_GET['studentId']) : '';
     $examFilter = isset($_GET['examId']) ? trim((string)$_GET['examId']) : '';
+    // ?noSnapshots=1 skips the base64 evidence images (often tens of KB each). Count-only callers like
+    // the Dashboard tile poll 200 rows every 15 s and never display them.
+    $snapshotColumn = (($_GET['noSnapshots'] ?? '') === '1') ? 'NULL AS snapshot_base64' : 'vl.snapshot_base64';
     if (!db_table_exists($pdo, 'violation_logs') || !db_table_exists($pdo, 'exam_sessions')) {
         json_response(['violations' => []]);
     }
@@ -80,7 +83,7 @@ if ($method === 'GET') {
                 ' . ($hasCategory ? 'vl.category' : 'NULL AS category') . ',
                 ' . ($hasConfidence ? 'vl.confidence' : 'NULL AS confidence') . ',
                 vl.description,
-                vl.snapshot_base64,
+                ' . $snapshotColumn . ',
                 ' . ($hasMetadataJson ? 'vl.metadata_json' : 'NULL AS metadata_json') . ',
                 ' . ($hasReviews ? 'vr.decision' : 'NULL') . ' AS review_decision,
                 ' . ($hasReviews ? 'vr.note' : 'NULL') . ' AS review_note,
@@ -109,7 +112,7 @@ if ($method === 'GET') {
                 ' . ($hasCategory ? 'vl.category' : 'NULL AS category') . ',
                 ' . ($hasConfidence ? 'vl.confidence' : 'NULL AS confidence') . ',
                 vl.description,
-                vl.snapshot_base64,
+                ' . $snapshotColumn . ',
                 ' . ($hasMetadataJson ? 'vl.metadata_json' : 'NULL AS metadata_json') . ',
                 ' . ($hasReviews ? 'vr.decision' : 'NULL') . ' AS review_decision,
                 ' . ($hasReviews ? 'vr.note' : 'NULL') . ' AS review_note,
@@ -177,7 +180,12 @@ if ($method === 'POST') {
             json_response(['error' => 'Violation review storage is unavailable on this database.'], 503);
         }
         $violationId = isset($payload['violationId']) ? (int)$payload['violationId'] : 0;
-        $decision = isset($payload['decision']) ? (string)$payload['decision'] : '';
+        $decision = isset($payload['decision']) ? strtoupper(trim((string)$payload['decision'])) : '';
+        // violation_reviews.decision is ENUM('CLEARED','CONFIRMED','ESCALATED'): anything else used
+        // to reach the INSERT and fail as a 500 instead of a clear 400.
+        if ($decision !== '' && !in_array($decision, ['CLEARED', 'CONFIRMED', 'ESCALATED'], true)) {
+            json_response(['error' => 'decision must be one of CLEARED, CONFIRMED, ESCALATED.'], 400);
+        }
         $reviewer = isset($payload['reviewer']) ? (string)$payload['reviewer'] : (get_actor_id($payload) ?? null);
         $note = isset($payload['note']) ? (string)$payload['note'] : null;
 
@@ -273,6 +281,14 @@ if ($method === 'POST') {
             ? json_encode($v['metadata'])
             : null;
         $timestamp = isset($v['timestamp']) && is_numeric($v['timestamp']) ? ((float)$v['timestamp'] / 1000) : microtime(true);
+        // The event time comes from the candidate's clock (kept so queued evidence retains when it
+        // happened). A clock running fast, or a junk value, must not date an incident in the future
+        // — it would pin itself to the top of every newest-first feed and skew incident grouping —
+        // and an out-of-range value makes FROM_UNIXTIME() NULL, failing the insert outright.
+        $nowTs = microtime(true);
+        if (!is_finite($timestamp) || $timestamp <= 0 || $timestamp > $nowTs) {
+            $timestamp = $nowTs;
+        }
 
         if (!in_array($type, $allowedTypes, true)) {
             $errors[] = "Invalid violation type: {$type}";

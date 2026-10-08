@@ -18,10 +18,11 @@ import { Settings } from './components/admin/Settings';
 import { SettingsProvider, useSettings } from './services/appSettings';
 import { ExamTake } from './components/student/ExamTake';
 import { ExamResult } from './components/student/ExamResult';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { UserRole, Exam, Student, ViolationLog, Question, ExamSession } from './types';
 import { MOCK_EXAMS, MOCK_STUDENTS, MOCK_SESSIONS } from './services/mockStore';
 import { ArrowRight, KeyRound, AlertCircle } from 'lucide-react';
-import { apiGet, apiPost, resetAuthExpiryGuard } from './services/api';
+import { apiGet, apiPost, resetAuthExpiryGuard, getApiErrorMessage, ApiError } from './services/api';
 import { resolveExamTimezone, formatScheduleShort } from './services/timezone';
 
 const ADMIN_SESSION_KEY = 'pg_admin_session';
@@ -31,7 +32,6 @@ const ADMIN_AUTH_STORAGE_KEY = 'pg_admin_auth';
 const STUDENT_COMPANY_STORAGE_KEY = 'pg_student_company';
 const STUDENT_EXAM_TOKEN_KEY = 'pg_student_exam_token';
 const ADMIN_ACTIVE_COMPANY_KEY = 'pg_admin_active_company';
-const ADMIN_AUTH_URL = import.meta.env.VITE_ADMIN_AUTH_URL || 'https://auth.lsc-india.org/api/login';
 const SUPER_ADMIN_EMAILS = new Set(
   String(import.meta.env.VITE_SUPER_ADMIN_EMAILS || '')
     .split(',')
@@ -286,11 +286,21 @@ const getMacAddress = async (): Promise<string | null> => {
         pc.close();
         resolve(null);
       }, 3000);
-      
+
       pc.createDataChannel('');
-      pc.createOffer().then(offer => pc.setLocalDescription(offer));
-      
+      // A rejected offer used to surface as an unhandled promise rejection; the 3s timeout still
+      // resolves null in that case.
+      pc.createOffer().then(offer => pc.setLocalDescription(offer)).catch(() => {});
+
       pc.onicecandidate = (event) => {
+        if (!event.candidate) {
+          // ICE gathering finished without a usable IPv4 candidate (modern browsers hide host IPs
+          // behind mDNS names). Stop now instead of stalling "Start Test" for the full 3s timeout.
+          clearTimeout(timeout);
+          pc.close();
+          resolve(null);
+          return;
+        }
         if (event.candidate) {
           const candidate = event.candidate.candidate;
           const match = candidate.match(/(\d+\.\d+\.\d+\.\d+)/);
@@ -383,7 +393,7 @@ const AdminAppInner: React.FC = () => {
   const [isAuthed, setIsAuthed] = useState(initialAuthed);
   const [adminEmail, setAdminEmail] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
-  const [adminSystemId, setAdminSystemId] = useState('3');
+  const [adminSystemId] = useState('3');
   const [adminRole, setAdminRole] = useState<AdminConsoleRole>(initialRole);
   const [adminError, setAdminError] = useState('');
   const [adminLoading, setAdminLoading] = useState(false);
@@ -396,10 +406,34 @@ const AdminAppInner: React.FC = () => {
   const [students, setStudents] = useState<Student[]>(MOCK_STUDENTS);
   const [exams, setExams] = useState<Exam[]>(MOCK_EXAMS);
   const [sessions, setSessions] = useState<ExamSession[]>(MOCK_SESSIONS);
+  // Set when one of the shared students/exams/sessions loads fails, so the console can say so
+  // (instead of silently rendering empty lists / zero counts) and offer a retry.
+  const [dataLoadError, setDataLoadError] = useState(false);
+  const [dataReloadNonce, setDataReloadNonce] = useState(0);
+  // Bumped whenever the data scope is reset (logout / company switch) so an in-flight sessions
+  // refresh for the previous scope can't land on top of the new one.
+  const scopeGenRef = useRef(0);
 
   // A SUPER_ADMIN must pick a company before company-scoped data can load (the API requires a
   // company). For a regular admin the company is pinned to their account, so this is always false.
   const scopeReady = adminRole !== UserRole.SUPER_ADMIN || activeCompanyId !== null;
+
+  // Drop the previous account's / company's data. Without this, logging out and back in as a
+  // different user (or switching company) kept showing the old company's students, exams and
+  // sessions until the new fetch landed — and indefinitely if that fetch failed.
+  const clearScopedData = () => {
+    scopeGenRef.current += 1;
+    setStudents(MOCK_STUDENTS);
+    setExams(MOCK_EXAMS);
+    setSessions(MOCK_SESSIONS);
+    setDataLoadError(false);
+  };
+
+  // A 401 is not a "load failed" — the API layer turns it into a soft logout.
+  const flagDataLoadError = (e: unknown) => {
+    if (e instanceof ApiError && e.status === 401) return;
+    setDataLoadError(true);
+  };
 
   useEffect(() => {
     if (!isAuthed || !scopeReady) return;
@@ -412,13 +446,14 @@ const AdminAppInner: React.FC = () => {
         }
       } catch (e) {
         console.error('Failed to load students from API:', e);
+        if (!cancelled) flagDataLoadError(e);
       }
     };
     loadStudents();
     return () => {
       cancelled = true;
     };
-  }, [isAuthed, scopeReady, activeCompanyId]);
+  }, [isAuthed, scopeReady, activeCompanyId, dataReloadNonce]);
 
   useEffect(() => {
     if (!isAuthed || !scopeReady) return;
@@ -431,18 +466,21 @@ const AdminAppInner: React.FC = () => {
         }
       } catch (e) {
         console.error('Failed to load exams from API:', e);
+        if (!cancelled) flagDataLoadError(e);
       }
     };
     loadExams();
     return () => {
       cancelled = true;
     };
-  }, [isAuthed, scopeReady, activeCompanyId]);
+  }, [isAuthed, scopeReady, activeCompanyId, dataReloadNonce]);
 
   const refreshSessions = useCallback(async () => {
     if (!isAuthed || !scopeReady) return;
+    const gen = scopeGenRef.current;
     try {
       const data = await apiGet<{ sessions: ExamSession[] }>('sessions.php');
+      if (gen !== scopeGenRef.current) return;
       if (data?.sessions) {
         const normalized = data.sessions.map(s => ({
           ...s,
@@ -453,13 +491,19 @@ const AdminAppInner: React.FC = () => {
       }
     } catch (e) {
       console.error('Failed to load sessions from API:', e);
+      if (gen === scopeGenRef.current) flagDataLoadError(e);
     }
-  }, [isAuthed, scopeReady, activeCompanyId]);
+  }, [isAuthed, scopeReady, activeCompanyId, dataReloadNonce]);
 
   useEffect(() => {
     if (!isAuthed) return;
     refreshSessions();
   }, [isAuthed, refreshSessions]);
+
+  const retryDataLoad = () => {
+    setDataLoadError(false);
+    setDataReloadNonce(n => n + 1);
+  };
 
   const handleLogout = () => {
     setIsAuthed(false);
@@ -469,12 +513,18 @@ const AdminAppInner: React.FC = () => {
     setAdminRole(UserRole.ADMIN);
     setActiveCompanyId(null);
     storeActiveCompanyId(null);
+    clearScopedData();
+    // Never leave the password sitting in the sign-in form after logout — on a shared machine the
+    // next person could just press "Sign in" again.
+    setAdminPassword('');
   };
 
   // Super-admin global company switch: persist the choice (so the API layer picks it up as the
   // X-Company-Id header) and let the data-loading effects refetch every screen for that company.
   const handleCompanyChange = (companyId: number) => {
+    if (companyId === activeCompanyId) return;
     storeActiveCompanyId(companyId);
+    clearScopedData();
     setActiveCompanyId(companyId);
   };
 
@@ -513,6 +563,10 @@ const AdminAppInner: React.FC = () => {
     storeAdminAuth(params);
     setAdminRole(params.role);
     setCurrentView(params.role === UserRole.SUPER_ADMIN ? 'platform' : 'dashboard');
+    // The password must not outlive the sign-in: it would otherwise still be pre-filled in the
+    // login form after the next logout / session expiry.
+    setAdminPassword('');
+    setDataLoadError(false);
   };
 
   // Super admins authenticate against the external LSC auth service; company/role are then
@@ -601,8 +655,13 @@ const AdminAppInner: React.FC = () => {
         if (role !== UserRole.SUPER_ADMIN && !companyId) {
           throw new Error('This account is not mapped to a company. Please contact your administrator.');
         }
+        // Same guard as the external path: persisting a session without a token would boot the
+        // console "signed in" and immediately bounce back here with a misleading "expired" notice.
+        if (!dbRes.token) {
+          throw new Error('Sign-in failed: the server did not issue a session. Please try again.');
+        }
         finalizeAdminSession({
-          token: dbRes.token ?? '',
+          token: dbRes.token,
           name: dbRes.fullName,
           email: dbRes.email ?? email,
           userId: dbRes.userId,
@@ -615,7 +674,9 @@ const AdminAppInner: React.FC = () => {
 
       throw new Error(dbRes?.error || 'Invalid email or password.');
     } catch (e: any) {
-      setAdminError(e?.message || 'Login failed. Please try again.');
+      // Server errors arrive as JSON bodies (e.g. the 429 rate-limit {"ok":false,"error":"Too many
+      // attempts..."}) — show the readable text, not the raw JSON.
+      setAdminError(getApiErrorMessage(e, 'Login failed. Please try again.'));
       return;
     } finally {
       setAdminLoading(false);
@@ -625,14 +686,17 @@ const AdminAppInner: React.FC = () => {
   useEffect(() => {
     if (!isAuthed || !sessionStartedAt) return;
     const elapsed = Date.now() - sessionStartedAt;
-    if (elapsed >= ADMIN_SESSION_TTL_MS) {
+    // Tell the user why they were signed out instead of silently dropping them on the login form.
+    const expire = () => {
       handleLogout();
+      setAdminError('Your session has expired. Please sign in again.');
+    };
+    if (elapsed >= ADMIN_SESSION_TTL_MS) {
+      expire();
       return;
     }
     const remaining = ADMIN_SESSION_TTL_MS - elapsed;
-    const timeout = window.setTimeout(() => {
-      handleLogout();
-    }, remaining);
+    const timeout = window.setTimeout(expire, remaining);
     return () => window.clearTimeout(timeout);
   }, [isAuthed, sessionStartedAt]);
 
@@ -672,8 +736,9 @@ const AdminAppInner: React.FC = () => {
           <div className="lsc-card p-7 sm:p-8">
             <form onSubmit={handleAdminLogin} className="space-y-4">
               <div className="space-y-1.5">
-                <label className="text-[13px] font-medium text-slate-700">Email</label>
+                <label htmlFor="admin-login-email" className="text-[13px] font-medium text-slate-700">Email</label>
                 <input
+                  id="admin-login-email"
                   type="email"
                   value={adminEmail}
                   onChange={(e) => setAdminEmail(e.target.value)}
@@ -684,8 +749,9 @@ const AdminAppInner: React.FC = () => {
                 />
               </div>
               <div className="space-y-1.5">
-                <label className="text-[13px] font-medium text-slate-700">Password</label>
+                <label htmlFor="admin-login-password" className="text-[13px] font-medium text-slate-700">Password</label>
                 <input
+                  id="admin-login-password"
                   type="password"
                   value={adminPassword}
                   onChange={(e) => setAdminPassword(e.target.value)}
@@ -696,7 +762,7 @@ const AdminAppInner: React.FC = () => {
                 />
               </div>
               {adminError && (
-                <div className="flex items-start gap-2 text-sm text-red-700 bg-red-50 p-3 rounded-lg border border-red-100">
+                <div role="alert" className="flex items-start gap-2 text-sm text-red-700 bg-red-50 p-3 rounded-lg border border-red-100">
                   <AlertCircle size={16} className="mt-0.5 shrink-0" />
                   <span>{adminError}</span>
                 </div>
@@ -732,6 +798,25 @@ const AdminAppInner: React.FC = () => {
       activeCompanyId={activeCompanyId}
       onCompanyChange={handleCompanyChange}
     >
+      {dataLoadError && currentView !== 'platform' && currentView !== 'settings' && (
+        <div role="alert" className="mb-4 flex flex-col gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-start gap-2">
+            <AlertCircle size={16} className="mt-0.5 shrink-0 text-amber-600" />
+            <span>Some data couldn't be loaded from the server, so lists and counts may be incomplete.</span>
+          </div>
+          <button
+            type="button"
+            onClick={retryDataLoad}
+            className="shrink-0 self-start rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold text-amber-800 hover:bg-amber-100 sm:self-auto"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+      {/* Keyed by company + view: a super-admin company switch remounts the screen so no view keeps
+          (or late-receives) the previous company's data, and a screen that crashes is contained to
+          itself instead of blanking the whole console. */}
+      <ErrorBoundary key={`${activeCompanyId ?? 'none'}:${currentView}`}>
       {adminRole === UserRole.SUPER_ADMIN && currentView === 'platform' && <SuperAdminControl />}
       {currentView === 'settings' && <Settings role={adminRole} />}
       {isFullAdmin && currentView === 'users' && <UserDirectory role={adminRole} />}
@@ -750,7 +835,7 @@ const AdminAppInner: React.FC = () => {
         <Monitoring sessions={sessions} students={students} exams={exams} onRefreshSessions={refreshSessions} />
       )}
       {adminRole !== UserRole.PROCTOR && currentView === 'results' && (
-        <Results exams={exams} students={students} />
+        <Results exams={exams} students={students} role={adminRole} />
       )}
       {adminRole !== UserRole.VIEWER && currentView === 'security' && (
         <SecurityFeed exams={exams} students={students} />
@@ -761,6 +846,7 @@ const AdminAppInner: React.FC = () => {
       {adminRole !== UserRole.VIEWER && currentView === 'audit' && (
         <ActivityLogs students={students} role={adminRole} />
       )}
+      </ErrorBoundary>
     </Layout>
   );
 };
@@ -851,6 +937,27 @@ const StudentApp: React.FC = () => {
     return JSON.parse(bin.slice(start, end + 1));
   };
 
+  // The token the loaded exam/student data belongs to. exams.php / students.php answer a student
+  // token with ONLY that token's exam and student, so the data must be reloaded whenever the token
+  // changes — not just when the company does. Previously a second token for the same company (e.g.
+  // "Return to Home" after exam 1, then the link for exam 2) was checked against the first token's
+  // data and failed with "Exam not found or expired.". Initialised from the URL / stored token so
+  // the first load doesn't fire twice.
+  const [examTokenKey, setExamTokenKey] = useState<string | null>(() => {
+    try {
+      const urlToken = new URLSearchParams(window.location.search).get('token');
+      if (urlToken) return normalizeAccessToken(urlToken);
+      const stored = localStorage.getItem(STUDENT_EXAM_TOKEN_KEY);
+      return stored ? normalizeAccessToken(stored) : null;
+    } catch {
+      return null;
+    }
+  });
+  // True when the last exams/students load failed because the server was unreachable (network
+  // error / 5xx) rather than because the link is invalid — so the candidate isn't told their link
+  // is bad when it's their connection.
+  const studentDataUnreachableRef = useRef(false);
+
   const queueTokenLogin = (token: string, directLinkMode = false) => {
     try {
       const payload = parseTokenPayload(token);
@@ -859,18 +966,26 @@ const StudentApp: React.FC = () => {
       if (!Number.isFinite(parsedCompanyId) || parsedCompanyId <= 0) {
         throw new Error('Invalid company id in token.');
       }
+      // Store the CANONICAL token, not the raw (possibly URL-mangled) value — this is what gets sent
+      // as the X-Exam-Token header on every exams.php/students.php request. A mangled token fails
+      // server-side HMAC verification silently, exams.php falls through past the student-token
+      // check into require_staff(), and a perfectly valid student is 401'd with "Exam not found".
+      const cleanToken = normalizeAccessToken(token);
+      // When the data scope changes, mark the current data stale in the SAME render as the new
+      // pending token. Otherwise the pending-token effect runs once against the previous scope's
+      // already-"loaded" lists, reports "Exam not found or expired." and drops the token.
+      if (parsedCompanyId !== studentCompanyId || cleanToken !== examTokenKey) {
+        setStudentsLoaded(false);
+        setExamsLoaded(false);
+      }
       setIsDirectLinkMode(directLinkMode);
       setTokenError('');
       setAccessRequestContext(null);
       setPreStartContext(null);
       setStudentCompanyId(parsedCompanyId);
       storeStudentCompanyId(parsedCompanyId);
-      // Store the CANONICAL token, not the raw (possibly URL-mangled) value — this is what gets sent
-      // as the X-Exam-Token header on every exams.php/students.php request. A mangled token fails
-      // server-side HMAC verification silently, exams.php falls through past the student-token
-      // check into require_staff(), and a perfectly valid student is 401'd with "Exam not found".
-      const cleanToken = normalizeAccessToken(token);
       storeStudentExamToken(cleanToken);
+      setExamTokenKey(cleanToken);
       setPendingToken(cleanToken);
     } catch (e: any) {
       setIsDirectLinkMode(directLinkMode);
@@ -904,7 +1019,10 @@ const StudentApp: React.FC = () => {
     setExams([]);
     setPreStartContext(null);
     setAccessRequestContext(null);
-  }, [studentCompanyId]);
+    studentDataUnreachableRef.current = false;
+  }, [studentCompanyId, examTokenKey]);
+
+  const isUnreachableError = (e: unknown) => e instanceof ApiError && (e.status === 0 || e.status >= 500);
 
   useEffect(() => {
     if (!studentCompanyId) return;
@@ -917,6 +1035,7 @@ const StudentApp: React.FC = () => {
         }
       } catch (e) {
         console.error('Failed to load students from API:', e);
+        if (!cancelled && isUnreachableError(e)) studentDataUnreachableRef.current = true;
       } finally {
         if (!cancelled) setStudentsLoaded(true);
       }
@@ -925,7 +1044,7 @@ const StudentApp: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [studentCompanyId]);
+  }, [studentCompanyId, examTokenKey]);
 
   useEffect(() => {
     if (!studentCompanyId) return;
@@ -938,6 +1057,7 @@ const StudentApp: React.FC = () => {
         }
       } catch (e) {
         console.error('Failed to load exams from API:', e);
+        if (!cancelled && isUnreachableError(e)) studentDataUnreachableRef.current = true;
       } finally {
         if (!cancelled) setExamsLoaded(true);
       }
@@ -946,7 +1066,7 @@ const StudentApp: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [studentCompanyId]);
+  }, [studentCompanyId, examTokenKey]);
 
   useEffect(() => {
     if (!pendingToken) return;
@@ -971,8 +1091,11 @@ const StudentApp: React.FC = () => {
       }
       
       const exam = exams.find(e => e.id === payload.eid);
-      const student = students.find(s => s.id === payload.sid); 
+      const student = students.find(s => s.id === payload.sid);
 
+      if ((!exam || !student) && studentDataUnreachableRef.current) {
+        throw new Error("We couldn't reach the exam server to load your exam. Check your internet connection and reload this page.");
+      }
       if (!exam) throw new Error("Exam not found or expired.");
       if (!student) throw new Error("Student record not found.");
       if (exam.status === 'ARCHIVED') throw new Error("This exam is archived.");
@@ -1069,8 +1192,13 @@ const StudentApp: React.FC = () => {
         setTokenError('No more reconnection is possible. Please contact administrator.');
       } else if (errCode === 'MAC_ADDRESS_MISMATCH' || msg.includes('MAC_ADDRESS_MISMATCH')) {
         setTokenError('This exam is bound to a different device. Please contact your administrator to reset the device binding.');
+      } else if (errCode === 'EXAM_NOT_FOUND') {
+        setTokenError('This exam is no longer available. Please contact your administrator.');
+      } else if (errCode === 'STUDENT_NOT_FOUND') {
+        setTokenError('Your candidate record could not be found. Please contact your administrator.');
       } else {
-        setTokenError(parsed?.message || e?.message || 'Failed to start exam. Please try again.');
+        // Code-only bodies such as {"error":"..."} used to be shown to the candidate as raw JSON.
+        setTokenError(getApiErrorMessage(e, 'Failed to start exam. Please try again.'));
       }
     } finally {
       setStartExamBusy(false);
@@ -1200,6 +1328,9 @@ const StudentApp: React.FC = () => {
         return true;
       } catch (e) {
         console.error(`Failed to complete session (attempt ${attempt}/${attempts}):`, e);
+        // 409 = the server has a final answer for this attempt (e.g. SESSION_TERMINATED: it already
+        // ended and can't be submitted). Retrying can't change that, so stop instead of re-sending.
+        if (e instanceof ApiError && e.status === 409) return false;
         if (attempt < attempts) {
           await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
         }
@@ -1229,6 +1360,13 @@ const StudentApp: React.FC = () => {
     setSessionId(null);
     storeStudentExamToken(null);
     storeStudentCompanyId(null);
+    // "Return to Home" lands on the token entry screen. Candidates who arrived via an emailed link
+    // used to get an empty "Secure Link Access" card with no content and no way forward.
+    setIsDirectLinkMode(false);
+    setPreStartContext(null);
+    setAccessRequestContext(null);
+    setTokenError('');
+    setTokenInput('');
   };
 
   const renderAccessRequestAction = () => {
@@ -1246,6 +1384,7 @@ const StudentApp: React.FC = () => {
               value={accessRequestComment}
               onChange={e => setAccessRequestComment(e.target.value)}
               disabled={accessRequestContext.status === 'PENDING'}
+              aria-label="Reason for the device change"
               placeholder="Explain why your device changed. This comment is mandatory for approval."
               className="w-full min-h-24 rounded-lg border border-amber-200 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:border-amber-400 disabled:opacity-60"
             />
@@ -1278,8 +1417,10 @@ const StudentApp: React.FC = () => {
   };
 
   if (activeExam && currentStudent) {
+    const examCrashMessage = 'Your answers are saved as you go. Reload this page to get back into your exam.';
     if (examResults) {
       return (
+        <ErrorBoundary title="Something went wrong showing your result" message="Your submission is not affected. Reload the page to try again.">
         <ExamResult
            exam={activeExam}
            student={currentStudent}
@@ -1292,15 +1433,18 @@ const StudentApp: React.FC = () => {
            resubmitting={resubmittingSession}
            onRetrySubmission={handleRetrySubmission}
         />
+        </ErrorBoundary>
       );
     }
     return (
-      <ExamTake 
-        exam={activeExam} 
-        student={currentStudent} 
+      <ErrorBoundary title="Something went wrong during your exam" message={examCrashMessage}>
+      <ExamTake
+        exam={activeExam}
+        student={currentStudent}
         sessionId={sessionId ?? undefined}
-        onFinish={handleExamFinish} 
+        onFinish={handleExamFinish}
       />
+      </ErrorBoundary>
     );
   }
 
@@ -1339,11 +1483,16 @@ const StudentApp: React.FC = () => {
             )}
 
             {tokenError && (
-              <div className="flex items-start gap-2 text-sm text-red-600 bg-red-50 p-3 rounded-lg border border-red-100">
+              <div role="alert" className="flex items-start gap-2 text-sm text-red-600 bg-red-50 p-3 rounded-lg border border-red-100">
                 <AlertCircle size={16} className="mt-0.5 shrink-0" />
                 <span>{tokenError}</span>
               </div>
             )}
+
+            {/* After a termination (or any failure before the pre-start card exists) the request-access
+                action used to render only inside the pre-start card below, so a candidate who came in
+                through their emailed link saw the error with no way to ask for a reattempt. */}
+            {!preStartContext && renderAccessRequestAction()}
 
             {preStartContext && (
               <div className="space-y-4 rounded-xl border border-slate-200 bg-white p-5">
@@ -1408,16 +1557,17 @@ const StudentApp: React.FC = () => {
               <form onSubmit={handleManualTokenSubmit} className="space-y-3">
                 <div className="relative">
                   <KeyRound className="absolute left-3 top-3.5 text-slate-400" size={20} />
-                  <input 
-                    type="text" 
-                    placeholder="Paste your exam token" 
+                  <input
+                    type="text"
+                    aria-label="Exam access token"
+                    placeholder="Paste your exam token"
                     className="w-full pl-10 pr-4 py-3.5 border border-slate-200 rounded-xl outline-none text-slate-800 bg-white"
                     value={tokenInput}
                     onChange={e => setTokenInput(e.target.value)}
                   />
                 </div>
                 {tokenError && (
-                  <div className="flex items-start gap-2 text-sm text-red-600 bg-red-50 p-3 rounded-lg border border-red-100">
+                  <div role="alert" className="flex items-start gap-2 text-sm text-red-600 bg-red-50 p-3 rounded-lg border border-red-100">
                     <AlertCircle size={16} className="mt-0.5 shrink-0" />
                     <span>{tokenError}</span>
                   </div>
@@ -1476,11 +1626,15 @@ export default function App() {
 
   const isAdminRoute = routePath.startsWith('/admin');
 
+  // On admin routes the SettingsProvider owns the `admin-compact` class (Settings → Density).
+  // Forcing it on here used to override that preference: this parent effect runs after the
+  // provider's, so every admin page loaded compact and then jumped to "comfortable" once server
+  // settings synced (and the login screen / a failed sync stayed compact regardless of the choice).
+  // Only make sure the student exam pages never inherit it.
   useEffect(() => {
-    document.documentElement.classList.toggle('admin-compact', isAdminRoute);
-    return () => {
+    if (!isAdminRoute) {
       document.documentElement.classList.remove('admin-compact');
-    };
+    }
   }, [isAdminRoute]);
 
   return isAdminRoute ? <AdminApp /> : <StudentApp />;

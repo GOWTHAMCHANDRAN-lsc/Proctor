@@ -488,6 +488,18 @@ if ($method === 'POST') {
         if ($lookupEmail === '' || !filter_var($lookupEmail, FILTER_VALIDATE_EMAIL)) {
             json_response(['found' => false]);
         }
+        // Unauthenticated, this was an open directory oracle: anyone could POST any email and learn
+        // whether it is a staff account plus its role, company id and full name (the very enumeration
+        // LOGIN's uniform error avoids). Login now resolves identity via LOGIN / EXTERNAL_LOGIN, so
+        // under token enforcement this only answers for the caller's own verified email (or a super admin).
+        if (auth_enforced()) {
+            $idClaims = current_session_claims();
+            $idRole = strtoupper((string)($idClaims['role'] ?? ''));
+            $idEmail = strtolower(trim((string)($idClaims['email'] ?? '')));
+            if ($idClaims === null || ($idRole !== 'SUPER_ADMIN' && $idEmail !== $lookupEmail)) {
+                json_response(['found' => false]);
+            }
+        }
         $idStmt = $pdo->prepare("SELECT company_id, role, full_name FROM platform_users WHERE email = ? AND status <> 'DISABLED' LIMIT 1");
         $idStmt->execute([$lookupEmail]);
         $idRow = $idStmt->fetch();
@@ -651,7 +663,11 @@ if ($method === 'POST') {
         // VIEWER) — it only ever changes the CALLER's own password, so it sits ahead of the admin-only
         // gate below. Super admins authenticate against the central LSC auth service, so their
         // password is not stored here and is deliberately left alone.
-        $selfRole = get_actor_role($payload);
+        // Must be a signed-in staff member. Previously this used get_actor_role()/get_actor_id(),
+        // which with no token fall back to the client-supplied X-Actor-Id / payload actorId — so an
+        // anonymous POST {action:'RESET_OWN_PASSWORD', actorId:'<any admin email>'} reset that admin's
+        // password (locking them out, repeatably) and mailed them an attacker-chosen dashboard link.
+        $selfRole = require_staff($payload);
         $selfActorId = get_actor_id($payload);
         if ($selfRole === 'SUPER_ADMIN') {
             json_response(['error' => 'Super admin passwords are managed by the central LSC auth service and cannot be reset here.'], 400);
@@ -664,7 +680,7 @@ if ($method === 'POST') {
             json_response(['error' => 'Password storage is unavailable on this database.'], 503);
         }
 
-        $lookup = $pdo->prepare("SELECT id, company_id, role, full_name, email FROM platform_users WHERE LOWER(email) = ? LIMIT 1");
+        $lookup = $pdo->prepare("SELECT id, company_id, role, full_name, email, password_hash, password_updated_at FROM platform_users WHERE LOWER(email) = ? LIMIT 1");
         $lookup->execute([$actorEmail]);
         $me = $lookup->fetch();
         $lookup->closeCursor();
@@ -710,6 +726,20 @@ if ($method === 'POST') {
             'dashboardUrl' => (string)($payload['dashboardUrl'] ?? ''),
         ]);
 
+        if (!$emailResult['ok']) {
+            // The new password exists only in the email that just failed — keeping it would leave the
+            // user with a password nobody knows (locked out once their session expires). Put the old
+            // one back and report that nothing changed.
+            $restore = $pdo->prepare("UPDATE platform_users SET password_hash = ?, password_updated_at = ? WHERE id = ? LIMIT 1");
+            $restore->execute([$me['password_hash'] ?? null, $me['password_updated_at'] ?? null, (int)$me['id']]);
+            $restore->closeCursor();
+            json_response([
+                'ok' => false,
+                'error' => 'Your password was not changed because the email with the new password could not be sent ('
+                    . ($emailResult['error'] ?? 'Unknown error') . '). Please try again later.',
+            ]);
+        }
+
         audit_log($pdo, [
             'companyId' => $myCompanyId ?? 1,
             'actorRole' => $selfRole,
@@ -720,11 +750,7 @@ if ($method === 'POST') {
             'message' => "Self-service password reset for {$me['email']}.",
         ]);
 
-        $resp = ['ok' => true, 'message' => 'A temporary password has been emailed to you.'];
-        if (!$emailResult['ok']) {
-            $resp['emailWarning'] = 'Password reset, but the email could not be sent: ' . ($emailResult['error'] ?? 'Unknown error');
-        }
-        json_response($resp);
+        json_response(['ok' => true, 'message' => 'A temporary password has been emailed to you.']);
     }
 
     $actorRole = require_role(['SUPER_ADMIN', 'ADMIN'], $payload);
@@ -777,7 +803,20 @@ if ($method === 'POST') {
             $passwordHash = password_hash($plainPassword, PASSWORD_DEFAULT);
         }
 
+        // email is UNIQUE: report a clash clearly instead of letting the INSERT/UPDATE throw a raw
+        // "Duplicate entry" 500 (which the directory screen printed verbatim).
+        $assertEmailFree = static function (PDO $pdo, string $email, int $exceptId): void {
+            $dupStmt = $pdo->prepare('SELECT id FROM platform_users WHERE email = ? AND id <> ? LIMIT 1');
+            $dupStmt->execute([$email, $exceptId]);
+            $dupRow = $dupStmt->fetch();
+            $dupStmt->closeCursor();
+            if ($dupRow) {
+                json_response(['error' => 'A user with this email already exists.'], 409);
+            }
+        };
+
         if ($action === 'CREATE') {
+            $assertEmailFree($pdo, $email, 0);
             if (db_column_exists($pdo, 'platform_users', 'password_hash')) {
                 $stmt = $pdo->prepare("INSERT INTO platform_users
                     (company_id, role, full_name, email, status, registration_id, notes, password_hash, password_updated_at)
@@ -816,7 +855,7 @@ if ($method === 'POST') {
                 json_response(['error' => 'userId is required.'], 400);
             }
 
-            $scopeSql = "SELECT company_id, role FROM platform_users WHERE id = ? LIMIT 1";
+            $scopeSql = "SELECT company_id, role, email FROM platform_users WHERE id = ? LIMIT 1";
             $scopeStmt = $pdo->prepare($scopeSql);
             $scopeStmt->execute([$userId]);
             $existing = $scopeStmt->fetch();
@@ -824,9 +863,22 @@ if ($method === 'POST') {
             if (!$existing) {
                 json_response(['error' => 'User not found.'], 404);
             }
+            // The check above only validated the NEW role. STATUS/DELETE/RESET_PASSWORD also check the
+            // user's CURRENT role; without it an ADMIN could UPDATE a peer ADMIN of the same company
+            // (role -> VIEWER, change their email, disable them) despite not being allowed to manage admins.
+            if (!can_manage_directory_role($actorRole, strtoupper((string)$existing['role']))) {
+                json_response(['error' => 'You cannot manage this role.'], 403);
+            }
             if ($actorRole !== 'SUPER_ADMIN' && (int)($existing['company_id'] ?? 0) !== require_company_id($payload)) {
                 json_response(['error' => 'Forbidden for this company.'], 403);
             }
+            // Don't let the signed-in user demote or disable their own account (a sole super admin
+            // doing so locks the platform out of super-admin access).
+            if ($actorId !== null && strcasecmp((string)$actorId, (string)$existing['email']) === 0
+                && (strtoupper((string)$existing['role']) !== $targetRole || $status === 'DISABLED')) {
+                json_response(['error' => 'You cannot change the role of, or disable, your own account.'], 400);
+            }
+            $assertEmailFree($pdo, $email, $userId);
 
             $stmt = $pdo->prepare("UPDATE platform_users
                                    SET company_id = ?, role = ?, full_name = ?, email = ?, status = ?, registration_id = ?, notes = ?
@@ -967,7 +1019,7 @@ if ($method === 'POST') {
             json_response(['error' => 'Super admins are managed by the central LSC auth service and cannot be reset here.'], 400);
         }
         if (!role_uses_local_password($targetRole)) {
-            json_response(['error' => 'Only ADMIN and PROCTOR accounts have a password to reset. Students sign in with exam access tokens.'], 400);
+            json_response(['error' => 'Only ADMIN, PROCTOR and VIEWER accounts have a password to reset. Students sign in with exam access tokens.'], 400);
         }
         if (!can_manage_directory_role($actorRole, $targetRole)) {
             json_response(['error' => 'You cannot manage this role.'], 403);
@@ -1048,6 +1100,10 @@ if ($method === 'POST') {
         }
         if ($actorRole !== 'SUPER_ADMIN' && (int)($existing['company_id'] ?? 0) !== require_company_id($payload)) {
             json_response(['error' => 'Forbidden for this company.'], 403);
+        }
+        // Mirror DELETE's self-guard: disabling yourself (e.g. the only super admin) is a lock-out.
+        if ($status === 'DISABLED' && $actorId !== null && strcasecmp((string)$actorId, (string)$existing['email']) === 0) {
+            json_response(['error' => 'You cannot disable your own account.'], 400);
         }
 
         $stmt = $pdo->prepare("UPDATE platform_users SET status = ? WHERE id = ? LIMIT 1");

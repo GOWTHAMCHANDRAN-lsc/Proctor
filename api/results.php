@@ -244,9 +244,14 @@ if ($method === 'GET') {
 
         // How many questions the candidate actually attended (answered), for terminated/abandoned
         // attempts where that differs from the full paper.
+        // Structured types (multi-select, fill-blank, ordering, matching, drag-drop) store their
+        // response only in answer_json, so they must count too — otherwise a candidate who answered
+        // only those types was reported as having attended 0 questions.
         $answeredCount = 0;
         foreach ($answers as $a) {
-            if ($a['answerOptionIndex'] !== null || ($a['answerText'] !== null && $a['answerText'] !== '')) {
+            if ($a['answerOptionIndex'] !== null
+                || ($a['answerText'] !== null && $a['answerText'] !== '')
+                || ($a['answerJson'] !== null && $a['answerJson'] !== [])) {
                 $answeredCount++;
             }
         }
@@ -297,7 +302,7 @@ if ($method === 'POST') {
         json_response(['error' => 'sessionId and changes are required.'], 400);
     }
 
-    $sessStmt = $pdo->prepare('SELECT id, exam_id, student_id FROM exam_sessions WHERE id = ? AND company_id = ? LIMIT 1');
+    $sessStmt = $pdo->prepare('SELECT id, exam_id, student_id, status FROM exam_sessions WHERE id = ? AND company_id = ? LIMIT 1');
     $sessStmt->execute([$sessionId, $companyId]);
     $session = $sessStmt->fetch();
     if (!$session) {
@@ -337,6 +342,20 @@ if ($method === 'POST') {
     if ($hasAuditTable) {
         $auditStmt = $pdo->prepare('INSERT INTO result_audit_logs (session_id, question_id, previous_awarded_marks, new_awarded_marks, previous_is_correct, new_is_correct, actor, note)
                                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    }
+
+    // Validate every change before writing any: an out-of-range mark (e.g. 50 on a 5-mark question)
+    // was stored as-is, pushing the attempt past 100% and possibly flipping it to PASS. A negative
+    // value is only accepted when it is the answer's existing (negative-marking) score.
+    foreach ($changes as $change) {
+        if (!is_array($change) || !isset($change['questionId']) || !array_key_exists('awardedMarks', $change)) continue;
+        $qid = (string)$change['questionId'];
+        if (!isset($currentMap[$qid]) || !is_numeric($change['awardedMarks'])) continue;
+        $candidate = (float)$change['awardedMarks'];
+        $existing = $currentMap[$qid]['awarded_marks'] !== null ? (float)$currentMap[$qid]['awarded_marks'] : null;
+        if (!is_finite($candidate) || $candidate > (int)$currentMap[$qid]['marks'] || ($candidate < 0 && $candidate !== $existing)) {
+            json_response(['error' => "Marks for question {$qid} must be between 0 and " . (int)$currentMap[$qid]['marks'] . '.'], 400);
+        }
     }
 
     $updated = 0;
@@ -429,6 +448,12 @@ if ($method === 'POST') {
         if ($passPercent < 0) $passPercent = 0;
         if ($passPercent > 100) $passPercent = 100;
         $passed = ($totalScore / $maxScore) >= ($passPercent / 100) ? 1 : 0;
+    }
+    // A TERMINATED attempt (violation block, abandoned, or superseded by an admin Renew) is a FAIL
+    // regardless of its score — the same rule the terminate/sweep/reset paths stamp. Marking one of
+    // its descriptive answers must not flip it to PASS (or to "pending").
+    if (($session['status'] ?? '') === 'TERMINATED') {
+        $passed = 0;
     }
 
     $updateSession = $pdo->prepare('UPDATE exam_sessions SET total_score = ?, max_score = ?, passed = ? WHERE id = ? AND company_id = ?');

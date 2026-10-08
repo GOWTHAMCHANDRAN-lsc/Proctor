@@ -4,10 +4,24 @@ import { apiGet, apiPost } from '../../services/api';
 import { Pagination, usePagination } from './Pagination';
 import { CertificateIssuance, UserRole } from '../../types';
 
+// DEAD = retries exhausted (certificates.php marks an issuance DEAD after CERTIFICATE_MAX_ATTEMPTS).
+// It was missing here, so DEAD rows got a neutral badge and couldn't be filtered for at all.
 const STATUS_TONE: Record<string, string> = {
   PENDING: 'bg-slate-100 text-slate-600 border-slate-200',
   ISSUED: 'bg-emerald-100 text-emerald-700 border-emerald-200',
   FAILED: 'bg-amber-100 text-amber-700 border-amber-200',
+  DEAD: 'bg-rose-100 text-rose-700 border-rose-200',
+};
+
+// Human-readable outcome of a manual Retry (the `status` certificates.php returns).
+const RETRY_OUTCOME_TEXT: Record<string, string> = {
+  ISSUED: 'Certificate issued.',
+  ALREADY_ISSUED: 'This certificate was already issued.',
+  FAILED: 'Retry failed again — see the error on the row.',
+  DEAD: 'Retry limit reached — this issuance will not be retried again.',
+  DISABLED: 'Certification is turned off for this exam, so nothing was issued.',
+  NOT_ELIGIBLE: 'This attempt is not eligible (not passed, or still pending manual grading).',
+  LOCK_BUSY: 'Another process is handling this certificate right now — try again shortly.',
 };
 
 const StatusBadge: React.FC<{ status: string }> = ({ status }) => (
@@ -22,6 +36,7 @@ export const Certificates: React.FC<{ role?: UserRole }> = ({ role }) => {
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [expanded, setExpanded] = useState<number | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
+  const [notice, setNotice] = useState<{ tone: 'success' | 'warn' | 'error'; text: string } | null>(null);
 
   const isFullAdmin = role === UserRole.ADMIN || role === UserRole.SUPER_ADMIN;
 
@@ -30,8 +45,9 @@ export const Certificates: React.FC<{ role?: UserRole }> = ({ role }) => {
     try {
       const data = await apiGet<{ issuances: CertificateIssuance[] }>('certificates.php');
       setIssuances(data?.issuances || []);
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to load certificate issuances:', e);
+      setNotice({ tone: 'error', text: e?.message || 'Could not load certificate issuances.' });
     } finally {
       setLoading(false);
     }
@@ -48,8 +64,16 @@ export const Certificates: React.FC<{ role?: UserRole }> = ({ role }) => {
 
   const handleRetry = async (issuance: CertificateIssuance) => {
     setBusyId(issuance.id);
+    setNotice(null);
     try {
-      await apiPost('certificates.php', { action: 'RETRY', id: issuance.id });
+      // The API answers 200 with the outcome (ISSUED / FAILED / DEAD / DISABLED / NOT_ELIGIBLE /
+      // LOCK_BUSY …). It used to be ignored, so a retry that changed nothing looked like a dead button.
+      const res = await apiPost<{ ok?: boolean; status?: string }>('certificates.php', { action: 'RETRY', id: issuance.id });
+      const outcome = String(res?.status || '');
+      setNotice({
+        tone: outcome === 'ISSUED' || outcome === 'ALREADY_ISSUED' ? 'success' : 'warn',
+        text: RETRY_OUTCOME_TEXT[outcome] || `Retry finished${outcome ? ` (${outcome})` : ''}.`,
+      });
       await load();
     } catch (e: any) {
       alert(e?.message || 'Could not retry issuance.');
@@ -60,8 +84,10 @@ export const Certificates: React.FC<{ role?: UserRole }> = ({ role }) => {
 
   const handleResend = async (issuance: CertificateIssuance) => {
     setBusyId(issuance.id);
+    setNotice(null);
     try {
       await apiPost('certificates.php', { action: 'RESEND', id: issuance.id });
+      setNotice({ tone: 'success', text: `Certificate email re-sent to ${issuance.studentEmail || issuance.studentName}.` });
       await load();
     } catch (e: any) {
       alert(e?.message || 'Could not resend certificate email.');
@@ -83,21 +109,43 @@ export const Certificates: React.FC<{ role?: UserRole }> = ({ role }) => {
             Certificates are issued on demand only, from a passed result in Results, and only for exams with certification enabled. The external certificate system isn't wired up yet — issuances show FAILED/DEAD with the reason until that's configured.
           </p>
         </div>
-        <button onClick={load} className="px-3.5 py-2 lsc-button-ghost text-sm inline-flex items-center gap-2 self-start">
+        <button onClick={load} disabled={loading} className="px-3.5 py-2 lsc-button-ghost text-sm inline-flex items-center gap-2 self-start disabled:opacity-60">
           <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> Refresh
         </button>
       </div>
 
+      {notice && (
+        <div
+          role={notice.tone === 'success' ? 'status' : 'alert'}
+          className={`flex items-start justify-between gap-3 text-sm rounded-lg border px-3.5 py-2.5 ${
+            notice.tone === 'success'
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+              : notice.tone === 'warn'
+                ? 'bg-amber-50 border-amber-200 text-amber-800'
+                : 'bg-rose-50 border-rose-200 text-rose-700'
+          }`}
+        >
+          <span>{notice.text}</span>
+          <button onClick={() => setNotice(null)} className="text-xs opacity-70 hover:opacity-100 shrink-0">Dismiss</button>
+        </div>
+      )}
+
       <div className="lsc-panel overflow-hidden">
         <div className="p-4 lsc-panel-header flex flex-wrap items-center justify-between gap-3">
           <div className="text-sm font-semibold text-slate-800">Issuances</div>
-          <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} className="px-3 py-1.5 border border-slate-200 rounded-lg text-xs outline-none bg-white">
+          <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} aria-label="Filter by status" className="px-3 py-1.5 border border-slate-200 rounded-lg text-xs outline-none bg-white">
             <option value="ALL">All statuses</option>
             {Object.keys(STATUS_TONE).map(s => <option key={s} value={s}>{s}</option>)}
           </select>
         </div>
         {loading && <div className="p-6 text-sm text-slate-400">Loading issuances...</div>}
-        {!loading && filtered.length === 0 && <div className="p-6 text-sm text-slate-400">No certificate issuances yet — an admin issues one on demand from a passed result in Results.</div>}
+        {!loading && filtered.length === 0 && (
+          <div className="p-6 text-sm text-slate-400">
+            {issuances.length > 0
+              ? `No issuances with status ${statusFilter}.`
+              : 'No certificate issuances yet — an admin issues one on demand from a passed result in Results.'}
+          </div>
+        )}
         {!loading && filtered.length > 0 && (
           <div className="lsc-table-wrap">
             <table className="w-full text-left text-sm">

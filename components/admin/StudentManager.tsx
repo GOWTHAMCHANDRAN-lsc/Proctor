@@ -84,6 +84,30 @@ const parseCsvLine = (line: string): string[] => {
   return cols;
 };
 
+// Invitations are emailed to this address, so reject obviously broken ones ("a@b", "x y@z.com") up
+// front rather than letting the server's bare "contains @" check store them.
+const isValidEmail = (value: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+
+// Spreadsheet apps run a cell starting with = + - @ (or tab/CR) as a formula; prefix those with an
+// apostrophe, then quote anything containing a delimiter, quote or line break.
+const csvCell = (value: unknown) => {
+  let str = String(value ?? '');
+  if (/^[=+\-@\t\r]/.test(str)) str = `'${str}`;
+  return /[",\r\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+};
+
+// Excel's plain "CSV (Comma delimited)" saves in Windows-1252, not UTF-8. Reading that as UTF-8 turns
+// every accented name into "�" before it is stored — so try strict UTF-8 first and fall back, the same
+// way ExamManager reads its question CSVs.
+const readCsvText = async (file: File): Promise<string> => {
+  const buffer = await file.arrayBuffer();
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buffer).replace(/^\uFEFF/, '');
+  } catch {
+    return new TextDecoder('windows-1252').decode(buffer).replace(/^\uFEFF/, '');
+  }
+};
+
 const mergeStudents = (current: Student[], incoming: Student[]) => {
   const map = new Map(current.map(student => [student.id, student]));
   incoming.forEach(student => {
@@ -103,6 +127,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
   const [selectedCompanyId, setSelectedCompanyId] = useState<number | ''>('');
   const [superStudents, setSuperStudents] = useState<Student[]>([]);
   const [superStudentsLoading, setSuperStudentsLoading] = useState(false);
+  const [superStudentsError, setSuperStudentsError] = useState('');
 
   // Effective bindings — the rest of the component uses these transparently.
   const students = isSuperAdmin ? superStudents : propStudents;
@@ -124,6 +149,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
 
   const [newBatch, setNewBatch] = useState({ name: '', description: '' });
   const [newStudent, setNewStudent] = useState({ fullName: '', email: '', registrationId: '' });
+  // In-flight guards so a double-click can't fire the same create twice.
+  const [createBatchBusy, setCreateBatchBusy] = useState(false);
+  const [addStudentBusy, setAddStudentBusy] = useState(false);
 
   const [deleteStudentTarget, setDeleteStudentTarget] = useState<Student | null>(null);
   const [deleteStudentBusy, setDeleteStudentBusy] = useState(false);
@@ -204,17 +232,34 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
     let cancelled = false;
     (async () => {
       setSuperStudentsLoading(true);
+      setSuperStudentsError('');
       try {
         const data = await apiGet<{ students: Student[] }>(`students.php${companyQuery}`);
         if (!cancelled) setSuperStudents(data?.students || []);
-      } catch {
-        if (!cancelled) setSuperStudents([]);
+      } catch (e: any) {
+        // Say so — an empty table would otherwise read as "this company has no students".
+        if (!cancelled) {
+          setSuperStudents([]);
+          setSuperStudentsError(e?.message || 'Failed to load students.');
+        }
       } finally {
         if (!cancelled) setSuperStudentsLoading(false);
       }
     })();
     return () => { cancelled = true; };
   }, [isSuperAdmin, effectiveCompanyId, companyQuery]);
+
+  // Escape dismisses whichever delete confirmation is open — never while its request is running.
+  useEffect(() => {
+    if (!deleteStudentTarget && !confirmDeleteBatch) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (deleteStudentTarget && !deleteStudentBusy) setDeleteStudentTarget(null);
+      if (confirmDeleteBatch && !deleteBatchBusy) setConfirmDeleteBatch(false);
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [deleteStudentTarget, confirmDeleteBatch, deleteStudentBusy, deleteBatchBusy]);
 
   const selectedBatch = useMemo(
     () => batches.find(batch => batch.id === selectedBatchId) || null,
@@ -231,16 +276,18 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
     );
   }, [search, students]);
 
-  const studentPaging = usePagination(filteredStudents, search);
+  const studentPaging = usePagination(filteredStudents, `${search}|${selectedCompanyId}`);
 
   const batchCount = batches.length;
 
   const createBatch = async () => {
+    if (createBatchBusy) return;
     if (!newBatch.name.trim()) {
       alert('Batch name is required.');
       return;
     }
 
+    setCreateBatchBusy(true);
     try {
       const result = await apiPost<{ batch: Batch; created: boolean }>('batches.php', {
         name: newBatch.name.trim(),
@@ -251,8 +298,12 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
       const batch = result.batch;
       setBatches(prev => {
         const exists = prev.some(item => item.id === batch.id);
+        // When the name already existed the server hands back that batch with a placeholder
+        // studentCount of 0 — keep the real tally we already have instead of showing "(0)".
         const next = exists
-          ? prev.map(item => (item.id === batch.id ? { ...item, ...batch } : item))
+          ? prev.map(item => (item.id === batch.id
+            ? { ...item, ...batch, studentCount: result.created ? batch.studentCount : item.studentCount }
+            : item))
           : [batch, ...prev];
         return next;
       });
@@ -263,28 +314,45 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
     } catch (e: any) {
       console.error(e);
       alert(e?.message || 'Failed to create batch.');
+    } finally {
+      setCreateBatchBusy(false);
     }
   };
 
   const handleAddStudent = async () => {
+    if (addStudentBusy) return;
     if (!selectedBatch) {
       alert('Create or select a batch first.');
       return;
     }
-    if (!newStudent.fullName || !newStudent.email || !newStudent.registrationId) {
+    const fullName = newStudent.fullName.trim();
+    const email = newStudent.email.trim();
+    const registrationId = newStudent.registrationId.trim();
+    if (!fullName || !email || !registrationId) {
       alert('Full name, email, and registration ID are required.');
       return;
     }
+    if (!isValidEmail(email)) {
+      alert(`"${email}" is not a valid email address.`);
+      return;
+    }
 
-    const existingMatch = students.find(s => s.registrationId === newStudent.registrationId || s.email === newStudent.email);
+    // The server matches existing students case-insensitively (emails are stored lowercase), so
+    // compare the same way here.
+    const emailKey = email.toLowerCase();
+    const regKey = registrationId.toLowerCase();
+    const existingMatch = students.find(s => (s.registrationId || '').toLowerCase() === regKey || (s.email || '').toLowerCase() === emailKey);
     if (existingMatch && existingMatch.batches.some(b => b.id === selectedBatch.id)) {
       alert('This student is already in this batch.');
       return;
     }
 
+    setAddStudentBusy(true);
     try {
       const result = await apiPost<{ students: Student[]; errors?: string[] }>('students.php', {
-        ...newStudent,
+        fullName,
+        email,
+        registrationId,
         companyId: effectiveCompanyId,
         batchId: selectedBatch.id,
         batch: selectedBatch.name,
@@ -309,7 +377,10 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
       }
     } catch (e: any) {
       console.error(e);
-      alert('Failed to save student to database.');
+      // Surface the server's reason (e.g. "Select a company before managing students.").
+      alert(e?.message || 'Failed to save student to database.');
+    } finally {
+      setAddStudentBusy(false);
     }
   };
 
@@ -433,12 +504,10 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
       ]),
     ];
     const csv = rows
-      .map(row => row.map(value => {
-        const str = String(value ?? '');
-        return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
-      }).join(','))
+      .map(row => row.map(csvCell).join(','))
       .join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    // BOM so Excel opens UTF-8 names correctly (matches ExamManager's CSV exports).
+    const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -459,9 +528,14 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
     headerCols.findIndex(h => aliases.includes(h.replace(/^"|"$/g, '').trim().toLowerCase()));
 
   const parseCSV = (text: string) => {
-    const lines = text.replace(/^﻿/, '').split(/\r?\n/);
+    const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/);
     const newStudents: Student[] = [];
     const errors: CsvError[] = [];
+    // The server upserts by registration ID OR email and stores emails lowercase, so two rows that
+    // differ only by case are the SAME student there: the second would silently overwrite the
+    // first's name/registration ID. Catch them here instead.
+    const seenRegIds = new Set<string>();
+    const seenEmails = new Set<string>();
 
     const headerLine = lines[0]?.trim();
     if (!headerLine) {
@@ -492,14 +566,18 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
         errors.push({ row: i + 1, message: 'Empty fields detected.' });
         continue;
       }
-      if (!email.includes('@')) {
+      if (!isValidEmail(email)) {
         errors.push({ row: i + 1, message: `Invalid email format: ${email}` });
         continue;
       }
-      if (newStudents.some(s => s.registrationId === regId || s.email === email)) {
+      const regKey = regId.toLowerCase();
+      const emailKey = email.toLowerCase();
+      if (seenRegIds.has(regKey) || seenEmails.has(emailKey)) {
         errors.push({ row: i + 1, message: `Duplicate ID or Email inside file: ${regId} / ${email}` });
         continue;
       }
+      seenRegIds.add(regKey);
+      seenEmails.add(emailKey);
 
       newStudents.push({
         id: Math.random().toString(36).slice(2, 11),
@@ -514,6 +592,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
   };
 
   const handleFileUpload = (file: File) => {
+    if (uploadStatus === 'PROCESSING') return; // a drop while an upload is running would double-post
     if (!selectedBatch) {
       setUploadStatus('ERROR');
       setUploadMsg('Create or select a batch first.');
@@ -532,10 +611,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
     setCsvErrors([]);
     setUploadMsg(`Uploading students into ${selectedBatch.name}...`);
 
-    const reader = new FileReader();
-    reader.onload = event => {
-      const text = event.target?.result as string;
-
+    readCsvText(file).then(text => {
       setTimeout(async () => {
         const { newStudents, errors } = parseCSV(text);
 
@@ -586,14 +662,10 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
           setCsvErrors(errors);
         }
       }, 800);
-    };
-
-    reader.onerror = () => {
+    }).catch(() => {
       setUploadStatus('ERROR');
       setUploadMsg('Failed to read file.');
-    };
-
-    reader.readAsText(file);
+    });
   };
 
   const handleDrag = (e: React.DragEvent) => {
@@ -634,6 +706,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               onChange={e => setSelectedCompanyId(e.target.value === '' ? '' : Number(e.target.value))}
               className="px-3 py-2 border border-slate-200 rounded-lg bg-white text-sm outline-none min-w-[200px]"
               title="Select a company to manage its students"
+              aria-label="Company"
             >
               <option value="">Select a company…</option>
               {companies.map(company => (
@@ -692,7 +765,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
         </div>
         <div className="lsc-panel p-4">
           <div className="flex items-center justify-between mb-2">
-            <label className="block text-xs font-semibold text-slate-500 uppercase">Selected Batch</label>
+            <label htmlFor="student-batch-select" className="block text-xs font-semibold text-slate-500 uppercase">Selected Batch</label>
             <button
               type="button"
               onClick={() => setConfirmDeleteBatch(true)}
@@ -704,6 +777,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
             </button>
           </div>
           <select
+            id="student-batch-select"
             value={selectedBatchId}
             onChange={e => setSelectedBatchId(e.target.value ? Number(e.target.value) : '')}
             className="w-full p-2.5 border border-slate-200 rounded-lg outline-none transition-all bg-white"
@@ -731,7 +805,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               <h3 className="font-bold text-slate-900 text-lg">Create Batch</h3>
               <p className="text-sm text-slate-500">Create the batch first, then choose it from the dropdown for student upload.</p>
             </div>
-            <button onClick={() => setIsCreatingBatch(false)} className="bg-slate-100 p-1.5 rounded-full hover:bg-slate-200 transition-colors">
+            <button onClick={() => setIsCreatingBatch(false)} aria-label="Close create batch" className="bg-slate-100 p-1.5 rounded-full hover:bg-slate-200 transition-colors">
               <X size={18} className="text-slate-500 hover:text-slate-700" />
             </button>
           </div>
@@ -741,8 +815,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               <input type="text" className="w-full p-2.5 border border-slate-200 rounded-lg bg-slate-50 text-slate-600" value={effectiveCompanyLabel} readOnly />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Batch Name</label>
+              <label htmlFor="new-batch-name" className="block text-xs font-semibold text-slate-500 uppercase mb-1">Batch Name</label>
               <input
+                id="new-batch-name"
                 type="text"
                 placeholder="e.g. Batch A"
                 className="w-full p-2.5 border border-slate-200 rounded-lg outline-none transition-all bg-white"
@@ -751,8 +826,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Description</label>
+              <label htmlFor="new-batch-description" className="block text-xs font-semibold text-slate-500 uppercase mb-1">Description</label>
               <input
+                id="new-batch-description"
                 type="text"
                 placeholder="Optional notes"
                 className="w-full p-2.5 border border-slate-200 rounded-lg outline-none transition-all bg-white"
@@ -763,8 +839,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
           </div>
           <div className="mt-6 flex justify-end gap-3">
             <button onClick={() => setIsCreatingBatch(false)} className="px-5 py-2 text-slate-600 hover:bg-slate-50 font-medium rounded-lg">Cancel</button>
-            <button onClick={createBatch} className="px-6 py-2 lsc-button-primary">
-              Save Batch
+            <button onClick={createBatch} disabled={createBatchBusy} className="px-6 py-2 lsc-button-primary disabled:opacity-60 flex items-center gap-2">
+              {createBatchBusy && <Loader2 size={15} className="animate-spin" />}
+              {createBatchBusy ? 'Saving…' : 'Save Batch'}
             </button>
           </div>
         </div>
@@ -778,7 +855,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               <h3 className="font-bold text-slate-900 text-lg">Add New Student</h3>
               <p className="text-sm text-slate-500">This student will be added to batch {selectedBatch?.name || 'selected batch'}.</p>
             </div>
-            <button onClick={() => setIsAddingStudent(false)} className="bg-slate-100 p-1.5 rounded-full hover:bg-slate-200 transition-colors">
+            <button onClick={() => setIsAddingStudent(false)} aria-label="Close add student" className="bg-slate-100 p-1.5 rounded-full hover:bg-slate-200 transition-colors">
               <X size={18} className="text-slate-500 hover:text-slate-700" />
             </button>
           </div>
@@ -792,8 +869,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               <input type="text" className="w-full p-2.5 border border-slate-200 rounded-lg bg-slate-50 text-slate-600" value={selectedBatch?.name || ''} readOnly />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Full Name</label>
+              <label htmlFor="new-student-name" className="block text-xs font-semibold text-slate-500 uppercase mb-1">Full Name</label>
               <input
+                id="new-student-name"
                 type="text"
                 placeholder="e.g. John Doe"
                 className="w-full p-2.5 border border-slate-200 rounded-lg outline-none transition-all bg-white"
@@ -802,8 +880,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Registration ID</label>
+              <label htmlFor="new-student-reg" className="block text-xs font-semibold text-slate-500 uppercase mb-1">Registration ID</label>
               <input
+                id="new-student-reg"
                 type="text"
                 placeholder="e.g. REG-2024-001"
                 className="w-full p-2.5 border border-slate-200 rounded-lg outline-none transition-all bg-white"
@@ -812,8 +891,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-500 uppercase mb-1">Email Address</label>
+              <label htmlFor="new-student-email" className="block text-xs font-semibold text-slate-500 uppercase mb-1">Email Address</label>
               <input
+                id="new-student-email"
                 type="email"
                 placeholder="john@example.com"
                 className="w-full p-2.5 border border-slate-200 rounded-lg outline-none transition-all bg-white"
@@ -824,8 +904,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
           </div>
           <div className="mt-6 flex justify-end gap-3">
             <button onClick={() => setIsAddingStudent(false)} className="px-5 py-2 text-slate-600 hover:bg-slate-50 font-medium rounded-lg">Cancel</button>
-            <button onClick={handleAddStudent} className="px-6 py-2 lsc-button-primary">
-              Save Record
+            <button onClick={handleAddStudent} disabled={addStudentBusy} className="px-6 py-2 lsc-button-primary disabled:opacity-60 flex items-center gap-2">
+              {addStudentBusy && <Loader2 size={15} className="animate-spin" />}
+              {addStudentBusy ? 'Saving…' : 'Save Record'}
             </button>
           </div>
         </div>
@@ -846,12 +927,27 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
             onDragOver={handleDrag}
             onDrop={handleDrop}
             onClick={() => uploadStatus !== 'PROCESSING' && fileInputRef.current?.click()}
+            role="button"
+            tabIndex={0}
+            aria-label="Upload student CSV"
+            aria-disabled={uploadStatus === 'PROCESSING'}
+            onKeyDown={e => {
+              if ((e.key === 'Enter' || e.key === ' ') && uploadStatus !== 'PROCESSING') {
+                e.preventDefault();
+                fileInputRef.current?.click();
+              }
+            }}
           >
             <input
               ref={fileInputRef}
               type="file"
               className="hidden"
-              onChange={e => e.target.files?.[0] && handleFileUpload(e.target.files[0])}
+              onChange={e => {
+                const file = e.target.files?.[0];
+                // Clear the value so picking the SAME (corrected) file again still fires onChange.
+                e.target.value = '';
+                if (file) handleFileUpload(file);
+              }}
               accept=".csv"
               disabled={uploadStatus === 'PROCESSING'}
             />
@@ -926,7 +1022,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
                 <div className="flex items-center gap-2 text-red-800 text-xs font-bold uppercase tracking-wider">
                   <XCircle size={14} /> Validation Errors ({csvErrors.length})
                 </div>
-                <button onClick={() => setCsvErrors([])} className="text-red-400 hover:text-red-600"><X size={14} /></button>
+                <button onClick={() => setCsvErrors([])} aria-label="Dismiss validation errors" className="text-red-400 hover:text-red-600"><X size={14} /></button>
               </div>
               <div className="max-h-48 overflow-auto lsc-table-wrap scrollbar-thin scrollbar-thumb-red-100 scrollbar-track-transparent">
                 <table className="w-full text-left text-xs">
@@ -959,6 +1055,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
                 value={search}
                 onChange={e => setSearch(e.target.value)}
                 placeholder="Search by name, ID, company, or batch..."
+                aria-label="Search students"
                 className="pl-9 pr-4 py-2 text-sm border border-slate-200 rounded-lg outline-none w-full sm:w-72 transition-all bg-white"
               />
             </div>
@@ -1060,6 +1157,8 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
                           </div>
                           {isSuperAdmin && superStudentsLoading ? (
                             <p className="flex items-center gap-2"><Loader2 size={16} className="animate-spin" /> Loading students…</p>
+                          ) : isSuperAdmin && superStudentsError ? (
+                            <p className="text-red-600">Couldn't load this company's students: {superStudentsError}</p>
                           ) : isSuperAdmin && !effectiveCompanyId ? (
                             <p>Select a company above to view its students.</p>
                           ) : (
@@ -1088,13 +1187,13 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
 
       {deleteStudentTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40" onClick={() => !deleteStudentBusy && setDeleteStudentTarget(null)}>
-          <div className="lsc-card w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
+          <div className="lsc-card w-full max-w-md p-6 max-h-[90vh] overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="delete-student-title" onClick={e => e.stopPropagation()}>
             <div className="flex items-start gap-3">
               <div className="lsc-icon-tile-danger p-2.5 shrink-0">
                 <Trash2 size={18} />
               </div>
               <div className="min-w-0">
-                <h3 className="text-lg font-semibold text-slate-900">Delete student?</h3>
+                <h3 id="delete-student-title" className="text-lg font-semibold text-slate-900">Delete student?</h3>
                 <p className="text-sm text-slate-500 mt-1">
                   This permanently removes <span className="font-medium text-slate-800">{deleteStudentTarget.fullName}</span> ({deleteStudentTarget.registrationId}) and all of their exam sessions and results. This can't be undone.
                 </p>
@@ -1104,6 +1203,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               <button
                 onClick={() => setDeleteStudentTarget(null)}
                 disabled={deleteStudentBusy}
+                autoFocus
                 className="px-5 py-2 lsc-button-ghost text-sm"
               >
                 Cancel
@@ -1123,13 +1223,13 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
 
       {confirmDeleteBatch && selectedBatch && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40" onClick={() => !deleteBatchBusy && setConfirmDeleteBatch(false)}>
-          <div className="lsc-card w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
+          <div className="lsc-card w-full max-w-md p-6 max-h-[90vh] overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="delete-batch-title" onClick={e => e.stopPropagation()}>
             <div className="flex items-start gap-3">
               <div className="lsc-icon-tile-danger p-2.5 shrink-0">
                 <Trash2 size={18} />
               </div>
               <div className="min-w-0">
-                <h3 className="text-lg font-semibold text-slate-900">Delete batch?</h3>
+                <h3 id="delete-batch-title" className="text-lg font-semibold text-slate-900">Delete batch?</h3>
                 <p className="text-sm text-slate-500 mt-1">
                   This deletes <span className="font-medium text-slate-800">{selectedBatch.name}</span>. Students in this batch are kept but moved to <span className="font-medium text-slate-800">Unassigned</span>, and any exam links to this batch are removed.
                 </p>
@@ -1139,6 +1239,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               <button
                 onClick={() => setConfirmDeleteBatch(false)}
                 disabled={deleteBatchBusy}
+                autoFocus
                 className="px-5 py-2 lsc-button-ghost text-sm"
               >
                 Cancel

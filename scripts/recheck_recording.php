@@ -60,7 +60,7 @@ if ($recordingId <= 0) {
 }
 
 try {
-    $rsStmt = $pdo->prepare('SELECT id, company_id, exam_id, student_id, session_id FROM recording_sessions WHERE id = ? LIMIT 1');
+    $rsStmt = $pdo->prepare('SELECT id, company_id, exam_id, student_id, session_id, started_at FROM recording_sessions WHERE id = ? LIMIT 1');
     $rsStmt->execute([$recordingId]);
     $rec = $rsStmt->fetch();
     $rsStmt->closeCursor();
@@ -93,7 +93,17 @@ try {
         recheck_mark($pdo, $recordingId, 'FAILED', null, 'Exam session not found.');
         exit(1);
     }
-    $startMs = recheck_datetime_to_ms((string)$startTimeRaw);
+    // ai_recheck.py reports offsets from the START OF THIS VIDEO, and the video starts when this
+    // recording was INIT'd (recordings.php stamps started_at right before ExamTake creates the
+    // MediaRecorder) — not when the exam session started. Every page reload mid-exam opens a NEW
+    // recording, so anchoring on exam_sessions.start_time shifted every rechecked violation earlier by
+    // however far into the exam the recording began, broke the +/-5s dedupe against live detections,
+    // and put the markers in the wrong place on the player (Recordings.tsx maps a violation to
+    // timestamp - recording.startedAt). Fall back to the session start only if started_at is missing.
+    $recStartRaw = $rec['started_at'] ?? null;
+    $startMs = ($recStartRaw !== null && (string)$recStartRaw !== '')
+        ? recheck_datetime_to_ms((string)$recStartRaw)
+        : recheck_datetime_to_ms((string)$startTimeRaw);
 
     $studStmt = $pdo->prepare('SELECT face_descriptor FROM students WHERE id = ? AND company_id = ? LIMIT 1');
     $studStmt->execute([$rec['student_id'], $companyId]);

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ShieldCheck, UserPlus, Search, Building2, UserRound, Ban, CheckCircle2, Trash2, AlertTriangle, Loader2, KeyRound } from 'lucide-react';
 import { CompanyDirectoryRecord, ManagedUserRecord, UserRole } from '../../types';
 import { apiGet, apiPost } from '../../services/api';
@@ -88,7 +88,12 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
     }
   };
 
+  // Latest directory request wins: typing in search fires one request per pause, and a slower,
+  // older response must not overwrite the results for what is in the box now.
+  const usersReqRef = useRef(0);
+
   const loadUsers = async () => {
+    const reqId = ++usersReqRef.current;
     setLoading(true);
     setError('');
     try {
@@ -98,15 +103,23 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
       if (companyFilter !== 'ALL') params.set('companyId', String(companyFilter));
       const query = params.toString();
       const data = await apiGet<{ users: ManagedUserRecord[] }>(`users.php${query ? `?${query}` : ''}`);
+      if (reqId !== usersReqRef.current) return;
       setUsers(data?.users || []);
     } catch (e: any) {
+      if (reqId !== usersReqRef.current) return;
       console.error('Failed to load directory users:', e);
       setError(e?.message || 'Failed to load users.');
       setUsers([]);
     } finally {
-      setLoading(false);
+      if (reqId === usersReqRef.current) setLoading(false);
     }
   };
+
+  // users.php returns a refreshed roster after CREATE / STATUS / DELETE, but it ignores the role and
+  // search filters and (for a super admin) scopes it to the payload's companyId — i.e. the TARGET
+  // user's company, not the company dropdown. Rendering it made the table jump to a different company
+  // and show users that don't match the filters on screen. Re-query with the active filters instead.
+  const refreshAfterMutation = () => loadUsers();
 
   useEffect(() => {
     loadCompanies();
@@ -152,7 +165,7 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
       }
 
       const result = await apiPost<{ users: ManagedUserRecord[]; emailWarning?: string }>('users.php', payload);
-      setUsers(result?.users || []);
+      void refreshAfterMutation();
       setMessage(`${form.role} user created successfully.`);
       // The backend returns emailWarning when the welcome/temp-password email couldn't be sent
       // as intended (e.g. the login already existed on the shared LSC auth service).
@@ -186,8 +199,8 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
       if (isSuperAdmin && companyFilter !== 'ALL') {
         payload.companyId = companyFilter;
       }
-      const result = await apiPost<{ users: ManagedUserRecord[] }>('users.php', payload);
-      setUsers(result?.users || []);
+      await apiPost<{ users: ManagedUserRecord[] }>('users.php', payload);
+      void refreshAfterMutation();
       setMessage(`User status changed to ${status}.`);
     } catch (e: any) {
       console.error('Failed to update user status:', e);
@@ -200,6 +213,9 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
   // Reset an ADMIN/PROCTOR password in OUR database and email them a new temporary one.
   // (Super admins are managed by the external LSC auth service and can't be reset here.)
   const handleResetPassword = async (user: ManagedUserRecord) => {
+    if (resetBusyId !== null) return;
+    // This immediately invalidates the user's current password, so don't fire it on a stray click.
+    if (!window.confirm(`Reset the password for ${user.email}? Their current password stops working immediately and a new temporary password is emailed to them.`)) return;
     setResetBusyId(user.id);
     setMessage('');
     setWarning('');
@@ -241,8 +257,8 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
       if (isSuperAdmin && deleteTarget.companyId) {
         payload.companyId = deleteTarget.companyId;
       }
-      const result = await apiPost<{ users: ManagedUserRecord[] }>('users.php', payload);
-      setUsers(result?.users || []);
+      await apiPost<{ users: ManagedUserRecord[] }>('users.php', payload);
+      void refreshAfterMutation();
       setMessage(`Deleted ${deleteTarget.email}.`);
       setDeleteTarget(null);
     } catch (e: any) {
@@ -262,12 +278,27 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
     return user.role === UserRole.PROCTOR || user.role === UserRole.VIEWER;
   };
 
+  const isOwnAccount = (user: ManagedUserRecord): boolean =>
+    !!currentAdminEmail && user.email.trim().toLowerCase() === currentAdminEmail;
+
   // A user can be deleted if the actor can manage that role and it isn't their own account.
   const canDeleteUser = (user: ManagedUserRecord): boolean => {
-    if (currentAdminEmail && user.email.trim().toLowerCase() === currentAdminEmail) return false;
+    if (isOwnAccount(user)) return false;
     if (isSuperAdmin) return true;
     return user.role === UserRole.PROCTOR || user.role === UserRole.VIEWER || user.role === UserRole.STUDENT;
   };
+
+  // Same self-guard for status changes: a super admin can see their own row, and "Disable" on it
+  // locks them out (DISABLED accounts are refused at login) with no way back from this screen.
+  const canChangeStatus = (user: ManagedUserRecord): boolean => !isOwnAccount(user);
+
+  // Escape cancels the delete confirmation (unless the delete is already running).
+  useEffect(() => {
+    if (!deleteTarget) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !deleteBusy) setDeleteTarget(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [deleteTarget, deleteBusy]);
 
   const manageableRoles = isSuperAdmin
     ? [UserRole.SUPER_ADMIN, UserRole.ADMIN, UserRole.VIEWER, UserRole.PROCTOR, UserRole.STUDENT]
@@ -300,7 +331,11 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
               <span className="lsc-icon-tile-success h-8 w-8 border shrink-0"><Building2 size={15} /></span>
             </div>
             <p className="text-sm font-semibold text-slate-900 mt-2.5">
-              {isSuperAdmin ? 'All Companies' : (adminCompanyName || `Company ${adminCompanyId ?? '-'}`)}
+              {isSuperAdmin
+                ? (companyFilter === 'ALL'
+                  ? 'All Companies'
+                  : (companies.find(c => c.id === companyFilter)?.name || `Company ${companyFilter}`))
+                : (adminCompanyName || `Company ${adminCompanyId ?? '-'}`)}
             </p>
           </div>
           <div className="lsc-panel lsc-panel-interactive p-4 min-w-[170px]">
@@ -327,6 +362,7 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
               <select
                 value={form.role}
                 onChange={e => setForm(current => ({ ...current, role: e.target.value as UserRole }))}
+                aria-label="Role"
                 className="mt-2 w-full px-4 py-3 border border-slate-200 rounded-xl bg-white outline-none text-sm"
               >
                 {manageableRoles.map(item => (
@@ -341,6 +377,8 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
                 <select
                   value={form.companyId}
                   onChange={e => setForm(current => ({ ...current, companyId: e.target.value }))}
+                  required
+                  aria-label="Company"
                   className="mt-2 w-full px-4 py-3 border border-slate-200 rounded-xl bg-white outline-none text-sm"
                 >
                   <option value="">Select company</option>
@@ -356,6 +394,8 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
               <input
                 value={form.fullName}
                 onChange={e => setForm(current => ({ ...current, fullName: e.target.value }))}
+                required
+                aria-label="Full name"
                 className="mt-2 w-full px-4 py-3 border border-slate-200 rounded-xl bg-white outline-none text-sm"
                 placeholder="Enter full name"
               />
@@ -367,6 +407,8 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
                 type="email"
                 value={form.email}
                 onChange={e => setForm(current => ({ ...current, email: e.target.value }))}
+                required
+                aria-label="Email"
                 className="mt-2 w-full px-4 py-3 border border-slate-200 rounded-xl bg-white outline-none text-sm"
                 placeholder="name@company.com"
               />
@@ -431,12 +473,14 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
                     value={search}
                     onChange={e => setSearch(e.target.value)}
                     placeholder="Search name, email, company..."
+                    aria-label="Search users"
                     className="pl-9 pr-4 py-2 border border-slate-200 rounded-lg bg-white text-sm outline-none w-full sm:w-64"
                   />
                 </div>
                 <select
                   value={roleFilter}
                   onChange={e => setRoleFilter(e.target.value as 'ALL' | UserRole)}
+                  aria-label="Filter by role"
                   className="px-3 py-2 border border-slate-200 rounded-lg bg-white text-sm outline-none"
                 >
                   <option value="ALL">All Roles</option>
@@ -448,6 +492,7 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
                   <select
                     value={companyFilter}
                     onChange={e => setCompanyFilter(e.target.value === 'ALL' ? 'ALL' : Number(e.target.value))}
+                    aria-label="Filter by company"
                     className="px-3 py-2 border border-slate-200 rounded-lg bg-white text-sm outline-none"
                   >
                     <option value="ALL">All Companies</option>
@@ -540,7 +585,7 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
                       </td>
                       <td className="px-4 py-4 align-top">
                         <div className="flex flex-wrap gap-2">
-                          {user.status !== 'ACTIVE' && (
+                          {canChangeStatus(user) && user.status !== 'ACTIVE' && (
                             <button
                               onClick={() => handleStatusChange(user.id, 'ACTIVE')}
                               disabled={statusBusyId === user.id}
@@ -549,7 +594,7 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
                               <CheckCircle2 size={13} /> Activate
                             </button>
                           )}
-                          {user.status !== 'DISABLED' && (
+                          {canChangeStatus(user) && user.status !== 'DISABLED' && (
                             <button
                               onClick={() => handleStatusChange(user.id, 'DISABLED')}
                               disabled={statusBusyId === user.id}
@@ -558,7 +603,7 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
                               <Ban size={13} /> Disable
                             </button>
                           )}
-                          {user.status !== 'INVITED' && (
+                          {canChangeStatus(user) && user.status !== 'INVITED' && (
                             <button
                               onClick={() => handleStatusChange(user.id, 'INVITED')}
                               disabled={statusBusyId === user.id}
@@ -601,7 +646,7 @@ export const UserDirectory: React.FC<UserDirectoryProps> = ({ role }) => {
 
       {deleteTarget && (
         <div className="fixed inset-0 z-[200] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md border border-slate-200 overflow-hidden">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md border border-slate-200 overflow-hidden" role="dialog" aria-modal="true" aria-label="Delete user">
             <div className="px-6 py-5 border-b border-slate-100 flex items-center gap-3">
               <div className="w-10 h-10 rounded-full bg-rose-50 text-rose-600 flex items-center justify-center shrink-0">
                 <AlertTriangle size={20} />

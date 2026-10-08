@@ -46,13 +46,14 @@ export const formatResultAnswer = (a: ResultAnswer): FormattedAnswer => {
 
     case QuestionType.NUMERIC:
       return {
-        answerText: a.answerText ?? '—',
+        // `||` not `??`: an emptied field is stored as '' and should read as "no answer", not blank.
+        answerText: a.answerText || '—',
         correctText: key?.value !== undefined ? `${key.value}${key.tolerance != null ? ` ± ${key.tolerance}` : ''}` : '—',
       };
 
     case QuestionType.DATE:
     case QuestionType.TIME:
-      return { answerText: a.answerText ?? '—', correctText: key?.value !== undefined ? String(key.value) : '—' };
+      return { answerText: a.answerText || '—', correctText: key?.value !== undefined ? String(key.value) : '—' };
 
     case QuestionType.MATCHING: {
       const left = match?.left ?? [];

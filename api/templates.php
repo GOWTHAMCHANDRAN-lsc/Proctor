@@ -73,7 +73,7 @@ if ($method === 'POST') {
         audit_log($pdo, [
             'companyId' => $companyId,
             'actorRole' => 'ADMIN',
-            'actorId' => $payload['actor'] ?? null,
+            'actorId' => get_actor_id($payload),
             'action' => 'TEMPLATE_DELETE',
             'targetType' => 'template',
             'targetId' => (string)$id,
@@ -105,6 +105,19 @@ if ($method === 'POST') {
         $subject = null;
     }
 
+    if ($id > 0) {
+        // Saving a template that no longer exists in this company (deleted meanwhile, or another
+        // company's id) used to UPDATE nothing yet return ok — after first clearing this company's
+        // default — so the edit was silently lost.
+        $existsStmt = $pdo->prepare('SELECT id FROM notification_templates WHERE company_id = ? AND id = ? LIMIT 1');
+        $existsStmt->execute([$companyId, $id]);
+        $templateExists = (bool)$existsStmt->fetch();
+        $existsStmt->closeCursor();
+        if (!$templateExists) {
+            json_response(['error' => 'Template not found. It may have been deleted — reload and try again.'], 404);
+        }
+    }
+
     if ($isDefault === 1) {
         $reset = $pdo->prepare('UPDATE notification_templates SET is_default = 0 WHERE company_id = ? AND channel = ?');
         $reset->execute([$companyId, $channel]);
@@ -128,7 +141,7 @@ if ($method === 'POST') {
     audit_log($pdo, [
         'companyId' => $companyId,
         'actorRole' => 'ADMIN',
-        'actorId' => $template['actor'] ?? null,
+        'actorId' => get_actor_id($payload),
         'action' => 'TEMPLATE_SAVE',
         'targetType' => 'template',
         'targetId' => $id > 0 ? (string)$id : null,
@@ -154,7 +167,7 @@ if ($method === 'DELETE') {
     audit_log($pdo, [
         'companyId' => $companyId,
         'actorRole' => 'ADMIN',
-        'actorId' => $payload['actor'] ?? null,
+        'actorId' => get_actor_id($payload),
         'action' => 'TEMPLATE_DELETE',
         'targetType' => 'template',
         'targetId' => (string)$id,

@@ -482,7 +482,7 @@ export interface CertificateIssuance {
   verificationId: string;
   externalCertificateId?: string | null;
   verificationUrl?: string | null;
-  status: 'PENDING' | 'ISSUED' | 'FAILED';
+  status: 'PENDING' | 'ISSUED' | 'FAILED' | 'DEAD';
   attempts: number;
   error?: string | null;
   issuedAt?: number | null;

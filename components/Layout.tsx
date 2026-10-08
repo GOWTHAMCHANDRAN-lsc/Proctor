@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { CompanyDirectoryRecord, UserRole } from '../types';
-import { ShieldCheck, LogOut, LayoutDashboard, FileText, Users, AlertTriangle, Radio, ClipboardList, Activity, Menu, X, Film, Building2, Settings as SettingsIcon, Webhook, Award, Mail } from 'lucide-react';
-import { apiGet } from '../services/api';
+import { ShieldCheck, ShieldAlert, UserCog, LogOut, LayoutDashboard, FileText, Users, AlertTriangle, Radio, ClipboardList, Activity, Menu, X, Film, Building2, Settings as SettingsIcon, Webhook, Award, Mail } from 'lucide-react';
+import { apiGet, getApiErrorMessage } from '../services/api';
 import { useSettings } from '../services/appSettings';
 
 interface LayoutProps {
@@ -18,34 +18,58 @@ interface LayoutProps {
 // whole console (via the stored companyId that the API layer sends as X-Company-Id).
 const CompanySwitcher: React.FC<{ value: number | null; onChange: (companyId: number) => void }> = ({ value, onChange }) => {
   const [companies, setCompanies] = useState<CompanyDirectoryRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
+    setLoading(true);
+    setLoadError('');
     (async () => {
       try {
         const data = await apiGet<{ companies: CompanyDirectoryRecord[] }>('companies.php');
         if (!cancelled) setCompanies(data?.companies || []);
       } catch (e) {
         console.error('Failed to load companies for switcher:', e);
+        // Without this the dropdown just stayed empty and the super admin had no way to scope
+        // (and so load) any company data.
+        if (!cancelled) setLoadError(getApiErrorMessage(e, 'Could not load companies.'));
+      } finally {
+        if (!cancelled) setLoading(false);
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [reloadNonce]);
 
   return (
-    <div className="mb-4 flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
-      <Building2 size={18} className="shrink-0 text-[var(--lsc-primary)]" />
-      <label className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Active Company</label>
-      <select
-        value={value ?? ''}
-        onChange={e => { if (e.target.value) onChange(Number(e.target.value)); }}
-        className="ml-auto min-w-[200px] rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 outline-none"
-      >
-        <option value="" disabled>Select a company…</option>
-        {companies.map(company => (
-          <option key={company.id} value={company.id}>{company.name}</option>
-        ))}
-      </select>
+    <div className="mb-4 rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <Building2 size={18} className="shrink-0 text-[var(--lsc-primary)]" />
+        <label htmlFor="lsc-active-company" className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Active Company</label>
+        <select
+          id="lsc-active-company"
+          value={value ?? ''}
+          disabled={loading && companies.length === 0}
+          onChange={e => { if (e.target.value) onChange(Number(e.target.value)); }}
+          className="w-full min-w-0 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 outline-none disabled:opacity-60 sm:ml-auto sm:w-auto sm:min-w-[200px]"
+        >
+          <option value="" disabled>{loading && companies.length === 0 ? 'Loading companies…' : 'Select a company…'}</option>
+          {companies.map(company => (
+            <option key={company.id} value={company.id}>{company.name}</option>
+          ))}
+        </select>
+      </div>
+      {loadError ? (
+        <div role="alert" className="mt-2 flex flex-wrap items-center gap-2 text-xs text-red-700">
+          <span>{loadError}</span>
+          <button type="button" onClick={() => setReloadNonce(n => n + 1)} className="font-semibold underline hover:text-red-800">
+            Retry
+          </button>
+        </div>
+      ) : value === null && !loading ? (
+        <p className="mt-2 text-xs text-slate-500">Select a company to load its exams, students and results on every screen.</p>
+      ) : null}
     </div>
   );
 };
@@ -54,6 +78,19 @@ export const Layout: React.FC<LayoutProps> = ({ children, role, currentView, onN
   const { settings } = useSettings();
   const branding = settings.branding;
   const appName = branding.appName || 'LSC Exam Proctor';
+  // Hooks must run unconditionally — this used to be declared after the STUDENT early return,
+  // which breaks the Rules of Hooks (React throws if `role` ever flips across that branch).
+  const [mobileOpen, setMobileOpen] = useState(false);
+
+  // Let keyboard users dismiss the mobile navigation drawer with Escape.
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMobileOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [mobileOpen]);
 
   // Signed-in identity for the sidebar footer (falls back to the role label).
   const adminIdentity = (() => {
@@ -99,7 +136,6 @@ export const Layout: React.FC<LayoutProps> = ({ children, role, currentView, onN
   }
 
   // Admin Layout
-  const [mobileOpen, setMobileOpen] = useState(false);
   const isProctor = role === UserRole.PROCTOR;
   const isViewer = role === UserRole.VIEWER;
   const isSuperAdmin = role === UserRole.SUPER_ADMIN;
@@ -122,8 +158,11 @@ export const Layout: React.FC<LayoutProps> = ({ children, role, currentView, onN
       {/* Mobile Header */}
       <header className="lg:hidden fixed top-0 left-0 right-0 z-20 bg-white border-b border-slate-200 px-4 py-3 flex items-center justify-between shadow-sm">
         <button
+          type="button"
           onClick={() => setMobileOpen(true)}
           aria-label="Open navigation menu"
+          aria-expanded={mobileOpen}
+          aria-controls="lsc-admin-sidebar"
           className="p-2 rounded-lg border border-slate-200 text-slate-600 hover:text-slate-900 hover:bg-slate-50"
         >
           <Menu size={18} />
@@ -147,10 +186,11 @@ export const Layout: React.FC<LayoutProps> = ({ children, role, currentView, onN
         />
       )}
 
-      {/* Sidebar */}
-      <aside className={`fixed inset-y-0 left-0 w-72 max-w-[84vw] bg-white border-r border-slate-200 flex flex-col z-30 shadow-xl lg:shadow-none transform transition-transform duration-300 ${
+      {/* Sidebar — sticky full-height on desktop so the nav and the account/logout footer stay in view
+          on long pages (it used to stretch to the content height and scroll away with it). */}
+      <aside id="lsc-admin-sidebar" aria-label="Main navigation" className={`fixed inset-y-0 left-0 w-72 max-w-[84vw] bg-white border-r border-slate-200 flex flex-col z-30 shadow-xl lg:shadow-none transform transition-transform duration-300 ${
         mobileOpen ? 'translate-x-0' : '-translate-x-full'
-      } lg:translate-x-0 lg:static`}>
+      } lg:translate-x-0 lg:sticky lg:top-0 lg:bottom-auto lg:h-screen lg:shrink-0`}>
         <div className="px-5 h-16 shrink-0 border-b border-slate-200 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
             {brandMark('h-9 w-9', 'text-[13px]')}
@@ -160,6 +200,7 @@ export const Layout: React.FC<LayoutProps> = ({ children, role, currentView, onN
             </div>
           </div>
           <button
+            type="button"
             onClick={() => setMobileOpen(false)}
             aria-label="Close navigation menu"
             className="lg:hidden p-2 rounded-lg border border-slate-200 text-slate-500 hover:text-slate-900 hover:bg-slate-50"
@@ -185,7 +226,7 @@ export const Layout: React.FC<LayoutProps> = ({ children, role, currentView, onN
           />
           {isFullAdmin && (
             <NavItem
-              icon={<ShieldCheck size={18} />}
+              icon={<UserCog size={18} />}
               label="Users"
               active={currentView === 'users'}
               onClick={() => handleNavigate('users')}
@@ -257,7 +298,7 @@ export const Layout: React.FC<LayoutProps> = ({ children, role, currentView, onN
           )}
           {!isViewer && (
             <NavItem
-              icon={<Radio size={18} />}
+              icon={<ShieldAlert size={18} />}
               label="Security Feed"
               active={currentView === 'security'}
               onClick={() => handleNavigate('security')}
@@ -299,6 +340,7 @@ export const Layout: React.FC<LayoutProps> = ({ children, role, currentView, onN
               <div className="text-[11px] text-slate-400 truncate">{adminIdentity?.name && adminIdentity?.email ? adminIdentity.email : consoleLabel}</div>
             </div>
             <button
+              type="button"
               onClick={onLogout}
               aria-label="Logout"
               title="Logout"
@@ -325,6 +367,7 @@ export const Layout: React.FC<LayoutProps> = ({ children, role, currentView, onN
 
 const NavItem = ({ icon, label, active, onClick }: { icon: React.ReactNode, label: string, active: boolean, onClick: () => void }) => (
   <button
+    type="button"
     onClick={onClick}
     aria-current={active ? 'page' : undefined}
     className={`group flex items-center gap-3 w-full pl-3.5 pr-3 py-2.5 rounded-lg text-[14px] transition-colors ${

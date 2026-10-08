@@ -325,6 +325,47 @@ function smtp_close($fp): void {
     @fclose($fp);
 }
 
+// Write one delivery_logs row via sp_add_delivery_log, best-effort. The procedure's parameters are
+// VARCHAR(255) (recipient/subject) and TEXT (body) and the server runs in STRICT mode, so an over-long
+// value (e.g. an exam title near 255 chars inside a "Your exam is ready: …" subject) or a stale
+// template id used to raise a PDOException AFTER the email had already gone out — aborting the rest of
+// a notify.php batch with a 500 (so the admin re-sent, duplicating mail to everyone already reached)
+// and, in certificates.php, flipping an already-ISSUED certificate back to FAILED. The log is
+// bookkeeping: clamp the values to the column sizes and never let a logging failure escape.
+function add_delivery_log(PDO $pdo, int $companyId, string $channel, string $recipient, ?string $subject, ?string $body, string $status, ?string $error, ?int $templateId = null): void {
+    try {
+        $clip = static function (?string $value, int $maxChars): ?string {
+            if ($value === null) {
+                return null;
+            }
+            return function_exists('mb_substr') ? mb_substr($value, 0, $maxChars, 'UTF-8') : substr($value, 0, $maxChars);
+        };
+        // TEXT is limited in BYTES (65535), not characters.
+        $clipBytes = static function (?string $value): ?string {
+            if ($value === null || strlen($value) <= 65535) {
+                return $value;
+            }
+            return function_exists('mb_strcut') ? mb_strcut($value, 0, 65535, 'UTF-8') : substr($value, 0, 65535);
+        };
+        $log = $pdo->prepare('CALL sp_add_delivery_log(?, ?, ?, ?, ?, ?, ?, ?, ?)');
+        $log->execute([
+            $companyId,
+            $channel,
+            $clip($recipient, 255),
+            $clip($subject, 255),
+            $clipBytes($body),
+            $status,
+            $clipBytes($error),
+            $templateId,
+            null
+        ]);
+        while ($log->nextRowset()) {}
+        $log->closeCursor();
+    } catch (Throwable $e) {
+        // Best-effort: a failed log write must never undo or abort a send that already happened.
+    }
+}
+
 // Single-message convenience wrapper: open a session, deliver one email, tear it down. Kept for
 // callers that send exactly one message (e.g. users.php provisioning mail). Batch senders should
 // use smtp_open + smtp_deliver directly to reuse the connection.
@@ -357,7 +398,10 @@ if (!$isIncluded && $_SERVER['REQUEST_METHOD'] !== 'POST') {
 
 if (!$isIncluded) {
     $payload = json_input();
-    require_staff($payload);
+    // Sending mail is an admin action (the only caller is ExamManager's invite/reminder flow, which is
+    // ADMIN/SUPER_ADMIN-only). require_staff() also let the read-only VIEWER role and PROCTORs push
+    // arbitrary HTML email to arbitrary addresses through the company's SMTP account.
+    require_role(['SUPER_ADMIN', 'ADMIN'], $payload);
     $companyId = require_company_id($payload);
     $messages = $payload['messages'] ?? [];
     if (!is_array($messages) || count($messages) === 0) {
@@ -432,6 +476,11 @@ if (!$isIncluded) {
     };
 
     foreach ($messages as $msg) {
+        if (!is_array($msg)) {
+            // A scalar entry used to fatal on the array access below and abort the whole batch.
+            $failed[] = ['to' => '', 'error' => 'Invalid message payload.'];
+            continue;
+        }
         $to = trim((string)($msg['to'] ?? ''));
         $subject = trim((string)($msg['subject'] ?? ''));
         $body = (string)($msg['body'] ?? '');
@@ -450,59 +499,20 @@ if (!$isIncluded) {
 
         if ($to === '' || ($channel === 'EMAIL' && $subject === '') || $body === '') {
             $failed[] = ['to' => $to, 'error' => 'Invalid message payload.'];
-            $log = $pdo->prepare('CALL sp_add_delivery_log(?, ?, ?, ?, ?, ?, ?, ?, ?)');
-            $log->execute([
-                $companyId,
-                $channel,
-                $to,
-                $subject,
-                $body,
-                'FAILED',
-                'Invalid message payload.',
-                $templateId,
-                null
-            ]);
-            while ($log->nextRowset()) {}
-            $log->closeCursor();
+            add_delivery_log($pdo, $companyId, $channel, $to, $subject, $body, 'FAILED', 'Invalid message payload.', $templateId);
             continue;
         }
 
         if ($channel === 'EMAIL' && filter_var($to, FILTER_VALIDATE_EMAIL) === false) {
             $error = 'Invalid recipient email address.';
             $failed[] = ['to' => $to, 'error' => $error];
-            $log = $pdo->prepare('CALL sp_add_delivery_log(?, ?, ?, ?, ?, ?, ?, ?, ?)');
-            $log->execute([
-                $companyId,
-                $channel,
-                $to,
-                $subject,
-                $body,
-                'FAILED',
-                $error,
-                $templateId,
-                null
-            ]);
-            while ($log->nextRowset()) {}
-            $log->closeCursor();
+            add_delivery_log($pdo, $companyId, $channel, $to, $subject, $body, 'FAILED', $error, $templateId);
             continue;
         }
 
         if ($channel === 'SMS') {
             $failed[] = ['to' => $to, 'error' => 'SMS provider not configured.'];
-            $log = $pdo->prepare('CALL sp_add_delivery_log(?, ?, ?, ?, ?, ?, ?, ?, ?)');
-            $log->execute([
-                $companyId,
-                $channel,
-                $to,
-                null,
-                $body,
-                'SKIPPED',
-                'SMS provider not configured.',
-                $templateId,
-                null
-            ]);
-            while ($log->nextRowset()) {}
-            $log->closeCursor();
+            add_delivery_log($pdo, $companyId, $channel, $to, null, $body, 'SKIPPED', 'SMS provider not configured.', $templateId);
             continue;
         }
 
@@ -570,20 +580,7 @@ if (!$isIncluded) {
             $failed[] = ['to' => $to, 'error' => $error];
         }
 
-        $log = $pdo->prepare('CALL sp_add_delivery_log(?, ?, ?, ?, ?, ?, ?, ?, ?)');
-        $log->execute([
-            $companyId,
-            $channel,
-            $to,
-            $subject,
-            $body,
-            $status,
-            $error,
-            $templateId,
-            null
-        ]);
-        while ($log->nextRowset()) {}
-        $log->closeCursor();
+        add_delivery_log($pdo, $companyId, $channel, $to, $subject, $body, $status, $error, $templateId);
     }
 
     // Cleanly close the shared SMTP session once the whole batch is done.

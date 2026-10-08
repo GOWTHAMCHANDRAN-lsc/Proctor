@@ -364,6 +364,11 @@ if ($method === 'POST') {
     $errors = [];
 
     foreach ($items as $item) {
+        if (!is_array($item)) {
+            // A scalar row used to fatal on the array accesses below and 500 the whole upload.
+            $errors[] = 'Invalid student row (expected an object with fullName/email/registrationId).';
+            continue;
+        }
         $fullName = trim((string)($item['fullName'] ?? ''));
         // Store emails in canonical lowercase — addresses uploaded in ALL CAPS or Mixed
         // Case resolve to the same mailbox, so normalise on both create and update.
@@ -385,8 +390,17 @@ if ($method === 'POST') {
             $errors[] = 'Missing fields for student (fullName/email/registrationId required).';
             continue;
         }
-        if (strpos($email, '@') === false) {
+        // Same validator notify.php applies at send time: an address that passed the old "contains @"
+        // check but not this one (spaces, missing domain, "a@b@c") was stored, then every invitation
+        // to it failed with "Invalid recipient email address" long after the upload looked fine.
+        if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
             $errors[] = "Invalid email format: {$email}";
+            continue;
+        }
+        // Column limits (full_name/email VARCHAR(255), registration_id VARCHAR(128)): report a clear
+        // per-row error instead of a raw "SQLSTATE[22001] Data too long" message.
+        if (mb_strlen($fullName, 'UTF-8') > 255 || mb_strlen($email, 'UTF-8') > 255 || mb_strlen($registrationId, 'UTF-8') > 128) {
+            $errors[] = "Row skipped for {$registrationId}: name/email must be at most 255 characters and registration ID at most 128.";
             continue;
         }
 
@@ -451,8 +465,10 @@ if ($method === 'POST') {
 
                 audit_log($pdo, [
                     'companyId' => $companyId,
-                    'actorRole' => 'ADMIN',
-                    'actorId' => $payload['actor'] ?? null,
+                    'actorRole' => $actorRole,
+                    // Verified identity (token), not the client's free-text `actor` (ExamManager
+                    // sends the literal 'Admin'), matching the delete/unenroll audit rows above.
+                    'actorId' => get_actor_id($payload) ?? ($payload['actor'] ?? null),
                     'action' => 'STUDENT_UPDATE',
                     'targetType' => 'student',
                     'targetId' => $studentId,
@@ -483,8 +499,8 @@ if ($method === 'POST') {
 
             audit_log($pdo, [
                 'companyId' => $companyId,
-                'actorRole' => 'ADMIN',
-                'actorId' => $payload['actor'] ?? null,
+                'actorRole' => $actorRole,
+                'actorId' => get_actor_id($payload) ?? ($payload['actor'] ?? null),
                 'action' => 'STUDENT_CREATE',
                 'targetType' => 'student',
                 'targetId' => $studentId,

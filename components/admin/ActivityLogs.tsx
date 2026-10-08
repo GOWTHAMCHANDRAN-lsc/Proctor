@@ -9,7 +9,10 @@ export const ActivityLogs: React.FC<{ students?: Student[]; role?: UserRole }> =
   // this too, so the option is hidden here to avoid an empty, misleading filter for company staff.
   const isSuperAdmin = role === UserRole.SUPER_ADMIN;
   const [logs, setLogs] = useState<AuditLog[]>([]);
+  // Server-side total for this company (audit.php returns it alongside the page of rows).
+  const [total, setTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState('');
   const [search, setSearch] = useState('');
   const [roleFilter, setRoleFilter] = useState<'ALL' | 'ADMIN' | 'SUPER_ADMIN' | 'PROCTOR' | 'STUDENT' | 'SYSTEM'>('ALL');
 
@@ -28,12 +31,18 @@ export const ActivityLogs: React.FC<{ students?: Student[]; role?: UserRole }> =
 
   const loadLogs = async () => {
     setLoading(true);
+    setLoadError('');
     try {
-      const data = await apiGet<{ logs: AuditLog[] }>('audit.php?limit=200');
+      const data = await apiGet<{ logs: AuditLog[]; total?: number }>('audit.php?limit=200');
       setLogs(data?.logs || []);
-    } catch (e) {
+      setTotal(typeof data?.total === 'number' ? data.total : null);
+    } catch (e: any) {
       console.error('Failed to load audit logs:', e);
       setLogs([]);
+      setTotal(null);
+      // Previously a failed load just showed "No audit logs found." — indistinguishable from an
+      // empty log.
+      setLoadError(e?.message || 'Could not load audit logs.');
     } finally {
       setLoading(false);
     }
@@ -88,6 +97,7 @@ export const ActivityLogs: React.FC<{ students?: Student[]; role?: UserRole }> =
             <input
               type="text"
               placeholder="Search action, actor, target..."
+              aria-label="Search audit logs"
               className="pl-9 pr-4 py-2 border border-slate-200 rounded-lg outline-none w-full sm:w-64 text-sm bg-white"
               value={search}
               onChange={e => setSearch(e.target.value)}
@@ -96,6 +106,7 @@ export const ActivityLogs: React.FC<{ students?: Student[]; role?: UserRole }> =
           <select
             value={roleFilter}
             onChange={e => setRoleFilter(e.target.value as typeof roleFilter)}
+            aria-label="Filter by actor role"
             className="px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white"
           >
             <option value="ALL">All Roles</option>
@@ -111,13 +122,28 @@ export const ActivityLogs: React.FC<{ students?: Student[]; role?: UserRole }> =
       <div className="lsc-panel overflow-hidden">
         <div className="p-4 lsc-panel-header flex items-center justify-between">
           <div className="text-sm font-semibold text-slate-800">Recent Activity</div>
-          <div className="text-xs text-slate-500">{filtered.length} events</div>
+          <div className="text-xs text-slate-500 text-right">
+            {filtered.length} events
+            {/* Search and the role filter only cover the rows loaded here (the most recent ones), so
+                say so when the log is longer than that. */}
+            {total !== null && total > logs.length && (
+              <span className="block text-[11px] text-slate-400">Searching the latest {logs.length} of {total}</span>
+            )}
+          </div>
         </div>
         {loading && (
           <div className="p-6 text-sm text-slate-400">Loading audit logs...</div>
         )}
-        {!loading && filtered.length === 0 && (
-          <div className="p-6 text-sm text-slate-400">No audit logs found.</div>
+        {!loading && loadError && (
+          <div role="alert" className="p-6 text-sm text-rose-600">
+            {loadError}{' '}
+            <button onClick={() => { void loadLogs(); }} className="font-semibold underline hover:no-underline">Try again</button>
+          </div>
+        )}
+        {!loading && !loadError && filtered.length === 0 && (
+          <div className="p-6 text-sm text-slate-400">
+            {logs.length > 0 ? 'No audit logs match the current filters.' : 'No audit logs found.'}
+          </div>
         )}
         {!loading && filtered.length > 0 && (
           <div className="lsc-table-wrap">

@@ -31,6 +31,16 @@ const seededShuffle = <T,>(arr: T[], seedStr: string): T[] => {
 };
 const rangeArr = (n: number): number[] => Array.from({ length: n }, (_, i) => i);
 
+// True when a stored answer actually holds something. Typing then clearing a field, or unticking
+// every box, leaves ''/[]/{} behind — that must not count (or show in the map) as "answered".
+const hasAnswerValue = (v: unknown): boolean => {
+  if (v === undefined || v === null) return false;
+  if (typeof v === 'string') return v.trim() !== '';
+  if (Array.isArray(v)) return v.some(x => x !== undefined && x !== null && String(x).trim() !== '');
+  if (typeof v === 'object') return Object.keys(v as object).length > 0;
+  return true;
+};
+
 // --- Device capability detection -------------------------------------------------
 // Mobiles/tablets (especially iOS Safari) cannot screen-record (getDisplayMedia is
 // absent) and iPhone Safari has no Fullscreen API. We degrade gracefully on these
@@ -238,7 +248,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     if (exam.sections && exam.sections.length > 0) {
       const orderedSections = [...exam.sections].sort((a, b) => (a.displayOrder ?? 0) - (b.displayOrder ?? 0));
       return orderedSections.map(section => {
-        const base = [...section.questions];
+        const base = [...(section.questions || [])];
         let working = base;
         if (section.shuffleQuestions ?? true) {
           working = shuffleWithSeed(base, makeSeed(section.id));
@@ -251,7 +261,9 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
           ...section,
           questions: selected.map(q => ({ ...q, sectionId: section.id, sectionTitle: section.title }))
         };
-      });
+      // A section with no questions would leave the candidate on a non-existent question
+      // (currentQ undefined → the whole exam view crashes to a blank screen). Drop empty sections.
+      }).filter(section => section.questions.length > 0);
     }
 
     let questionsToProcess = [...exam.questions];
@@ -281,7 +293,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   // Values are per-type: number (option index), number[] (multi-select/ordering),
   // string (text/numeric/date/time), or a Record map (matching/drag-drop).
   const [answers, setAnswers] = useState<Record<string, any>>({});
-  const [timeLeft, setTimeLeft] = useState(exam.durationMinutes * 60);
+  const [timeLeft, setTimeLeft] = useState(() => Math.max(0, Math.round((Number(exam.durationMinutes) || 0) * 60)));
   const [violations, setViolations] = useState<ViolationLog[]>([]);
   const [questionTimes, setQuestionTimes] = useState<Record<string, number>>({});
   const questionTimerRef = useRef<number>(Date.now());
@@ -298,6 +310,18 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   const tabSwitchLockedRef = useRef(false);
   const terminationQueuedRef = useRef(false);
   const finishOnceRef = useRef(false);
+  // True once the finished attempt has been handed to the parent (onFinish). Until then the
+  // submission is still in flight, so closing/reloading the tab must still be warned about.
+  const finishDeliveredRef = useRef(false);
+  // Set right before an intentional reload (e.g. "Refresh Page" after a lost device) so the
+  // leave-page guard doesn't throw a confusing browser dialog in the candidate's face.
+  const allowUnloadRef = useRef(false);
+  // Submission feedback: the finish path flushes evidence + recordings before handing off, which
+  // can take seconds — without a visible state the exam looked frozen and candidates closed the tab.
+  const [finishPhase, setFinishPhase] = useState<null | 'submitting' | 'terminating'>(null);
+  const [confirmSubmitOpen, setConfirmSubmitOpen] = useState(false);
+  // Section index whose time limit has already been enforced (so expiry fires exactly once).
+  const sectionExpiredRef = useRef<number | null>(null);
   const violationTypeCountsRef = useRef<Record<ViolationLog['type'], number>>({
     TAB_SWITCH: 0,
     NO_FACE: 0,
@@ -1242,7 +1266,21 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     return new MediaStream(tracks);
   };
 
-  const requestAllPermissions = async () => {
+  // Single-flight: the desktop auto-request (on intro "Continue") and the PermissionGuide button can
+  // both fire while the browser's permission bubble is still open. Two concurrent acquisitions used
+  // to both succeed → applyStream() ran twice: the first camera/mic stream was orphaned (camera light
+  // stayed on after the exam), and a second AudioContext + detectAudio loop + VAD ran forever.
+  const permissionRequestRef = useRef<Promise<void> | null>(null);
+  const requestAllPermissions = (): Promise<void> => {
+    if (permissionRequestRef.current) return permissionRequestRef.current;
+    const request = acquireAllPermissions().finally(() => {
+      permissionRequestRef.current = null;
+    });
+    permissionRequestRef.current = request;
+    return request;
+  };
+
+  const acquireAllPermissions = async () => {
     // Suppress violations while browser permission dialogs are open.
     permissionDialogOpenRef.current = true;
     let stream: MediaStream;
@@ -1525,6 +1563,13 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
         onSpeechEnd: () => { vadSpeechActiveRef.current = false; },
       }, audioContext)
         .then(handle => {
+          // The model loads asynchronously (multi-MB wasm). If the exam was torn down meanwhile
+          // (submitted / unmounted → this AudioContext was closed and dropped), don't adopt the
+          // handle — nothing would ever destroy it — release it immediately instead.
+          if (audioContextRef.current !== audioContext) {
+            void handle.destroy();
+            return;
+          }
           voiceVadRef.current = handle;
           vadModelActiveRef.current = true;
         })
@@ -1734,7 +1779,14 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
           return;
         }
 
-        await requestAllPermissions();
+        // Show the guide's button as "Requesting…" (disabled) while the auto-request's browser
+        // prompt is open, instead of an enabled "Allow & Continue" that invites a second request.
+        setPermissionBusy(true);
+        try {
+          await requestAllPermissions();
+        } finally {
+          setPermissionBusy(false);
+        }
 
       } catch (err) {
         // Don't log a violation here — the exam hasn't started yet (permissionStatus never
@@ -1751,6 +1803,16 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     startProctoring();
 
     return () => {
+        // The run with introDone=false never acquired anything. Tearing down here used to fire an
+        // async shutdown the instant the candidate clicked "Continue" — and ~500ms later (after
+        // stopRecordingPipeline's wait) it stopped whatever the NEW run had just acquired (a
+        // pre-granted mic on a mic-only exam went silently dead, a fresh recordingId was nulled,
+        // fullscreen was exited). Only the run that actually started capture owns its teardown.
+        if (!introDone) return;
+        // A finished attempt's teardown is owned by handleFinish (it may still be draining recording
+        // uploads in the background when the parent unmounts this view); a second concurrent
+        // shutdown here could finalize the recording as FAILED ahead of it.
+        if (finishOnceRef.current) return;
         void shutdownExamCapture('FAILED');
     };
   }, [exam, introDone]);
@@ -1765,7 +1827,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     // Identity enrollment is NOT a prerequisite — face-presence / gaze / multi-face / phone /
     // object / AUDIO violations must work for every candidate. Identity matching is layered on
     // once an SFace template exists (already on file, or auto-enrolled from the first clear frame).
-    if (permissionStatus === 'granted' && !fullscreenBlocked) {
+    // Never re-arm a finished attempt (teardown exits fullscreen, which flips fullscreenBlocked).
+    if (permissionStatus === 'granted' && !fullscreenBlocked && !finishOnceRef.current) {
       proctoringArmedRef.current = true;
       // Reset proctor timers so stale pre-exam state doesn't fire immediately
       faceAbsenceStartRef.current = null;
@@ -2325,23 +2388,34 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   // sustained mismatch. No browser-side recognition loop runs anymore.
 
   // 2. Timer
+  // Wall-clock based: a "-1 per setInterval tick" countdown silently ran SLOW whenever the browser
+  // throttled timers (background tab, intensive throttling after 5 min hidden) and stopped entirely
+  // while a phone was locked — handing the candidate extra exam time. Each tick now subtracts the
+  // whole seconds that actually elapsed. The clock still pauses while the exam is blocked (the
+  // interval is torn down and `last` restarts when it resumes), exactly as before.
   useEffect(() => {
     if (examBlocked || resumePending) return;
-    const timer = setInterval(() => {
-      setTimeLeft(prev => {
-        if (prev <= 1) {
-          clearInterval(timer);
-          handleFinish();
-          return 0;
-        }
-        return prev - 1;
-      });
+    let last = Date.now();
+    const timer = window.setInterval(() => {
+      const elapsed = Math.floor((Date.now() - last) / 1000);
+      if (elapsed < 1) return;
+      last += elapsed * 1000;
+      setTimeLeft(prev => Math.max(0, prev - elapsed));
     }, 1000);
-    return () => clearInterval(timer);
+    return () => window.clearInterval(timer);
   }, [examBlocked, resumePending]);
+
+  // Time's up → submit. Kept out of the state updater above (updaters must be pure; React may run
+  // them during render or twice under StrictMode).
+  useEffect(() => {
+    if (timeLeft > 0 || examBlocked || resumePending) return;
+    handleFinish();
+  }, [timeLeft, examBlocked, resumePending]);
 
   // Section timer (if enabled)
   useEffect(() => {
+    // Entering a section (re-)arms its expiry handling below.
+    sectionExpiredRef.current = null;
     const currentSection = activeSections[currentSectionIdx];
     if (!currentSection) {
       setSectionTimeLeft(null);
@@ -2368,22 +2442,43 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     questionTimerRef.current = Date.now();
   }, [activeSections, currentSectionIdx]);
 
+  // Wall-clock based for the same reason as the exam timer above.
+  const sectionTimerRunning = sectionTimeLeft !== null && sectionTimeLeft > 0;
   useEffect(() => {
     if (examBlocked || resumePending) return;
-    if (sectionTimeLeft === null) return;
+    if (!sectionTimerRunning) return;
+    let last = Date.now();
     const timer = window.setInterval(() => {
-      setSectionTimeLeft(prev => {
-        if (prev === null) return prev;
-        if (prev <= 1) {
-          window.clearInterval(timer);
-          moveToNext();
-          return 0;
-        }
-        return prev - 1;
-      });
+      const elapsed = Math.floor((Date.now() - last) / 1000);
+      if (elapsed < 1) return;
+      last += elapsed * 1000;
+      setSectionTimeLeft(prev => (prev === null ? prev : Math.max(0, prev - elapsed)));
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [examBlocked, resumePending, sectionTimeLeft, currentSectionIdx]);
+  }, [examBlocked, resumePending, sectionTimerRunning, currentSectionIdx]);
+
+  // Section time limit reached → move to the NEXT SECTION (or submit after the last one). This used
+  // to call moveToNext(), which only advanced ONE QUESTION; with the section clock at 0 it then
+  // re-fired every second, dragging the candidate through the rest of the expired section one
+  // question per second (each still answerable). Locking follows the section's lockOnComplete,
+  // exactly like the "Next Section" button.
+  useEffect(() => {
+    if (sectionTimeLeft !== 0 || examBlocked || resumePending) return;
+    if (finishOnceRef.current) return;
+    const { sectionIdx } = positionRef.current;
+    if (sectionExpiredRef.current === sectionIdx) return;
+    sectionExpiredRef.current = sectionIdx;
+    if (sectionIdx < activeSections.length - 1) {
+      const nextSectionIdx = sectionIdx + 1;
+      if (activeSections[sectionIdx]?.lockOnComplete ?? true) {
+        setMinSectionIdx(prev => Math.max(prev, nextSectionIdx));
+      }
+      recordQuestionTime(nextSectionIdx, 0);
+      showStudentNotice('Time is up for this section. Moved to the next section.');
+    } else {
+      handleFinish();
+    }
+  }, [sectionTimeLeft, examBlocked, resumePending]);
 
   useEffect(() => {
     if (examBlocked) {
@@ -2409,35 +2504,73 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     }
   }, [storageKey, exam.id, student.id]);
 
+  // Restore a saved attempt. `keepAnswers=false` is "Start Fresh": it discards the saved ANSWERS
+  // only — the exam clock, section progress/locks and the violation tally belong to this server
+  // session and must carry over (previously "Start Fresh" silently reset the timer to the full
+  // duration and re-opened locked sections, and any reload zeroed the violation-limit counters).
+  const applyResumePayload = (payload: any, keepAnswers: boolean) => {
+    const elapsed = Math.max(0, Math.floor((Date.now() - (payload.savedAt || Date.now())) / 1000));
+    // Clamp saved positions: if the exam was edited since the save (fewer sections/questions),
+    // an out-of-range index left currentQ undefined and crashed the exam view to a blank page.
+    const lastSectionIdx = Math.max(0, activeSections.length - 1);
+    const nextSectionIdx = Math.min(lastSectionIdx, Math.max(0, Math.floor(Number(payload.currentSectionIdx) || 0)));
+    const lastQuestionIdx = Math.max(0, (activeSections[nextSectionIdx]?.questions.length ?? 1) - 1);
+    const nextQuestionIdx = Math.min(lastQuestionIdx, Math.max(0, Math.floor(Number(payload.currentQuestionIdx) || 0)));
+    const nextMinSectionIdx = Math.min(nextSectionIdx, Math.max(0, Math.floor(Number(payload.minSectionIdx) || 0)));
+    const shouldDeferOverride = nextSectionIdx !== currentSectionIdx;
+    if (keepAnswers) {
+      setAnswers(payload.answers || {});
+      setQuestionTimes(payload.questionTimes || {});
+      questionTimesRef.current = payload.questionTimes || {};
+    }
+    const savedTypeCounts = payload.violationTypeCounts;
+    if (savedTypeCounts && typeof savedTypeCounts === 'object') {
+      (Object.keys(violationTypeCountsRef.current) as ViolationLog['type'][]).forEach(type => {
+        const saved = Number(savedTypeCounts[type]);
+        if (Number.isFinite(saved) && saved > violationTypeCountsRef.current[type]) {
+          violationTypeCountsRef.current[type] = saved;
+        }
+      });
+    }
+    const savedCategoryCounts = payload.violationCategoryCounts;
+    if (savedCategoryCounts && typeof savedCategoryCounts === 'object') {
+      (Object.keys(violationCategoryCountsRef.current) as ViolationCategory[]).forEach(category => {
+        const saved = Number(savedCategoryCounts[category]);
+        if (Number.isFinite(saved) && saved > violationCategoryCountsRef.current[category]) {
+          violationCategoryCountsRef.current[category] = saved;
+        }
+      });
+      setTabSwitchCount(violationCategoryCountsRef.current.tabSwitch);
+    }
+    setCurrentSectionIdx(nextSectionIdx);
+    setCurrentQuestionIdx(nextQuestionIdx);
+    setMinSectionIdx(nextMinSectionIdx);
+    if (typeof payload.timeLeft === 'number') {
+      setTimeLeft(Math.max(0, payload.timeLeft - elapsed));
+    }
+    if (typeof payload.sectionTimeLeft === 'number') {
+      const nextSectionTime = Math.max(0, payload.sectionTimeLeft - elapsed);
+      resumeOverrideRef.current = shouldDeferOverride ? nextSectionTime : null;
+      resumeAppliedRef.current = shouldDeferOverride;
+      setSectionTimeLeft(nextSectionTime);
+    } else {
+      resumeOverrideRef.current = null;
+      resumeAppliedRef.current = shouldDeferOverride;
+    }
+    questionTimerRef.current = Date.now();
+  };
+
   useEffect(() => {
     if (!resumePending) return;
     if (resumeCountdown <= 0) {
       const payload = resumePayloadRef.current;
       if (payload) {
-        const elapsed = Math.max(0, Math.floor((Date.now() - (payload.savedAt || Date.now())) / 1000));
-        const nextSectionIdx = payload.currentSectionIdx ?? 0;
-        const shouldDeferOverride = nextSectionIdx !== currentSectionIdx;
-        setAnswers(payload.answers || {});
-        setQuestionTimes(payload.questionTimes || {});
-        questionTimesRef.current = payload.questionTimes || {};
-        setCurrentSectionIdx(nextSectionIdx);
-        setCurrentQuestionIdx(payload.currentQuestionIdx ?? 0);
-        setMinSectionIdx(payload.minSectionIdx ?? 0);
-        if (typeof payload.timeLeft === 'number') {
-          setTimeLeft(Math.max(0, payload.timeLeft - elapsed));
-        }
-        if (typeof payload.sectionTimeLeft === 'number') {
-          const nextSectionTime = Math.max(0, payload.sectionTimeLeft - elapsed);
-          resumeOverrideRef.current = shouldDeferOverride ? nextSectionTime : null;
-          resumeAppliedRef.current = shouldDeferOverride;
-          setSectionTimeLeft(nextSectionTime);
-        } else {
-          resumeOverrideRef.current = null;
-          resumeAppliedRef.current = shouldDeferOverride;
-        }
-        questionTimerRef.current = Date.now();
+        applyResumePayload(payload, true);
         showStudentNotice('Session restored from autosave.');
       }
+      // Consumed — autosave (which holds off while a saved attempt is waiting to be restored) may
+      // now write again.
+      resumePayloadRef.current = null;
       setResumePending(false);
       return;
     }
@@ -2470,14 +2603,23 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
 
   useEffect(() => {
     if (resumePending) return;
+    // A saved attempt found on mount is still waiting to be restored. On the very first commit this
+    // effect runs (resumePending is only flipped on the NEXT render) and used to immediately
+    // overwrite that saved attempt with the blank initial state — so a second reload during the
+    // "Resume your attempt?" countdown lost every answer and reset the clock to full.
+    if (resumePayloadRef.current) return;
     const saveState = () => {
+      if (finishOnceRef.current) return; // finished: storage is cleared, don't resurrect it
       try {
         setAutosaveStatus('saving');
         const payload = {
           examId: exam.id,
           studentId: student.id,
           savedAt: Date.now(),
-          ...stateRef.current
+          ...stateRef.current,
+          // Conduct tallies travel with the attempt so a reload can't reset the violation limits.
+          violationTypeCounts: violationTypeCountsRef.current,
+          violationCategoryCounts: violationCategoryCountsRef.current,
         };
         localStorage.setItem(storageKey, JSON.stringify(payload));
         setAutosaveStatus('saved');
@@ -2487,7 +2629,12 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     };
     saveState();
     const interval = window.setInterval(saveState, 5000);
-    return () => window.clearInterval(interval);
+    // Capture the last few seconds of work on reload/close too (the interval alone could lose up to 5s).
+    window.addEventListener('pagehide', saveState);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('pagehide', saveState);
+    };
   }, [resumePending, storageKey, exam.id, student.id]);
 
   // Server-side answer autosave. localStorage (above) only survives on the SAME device, so an
@@ -2592,8 +2739,10 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     };
 
     // Guard against accidental reload / closing / external navigation mid-exam.
+    // Stays armed while a submission is still flushing (finish clicked but not yet handed off):
+    // leaving at that point used to lose the submission silently, with no warning.
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (finishingRef.current || finishOnceRef.current) return;
+      if (allowUnloadRef.current || finishDeliveredRef.current) return;
       e.preventDefault();
       e.returnValue = '';
     };
@@ -2867,18 +3016,25 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   };
 
   const discardResume = () => {
+    const payload = resumePayloadRef.current;
     try {
       localStorage.removeItem(storageKey);
     } catch {
       // ignore storage errors
     }
-    resumePayloadRef.current = null;
     resumeOverrideRef.current = null;
     resumeAppliedRef.current = false;
+    // Same server session, so the clock, section locks and violation tally carry over — only the
+    // saved answers are discarded (this used to hand the candidate a full-length timer again).
+    if (payload) applyResumePayload(payload, false);
+    resumePayloadRef.current = null;
     setResumePending(false);
     setResumeCountdown(0);
-    showStudentNotice('Starting a fresh attempt.');
+    showStudentNotice('Saved answers cleared. Your exam timer continues.');
   };
+
+  // Upper bound on how long the hand-off to onFinish waits for capture teardown (see handleFinish).
+  const FINISH_MAX_WAIT_MS = 12000;
 
   const handleFinish = (opts?: {
     terminated?: boolean;
@@ -2887,7 +3043,16 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     triggerType?: ViolationLog['type'];
   }) => {
       if (finishOnceRef.current) return;
+      // A violation-limit termination is already queued (it fires ~800ms after the limit is hit).
+      // A normal submit / time-up landing inside that window used to win the race and record the
+      // attempt as COMPLETED, silently bypassing the termination.
+      if (terminationQueuedRef.current && !opts?.terminated) return;
       finishOnceRef.current = true;
+      // Stop raising new violations the moment the attempt ends — otherwise an Esc / alt-tab /
+      // look-away while the submission is still flushing was logged against an already-ended exam.
+      proctoringArmedRef.current = false;
+      setConfirmSubmitOpen(false);
+      setFinishPhase(opts?.terminated ? 'terminating' : 'submitting');
       // Read exam state through refs, never the closure: finish fires from effects that mounted
       // at exam start (timer expiry, violation-limit termination), whose captured state is stale.
       const { sectionIdx, questionIdx } = positionRef.current;
@@ -2919,13 +3084,25 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
       };
 
       void (async () => {
-        await flushPendingViolations(); // last chance to land queued evidence before teardown
-        await shutdownExamCapture(opts?.terminated ? 'FAILED' : 'COMPLETED');
+        const teardown = (async () => {
+          await flushPendingViolations(); // last chance to land queued evidence before teardown
+          await shutdownExamCapture(opts?.terminated ? 'FAILED' : 'COMPLETED');
+        })().catch(err => console.error('Exam teardown failed:', err));
+        // Bound how long the SUBMISSION waits on teardown. shutdownExamCapture() drains every queued
+        // recording-chunk upload before finalizing; on a slow uplink that backlog can be minutes
+        // long, and the session "complete" call (in onFinish) used to sit behind it — the exam looked
+        // frozen after "Submit", and closing the tab then lost the submission entirely. Teardown keeps
+        // running in the background (it still finalizes the recording only after the last chunk).
+        await Promise.race([
+          teardown,
+          new Promise(resolve => window.setTimeout(resolve, FINISH_MAX_WAIT_MS)),
+        ]);
         try {
           localStorage.removeItem(storageKey);
         } catch {
           // ignore storage errors
         }
+        finishDeliveredRef.current = true;
         onFinish(payload);
       })();
   };
@@ -2934,13 +3111,24 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     const currentSection = activeSections[currentSectionIdx];
     const currentQuestion = currentSection?.questions[currentQuestionIdx];
     if (!currentQuestion) return;
-    setAnswers(prev => ({ ...prev, [currentQuestion.id]: val }));
+    setAnswerFor(currentQuestion.id, val);
   };
 
   // Set the answer for an arbitrary question id (used by structured renderers that update
-  // maps/arrays for the currently displayed question).
+  // maps/arrays for the currently displayed question). A fully cleared answer ('' or an array of
+  // only empty blanks / no picks) is REMOVED rather than stored: the server grades any non-empty
+  // array as answered, so a fill-in-the-blank the candidate typed into and then erased used to be
+  // scored as a wrong answer (incl. negative marks) instead of "not answered".
   const setAnswerFor = (questionId: string, val: any) => {
-    setAnswers(prev => ({ ...prev, [questionId]: val }));
+    const cleared = val === undefined || val === null || val === ''
+      || (Array.isArray(val) && val.every(x => x === undefined || x === null || x === ''));
+    setAnswers(prev => {
+      if (!cleared) return { ...prev, [questionId]: val };
+      if (!(questionId in prev)) return prev;
+      const next = { ...prev };
+      delete next[questionId];
+      return next;
+    });
   };
 
   const applyTimeDelta = (questionId: string, delta: number) => {
@@ -3002,6 +3190,33 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     return `${m}:${s.toString().padStart(2, '0')}`;
   };
 
+  // Current question. Resolved (and its memoised display orders computed) BEFORE the early returns
+  // below: hooks after a conditional return change the hook count whenever that condition flips
+  // (React then throws "Rendered more/fewer hooks" and the exam white-screens).
+  const currentSection: (typeof activeSections)[number] | undefined = activeSections[currentSectionIdx];
+  const currentQ: Question | undefined = currentSection?.questions[currentQuestionIdx];
+  // Fixed candidate-facing display orders for the structured types (seeded by question id).
+  const matchRightOrder = useMemo(
+    () => (currentQ ? seededShuffle(rangeArr(currentQ.matchOptions?.right?.length || 0), currentQ.id + ':r') : []),
+    [currentQ?.id]
+  );
+  const orderingInitial = useMemo(() => {
+    if (!currentQ) return [];
+    const n = currentQ.matchOptions?.items?.length || 0;
+    const shuffled = seededShuffle(rangeArr(n), currentQ.id + ':o');
+    // Never START on the correct order. An untouched ORDERING question stores no answer (it is
+    // graded as unanswered), so when the seeded shuffle happened to land on the answer key — 50% of
+    // 2-item questions, 1 in 6 for 3 items — a candidate who agreed with what they saw could not
+    // submit it without moving items away and back. Rotating by one keeps the order deterministic.
+    const key = Array.isArray(currentQ.answerKey?.order) && currentQ.answerKey!.order!.length === n
+      ? currentQ.answerKey!.order!.map(Number)
+      : rangeArr(n);
+    if (n >= 2 && shuffled.every((v, i) => v === key[i])) {
+      return [...shuffled.slice(1), shuffled[0]];
+    }
+    return shuffled;
+  }, [currentQ?.id]);
+
   // Hard device gate — shown before anything else when the candidate's device class is not allowed.
   if (deviceBlocked) {
     const allowedLabels = allowedDeviceTypes.map(d => deviceTypeLabel[d]);
@@ -3049,28 +3264,25 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     );
   }
 
-  if (totalQuestions === 0) {
+  // The exam object arrives fully loaded (sections are built once on mount), so an empty question
+  // set will never "finish loading" — this used to spin on "Loading Exam Content..." forever.
+  if (totalQuestions === 0 || !currentSection || !currentQ) {
       return (
-        <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500 font-medium">
-          <div className="flex flex-col items-center gap-4">
-             <div className="w-8 h-8 border-4 border-[var(--lsc-primary)] border-t-transparent rounded-full animate-spin"></div>
-             Loading Exam Content...
+        <div className="min-h-screen flex items-center justify-center bg-slate-50 px-4">
+          <div className="max-w-md w-full lsc-panel p-8 text-center">
+             <div className="w-14 h-14 mx-auto rounded-2xl bg-amber-50 text-amber-600 flex items-center justify-center mb-4">
+               <AlertTriangle size={26} />
+             </div>
+             <h1 className="text-xl font-bold text-slate-900">No questions available</h1>
+             <p className="text-sm text-slate-500 mt-2">{exam.title}</p>
+             <p className="text-sm text-slate-600 mt-4 leading-relaxed">
+               This exam doesn&apos;t have any questions to display yet. Please contact your exam administrator.
+             </p>
           </div>
         </div>
       );
   }
 
-  const currentSection = activeSections[currentSectionIdx];
-  const currentQ = currentSection.questions[currentQuestionIdx];
-  // Fixed candidate-facing display orders for the structured types (seeded by question id).
-  const matchRightOrder = useMemo(
-    () => seededShuffle(rangeArr(currentQ.matchOptions?.right?.length || 0), currentQ.id + ':r'),
-    [currentQ.id]
-  );
-  const orderingInitial = useMemo(
-    () => seededShuffle(rangeArr(currentQ.matchOptions?.items?.length || 0), currentQ.id + ':o'),
-    [currentQ.id]
-  );
   const isLastQuestionInSection = currentQuestionIdx === currentSection.questions.length - 1;
   const isLastSection = currentSectionIdx === activeSections.length - 1;
   const isLast = isLastSection && isLastQuestionInSection;
@@ -3079,6 +3291,14 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     .reduce((sum, section) => sum + section.questions.length, 0) + currentQuestionIdx + 1;
 
   // ---- Per-question-type answer input for the candidate ----
+  // Option cards are clickable divs; make them keyboard-operable too (Enter / Space), like the
+  // native radio/checkbox they stand in for.
+  const onOptionKey = (e: React.KeyboardEvent, select: () => void) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      select();
+    }
+  };
   const optCardCls = (selected: boolean) =>
     `group flex items-center gap-4 p-4 rounded-xl border transition-all cursor-pointer ${
       selected ? 'border-blue-500 bg-blue-50/70 shadow-sm ring-1 ring-blue-500' : 'border-slate-200 bg-white hover:border-blue-300 hover:shadow-sm'
@@ -3093,11 +3313,19 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
       const opts = q.options && q.options.length ? q.options
         : q.type === QuestionType.TRUE_FALSE ? ['True', 'False'] : ['Yes', 'No'];
       return (
-        <div className="grid gap-3">
+        <div className="grid gap-3" role="radiogroup" aria-label="Answer options">
           {opts.map((opt, idx) => {
             const selected = val === idx;
             return (
-              <div key={idx} onClick={() => handleAnswer(idx)} className={optCardCls(selected)}>
+              <div
+                key={idx}
+                role="radio"
+                aria-checked={selected}
+                tabIndex={0}
+                onClick={() => handleAnswer(idx)}
+                onKeyDown={e => onOptionKey(e, () => handleAnswer(idx))}
+                className={optCardCls(selected)}
+              >
                 <div className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 ${selected ? 'border-blue-500 bg-blue-500' : 'border-slate-300 group-hover:border-blue-400'}`}>
                   {selected && <div className="w-2 h-2 rounded-full bg-white" />}
                 </div>
@@ -3113,11 +3341,20 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     if (q.type === QuestionType.MULTI_SELECT) {
       const picked: number[] = Array.isArray(val) ? val : [];
       return (
-        <div className="grid gap-3">
+        <div className="grid gap-3" role="group" aria-label="Answer options (select all that apply)">
           {(q.options || []).map((opt, idx) => {
             const selected = picked.includes(idx);
+            const toggle = () => handleAnswer(selected ? picked.filter(x => x !== idx) : [...picked, idx]);
             return (
-              <div key={idx} onClick={() => handleAnswer(selected ? picked.filter(x => x !== idx) : [...picked, idx])} className={optCardCls(selected)}>
+              <div
+                key={idx}
+                role="checkbox"
+                aria-checked={selected}
+                tabIndex={0}
+                onClick={toggle}
+                onKeyDown={e => onOptionKey(e, toggle)}
+                className={optCardCls(selected)}
+              >
                 <div className={`w-5 h-5 rounded border flex items-center justify-center shrink-0 ${selected ? 'border-blue-500 bg-blue-500' : 'border-slate-300 group-hover:border-blue-400'}`}>
                   {selected && <CheckCircle2 size={14} className="text-white" />}
                 </div>
@@ -3140,7 +3377,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
               <span className="text-sm text-slate-500 w-16 shrink-0">Blank {i + 1}</span>
               <input
                 type="text"
-                className="flex-1 p-3 text-base bg-white border border-slate-300 rounded-xl outline-none"
+                aria-label={`Blank ${i + 1}`}
+                className="flex-1 min-w-0 p-3 text-base bg-white border border-slate-300 rounded-xl outline-none"
                 value={arr[i] || ''}
                 onPaste={(e) => e.preventDefault()}
                 onChange={e => { const next = [...arr]; next[i] = e.target.value; handleAnswer(next); }}
@@ -3154,7 +3392,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     // Numeric.
     if (q.type === QuestionType.NUMERIC) {
       return (
-        <input type="number" step="any" className="w-full p-4 text-base bg-white border border-slate-300 rounded-xl outline-none"
+        <input type="number" step="any" inputMode="decimal" aria-label="Your answer" className="w-full p-4 text-base bg-white border border-slate-300 rounded-xl outline-none"
           placeholder="Enter a number" value={val ?? ''} onChange={e => handleAnswer(e.target.value)} />
       );
     }
@@ -3163,6 +3401,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     if (q.type === QuestionType.DATE || q.type === QuestionType.TIME) {
       return (
         <input type={q.type === QuestionType.DATE ? 'date' : 'time'}
+          aria-label="Your answer"
           className="p-4 text-base bg-white border border-slate-300 rounded-xl outline-none"
           value={val ?? ''} onChange={e => handleAnswer(e.target.value)} />
       );
@@ -3177,9 +3416,9 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
         <div className="space-y-3">
           {left.map((l, li) => (
             <div key={li} className="flex items-center gap-3">
-              <span className="flex-1 p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-800">{l}</span>
+              <span className="flex-1 min-w-0 break-words p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-800">{l}</span>
               <span className="text-slate-400">↔</span>
-              <select className="flex-1 p-3 bg-white border border-slate-300 rounded-xl outline-none"
+              <select aria-label={`Match for ${l}`} className="flex-1 min-w-0 p-3 bg-white border border-slate-300 rounded-xl outline-none"
                 value={map[li] ?? ''} onChange={e => setAnswerFor(q.id, { ...map, [li]: Number(e.target.value) })}>
                 <option value="" disabled>Select…</option>
                 {matchRightOrder.map(ri => <option key={ri} value={ri}>{right[ri]}</option>)}
@@ -3206,9 +3445,9 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
           {order.map((itemIdx, pos) => (
             <div key={itemIdx} className="flex items-center gap-3 p-3 bg-white border border-slate-300 rounded-xl">
               <span className="w-6 h-6 rounded-full bg-slate-100 text-slate-600 text-sm flex items-center justify-center shrink-0">{pos + 1}</span>
-              <span className="flex-1 text-slate-800">{items[itemIdx]}</span>
-              <button type="button" onClick={() => move(pos, -1)} disabled={pos === 0} className="p-1 text-slate-500 hover:text-blue-600 disabled:opacity-30"><ChevronLeft className="rotate-90" size={18} /></button>
-              <button type="button" onClick={() => move(pos, 1)} disabled={pos === order.length - 1} className="p-1 text-slate-500 hover:text-blue-600 disabled:opacity-30"><ChevronRight className="rotate-90" size={18} /></button>
+              <span className="flex-1 min-w-0 break-words text-slate-800">{items[itemIdx]}</span>
+              <button type="button" aria-label={`Move "${items[itemIdx]}" up`} onClick={() => move(pos, -1)} disabled={pos === 0} className="p-1 text-slate-500 hover:text-blue-600 disabled:opacity-30"><ChevronLeft className="rotate-90" size={18} /></button>
+              <button type="button" aria-label={`Move "${items[itemIdx]}" down`} onClick={() => move(pos, 1)} disabled={pos === order.length - 1} className="p-1 text-slate-500 hover:text-blue-600 disabled:opacity-30"><ChevronRight className="rotate-90" size={18} /></button>
             </div>
           ))}
         </div>
@@ -3224,9 +3463,9 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
         <div className="space-y-3">
           {items.map((it, ii) => (
             <div key={ii} className="flex items-center gap-3">
-              <span className="flex-1 p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-800">{it}</span>
+              <span className="flex-1 min-w-0 break-words p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-800">{it}</span>
               <span className="text-slate-400">→</span>
-              <select className="flex-1 p-3 bg-white border border-slate-300 rounded-xl outline-none"
+              <select aria-label={`Category for ${it}`} className="flex-1 min-w-0 p-3 bg-white border border-slate-300 rounded-xl outline-none"
                 value={map[ii] ?? ''} onChange={e => setAnswerFor(q.id, { ...map, [ii]: Number(e.target.value) })}>
                 <option value="" disabled>Choose…</option>
                 {buckets.map((bk, bi) => <option key={bi} value={bi}>{bk}</option>)}
@@ -3248,6 +3487,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
         {isShort ? (
           <input
             type="text"
+            aria-label="Your answer"
             className={`w-full p-4 text-base text-slate-800 bg-white border rounded-xl outline-none ${atLimit ? 'border-rose-300' : 'border-slate-300'}`}
             placeholder="Type your answer…"
             value={answerText}
@@ -3256,6 +3496,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
           />
         ) : (
           <textarea
+            aria-label="Your answer"
             className={`w-full h-52 sm:h-64 p-4 sm:p-5 text-base text-slate-800 bg-white border rounded-xl outline-none resize-none transition-shadow shadow-sm ${atLimit ? 'border-rose-300' : 'border-slate-300'}`}
             placeholder="Type your answer here..."
             value={answerText}
@@ -3300,20 +3541,22 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
             </p>
             <div className="mt-6 flex flex-col sm:flex-row gap-3">
               <button
+                type="button"
                 onClick={resumeNow}
                 className="flex-1 py-3 bg-[var(--lsc-primary)] text-white rounded-lg hover:bg-[var(--lsc-primary-700)] font-semibold"
               >
                 Resume Now
               </button>
               <button
+                type="button"
                 onClick={discardResume}
                 className="flex-1 py-3 border border-slate-200 text-slate-700 rounded-lg hover:bg-slate-50 font-semibold"
               >
-                Start Fresh
+                Clear Saved Answers
               </button>
             </div>
             <p className="text-xs text-slate-400 mt-4">
-              Autosaved progress restores your answers, timers, and section state.
+              Resuming restores your answers and position. Your exam timer keeps running either way.
             </p>
           </div>
         </div>
@@ -3368,7 +3611,11 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
             </p>
             <div className="mt-6 space-y-3">
               <button
-                onClick={() => window.location.reload()}
+                type="button"
+                onClick={() => {
+                  allowUnloadRef.current = true; // intentional reload — skip the leave-page prompt
+                  window.location.reload();
+                }}
                 className="w-full py-3 bg-[var(--lsc-primary)] text-white rounded-lg hover:bg-[var(--lsc-primary-700)] font-semibold"
               >
                 Refresh Page
@@ -3387,6 +3634,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
             </p>
             <div className="mt-6 space-y-3">
               <button
+                type="button"
                 onClick={() => {
                   requestFullscreen().then(ok => {
                     if (!ok) {
@@ -3440,8 +3688,63 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
         </div>
       )}
 
+      {confirmSubmitOpen && !finishPhase && (() => {
+        const allQuestions = activeSections.flatMap(section => section.questions);
+        const answeredCount = allQuestions.filter(q => hasAnswerValue(answers[q.id])).length;
+        const unanswered = allQuestions.length - answeredCount;
+        return (
+          <div className="fixed inset-0 z-[220] bg-slate-900/50 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="pg-submit-title">
+            <div className="bg-white rounded-2xl shadow-2xl p-6 sm:p-8 max-w-md w-full border border-slate-200 text-center">
+              <h2 id="pg-submit-title" className="text-xl sm:text-2xl font-bold text-slate-900">Submit your exam?</h2>
+              <p className="text-slate-600 mt-2 text-sm">
+                You have answered <span className="font-semibold text-slate-900">{answeredCount}</span> of {allQuestions.length} questions.
+              </p>
+              {unanswered > 0 && (
+                <p className="mt-3 text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                  {unanswered} {unanswered === 1 ? 'question is' : 'questions are'} still unanswered.
+                </p>
+              )}
+              <p className="text-xs text-slate-400 mt-3">You can&apos;t change your answers after submitting.</p>
+              <div className="mt-6 flex flex-col-reverse sm:flex-row gap-3">
+                <button
+                  type="button"
+                  autoFocus
+                  onClick={() => setConfirmSubmitOpen(false)}
+                  className="flex-1 py-3 border border-slate-200 text-slate-700 rounded-lg hover:bg-slate-50 font-semibold"
+                >
+                  Keep Working
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setConfirmSubmitOpen(false); handleFinish(); }}
+                  className="flex-1 py-3 bg-slate-900 text-white rounded-lg hover:bg-slate-950 font-semibold"
+                >
+                  Submit Exam
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {finishPhase && (
+        <div className="fixed inset-0 z-[240] bg-slate-900/50 flex items-center justify-center p-4" role="alertdialog" aria-modal="true" aria-live="assertive">
+          <div className="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full border border-slate-200 text-center">
+            <div className="w-10 h-10 mx-auto mb-4 border-4 border-[var(--lsc-primary)] border-t-transparent rounded-full animate-spin" aria-hidden="true" />
+            <h2 className="text-xl font-bold text-slate-900">
+              {finishPhase === 'terminating' ? 'Ending your exam…' : 'Submitting your exam…'}
+            </h2>
+            <p className="text-slate-600 mt-2 text-sm">
+              Saving your answers and finishing the recording. Please keep this window open — this can take a few seconds.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* --- Floating Violation Toast --- */}
-      <div className={`fixed top-4 sm:top-6 left-1/2 max-w-[calc(100vw-1.5rem)] sm:max-w-[calc(100vw-3rem)] transform -translate-x-1/2 z-[100] transition-all duration-300 ${
+      {/* Above every blocking overlay, so notices raised from them ("Fullscreen request blocked…",
+          the termination reason) are actually readable instead of dimmed underneath. */}
+      <div role="status" aria-live="polite" className={`fixed top-4 sm:top-6 left-1/2 max-w-[calc(100vw-1.5rem)] sm:max-w-[calc(100vw-3rem)] transform -translate-x-1/2 z-[250] transition-all duration-300 ${
           feedbackBanner.show ? 'translate-y-0 opacity-100' : '-translate-y-10 opacity-0 pointer-events-none'
       }`}>
         <div className={`flex items-center gap-3 px-4 sm:px-6 py-3 rounded-2xl sm:rounded-full shadow-2xl border backdrop-blur-md ${
@@ -3494,6 +3797,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
                   </div>
                 )}
                 <button
+                  type="button"
+                  aria-expanded={sidebarOpen}
                   onClick={() => setSidebarOpen(prev => !prev)}
                   className="lg:hidden px-3 py-1.5 rounded-full border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-50"
                 >
@@ -3549,23 +3854,35 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
 
                {/* Navigation Buttons */}
                <div className="flex flex-col-reverse gap-3 sm:flex-row sm:justify-between sm:items-center pt-6 border-t border-slate-200">
-                  <button 
+                  <button
+                     type="button"
                      onClick={moveToPrevious}
-                     disabled={currentQuestionIdx === 0 && currentSectionIdx <= minSectionIdx}
+                     disabled={!!finishPhase || (currentQuestionIdx === 0 && currentSectionIdx <= minSectionIdx)}
                      className="flex items-center justify-center gap-2 px-5 py-2.5 text-slate-600 hover:text-slate-900 font-medium rounded-lg hover:bg-slate-100 transition-colors disabled:opacity-30"
                   >
                      <ChevronLeft size={18} /> Previous
                   </button>
 
-                  <button 
-                     onClick={moveToNext}
-                     className={`flex items-center justify-center gap-2 px-8 py-2.5 text-white font-medium rounded-lg shadow-lg shadow-blue-200/60 transition-all hover:scale-[1.02] active:scale-[0.98] ${
-                        isLast ? 'bg-slate-900 hover:bg-slate-950' : 'bg-[var(--lsc-primary)] hover:bg-[var(--lsc-primary-700)]'
-                     }`}
-                  >
-                     {isLast ? 'Submit Exam' : isLastQuestionInSection ? 'Next Section' : 'Next Question'}
-                     {!isLast && <ChevronRight size={18} />}
-                  </button>
+                  <div className="flex flex-col items-stretch sm:items-end gap-1.5">
+                    <button
+                       type="button"
+                       // The last question's button sits exactly where "Next" was — a fast double-tap
+                       // used to submit the whole exam instantly with no chance to review.
+                       onClick={() => (isLast ? setConfirmSubmitOpen(true) : moveToNext())}
+                       disabled={!!finishPhase}
+                       className={`flex items-center justify-center gap-2 px-8 py-2.5 text-white font-medium rounded-lg shadow-lg shadow-blue-200/60 transition-all hover:scale-[1.02] active:scale-[0.98] disabled:opacity-60 disabled:hover:scale-100 ${
+                          isLast ? 'bg-slate-900 hover:bg-slate-950' : 'bg-[var(--lsc-primary)] hover:bg-[var(--lsc-primary-700)]'
+                       }`}
+                    >
+                       {isLast ? 'Submit Exam' : isLastQuestionInSection ? 'Next Section' : 'Next Question'}
+                       {!isLast && <ChevronRight size={18} />}
+                    </button>
+                    {!isLast && isLastQuestionInSection && (currentSection.lockOnComplete ?? true) && (
+                      <span className="text-[11px] text-slate-500 text-center sm:text-right">
+                        You can&apos;t return to this section after moving on.
+                      </span>
+                    )}
+                  </div>
                </div>
             </div>
          </main>
@@ -3581,10 +3898,14 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
                    <Monitor size={12} /> Proctoring Active
                 </span>
                 <div className="flex items-center gap-2">
-                  <div className="flex items-center gap-1.5 px-2 py-0.5 bg-red-500/10 border border-red-500/20 rounded text-[10px] font-bold text-red-500 animate-pulse">
-                     <div className="w-1.5 h-1.5 rounded-full bg-red-500"></div> REC
-                  </div>
+                  {/* Only claim to be recording when a recording actually runs (camera-required exams). */}
+                  {recordingEnabled && (
+                    <div className="flex items-center gap-1.5 px-2 py-0.5 bg-red-500/10 border border-red-500/20 rounded text-[10px] font-bold text-red-500 animate-pulse">
+                       <div className="w-1.5 h-1.5 rounded-full bg-red-500"></div> REC
+                    </div>
+                  )}
                   <button
+                    type="button"
                     onClick={() => setSidebarOpen(false)}
                     className="lg:hidden p-1.5 rounded-lg border border-slate-200 text-slate-500 hover:bg-white"
                     aria-label="Close tools"
@@ -3594,6 +3915,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
                 </div>
              </div>
 
+             {/* No camera on this exam → no black preview box stuck on "Detecting…" forever. */}
+             {cameraCaptureRequired && (
              <div className="relative aspect-[4/3] rounded-lg overflow-hidden border border-slate-200 bg-slate-900 shadow-inner mb-3">
                 <video
                    ref={videoRef}
@@ -3633,6 +3956,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
                    <AudioBars />
                 </div>
              </div>
+             )}
 
              <div className="grid grid-cols-2 gap-2 text-[10px] font-mono text-slate-500">
                 {microphoneCaptureRequired ? (
@@ -3692,11 +4016,20 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
             <div className="grid grid-cols-5 gap-2">
                {currentSection.questions.map((q, idx) => {
                   const isActive = currentQuestionIdx === idx;
-                  const isAnswered = answers[q.id] !== undefined;
+                  const isAnswered = hasAnswerValue(answers[q.id]);
+                  // Same numbering as the "Question N of M" header (it used to restart at 1 in
+                  // every section, so the map and the header disagreed in multi-section exams).
+                  const displayNumber = overallIndex - currentQuestionIdx + idx;
                   return (
-                     <button 
+                     <button
                         key={q.id}
-                        onClick={() => recordQuestionTime(currentSectionIdx, idx)}
+                        type="button"
+                        aria-label={`Question ${displayNumber}${isAnswered ? ', answered' : ', not answered'}`}
+                        aria-current={isActive ? 'step' : undefined}
+                        onClick={() => {
+                          recordQuestionTime(currentSectionIdx, idx);
+                          setSidebarOpen(false); // on phones the map is a drawer covering the question
+                        }}
                         className={`aspect-square rounded flex items-center justify-center text-xs font-medium transition-all relative ${
                            isActive 
                               ? 'bg-[var(--lsc-primary)] text-white shadow-lg shadow-blue-200/70 scale-105 z-10'
@@ -3705,7 +4038,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
                                  : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-50 hover:text-slate-700'
                         }`}
                      >
-                        {idx + 1}
+                        {displayNumber}
                         {isAnswered && !isActive && (
                            <div className="absolute bottom-1 w-1 h-1 rounded-full bg-teal-500"></div>
                         )}

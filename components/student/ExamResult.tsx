@@ -19,6 +19,32 @@ interface ExamResultProps {
   onRetrySubmission?: () => void;
 }
 
+// Module-level on purpose: a component declared inside ExamResult's body is a NEW component type
+// on every render, so React unmounted/remounted it on each keystroke or star click (focus lost).
+const StarRating = ({ label, value, onChange, disabled }: { label: string; value: number; onChange: (v: number) => void; disabled: boolean }) => (
+  <div className="flex flex-col gap-1" role="group" aria-label={label}>
+    <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">{label}</span>
+    <div className="flex gap-1">
+      {[1, 2, 3, 4, 5].map(n => (
+        <button
+          key={n}
+          type="button"
+          disabled={disabled}
+          onClick={() => onChange(n)}
+          aria-label={`${label}: ${n} of 5`}
+          aria-pressed={n === value}
+          className="rounded focus:outline-none disabled:cursor-default"
+        >
+          <Star
+            size={22}
+            className={n <= value ? 'fill-amber-400 text-amber-400' : 'text-slate-300'}
+          />
+        </button>
+      ))}
+    </div>
+  </div>
+);
+
 export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, questions, sessionId, onExit, submissionSynced = true, resubmitting = false, onRetrySubmission }) => {
   const questionsToGrade = questions || exam.questions;
   const showResults = exam.showResults ?? false;
@@ -59,7 +85,13 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
 
   const percentage = maxScore > 0 ? Math.round((score / maxScore) * 100) : 0;
   const passPercent = Math.max(0, Math.min(100, exam.passPercent ?? 60));
-  const passed = percentage >= passPercent;
+  // Same rule as the server (sessions.php 'complete': totalScore / maxScore >= passPercent / 100) on
+  // the UNROUNDED ratio. Comparing the rounded percentage showed e.g. 39.6% as PASSED against a
+  // 40% pass mark while the recorded result was FAIL.
+  const passed = maxScore > 0 ? score / maxScore >= passPercent / 100 : percentage >= passPercent;
+  // Manually-graded answers count as 0 until an examiner marks them, so a below-the-mark score is
+  // only provisional while any are outstanding — don't announce "Failed" yet.
+  const verdictPending = !passed && pendingCount > 0;
   const [rating, setRating] = useState(5);
   const [clarityRating, setClarityRating] = useState(5);
   const [platformRating, setPlatformRating] = useState(5);
@@ -86,29 +118,10 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
     }
   };
 
-  const StarRating = ({ label, value, onChange, disabled }: { label: string; value: number; onChange: (v: number) => void; disabled: boolean }) => (
-    <div className="flex flex-col gap-1">
-      <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">{label}</span>
-      <div className="flex gap-1">
-        {[1, 2, 3, 4, 5].map(n => (
-          <button
-            key={n}
-            type="button"
-            disabled={disabled}
-            onClick={() => onChange(n)}
-            className="focus:outline-none disabled:cursor-default"
-          >
-            <Star
-              size={22}
-              className={n <= value ? 'fill-amber-400 text-amber-400' : 'text-slate-300'}
-            />
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-
-  const FeedbackBox = () => (
+  // Rendered via a plain function call ({renderFeedbackBox()}), NOT as <FeedbackBox />: as an inline
+  // component it remounted on every state change, so the comment box lost focus after each
+  // character typed.
+  const renderFeedbackBox = () => (
     <div ref={feedbackRef} className="p-6 border-t-2 border-blue-100 bg-blue-50/40">
       <div className="flex flex-col gap-4">
         <div className="flex items-center gap-3">
@@ -137,12 +150,13 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
               value={comment}
               onChange={e => setComment(e.target.value)}
               disabled={feedbackStatus === 'saving'}
+              aria-label="Feedback comments (optional)"
               placeholder="Any comments about the exam, technical issues, or your experience? (optional)"
               className="min-h-20 w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none focus:border-blue-300 disabled:opacity-60 resize-none"
             />
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               {feedbackStatus === 'error' && (
-                <p className="text-xs text-rose-600">Could not save feedback. Please try again.</p>
+                <p role="alert" className="text-xs text-rose-600">Could not save feedback. Please try again.</p>
               )}
               <button
                 type="button"
@@ -159,10 +173,10 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
     </div>
   );
 
-  const SyncWarningBanner = () => {
+  const renderSyncWarningBanner = () => {
     if (submissionSynced) return null;
     return (
-      <div className="mx-4 sm:mx-0 mb-4 rounded-xl border border-amber-300 bg-amber-50 p-4 flex gap-3 items-start">
+      <div role="alert" className="mb-4 rounded-xl border border-amber-300 bg-amber-50 p-4 flex gap-3 items-start">
         <AlertTriangle size={20} className="text-amber-600 flex-shrink-0 mt-0.5" />
         <div className="flex-1">
           <p className="text-sm font-semibold text-amber-900">Submission not yet confirmed</p>
@@ -189,7 +203,7 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
     return (
       <div className="min-h-screen lsc-gradient-bg py-12 px-4 sm:px-6 lg:px-8">
         <div className="max-w-2xl mx-auto">
-          <SyncWarningBanner />
+          {renderSyncWarningBanner()}
           <div className="lsc-panel overflow-hidden">
             <div className="p-8 text-center bg-[radial-gradient(700px_circle_at_50%_0%,rgba(53,88,255,0.18),transparent_70%),linear-gradient(180deg,#f9fbff,#eef3fb)] text-slate-900 border-b border-slate-200">
               <h1 className="text-3xl font-bold mb-2">Thank you</h1>
@@ -200,9 +214,10 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
                 Your submission has been recorded. Results will be shared after evaluation.
               </p>
             </div>
-            <FeedbackBox />
+            {renderFeedbackBox()}
             <div className="bg-slate-50 p-6 border-t border-slate-200 flex justify-center">
-              <button 
+              <button
+                type="button"
                 onClick={onExit}
                 className="px-6 py-2 lsc-button-primary flex items-center gap-2"
               >
@@ -218,25 +233,33 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
   const gaugeRadius = 54;
   const gaugeCircumference = 2 * Math.PI * gaugeRadius;
   const gaugeOffset = gaugeCircumference * (1 - Math.max(0, Math.min(100, percentage)) / 100);
-  const accent = passed ? '#14b8a6' : '#f43f5e';
+  const accent = passed ? '#14b8a6' : verdictPending ? '#2563eb' : '#f43f5e';
 
   return (
     <div className="min-h-screen lsc-gradient-bg py-12 px-4 sm:px-6 lg:px-8">
       <div className="max-w-4xl mx-auto space-y-8">
 
-        <SyncWarningBanner />
+        {renderSyncWarningBanner()}
 
         {/* Header Card */}
         <div className="lsc-panel overflow-hidden">
           <div className={`relative p-8 sm:p-10 text-center text-slate-900 border-b border-slate-200 ${passed
               ? 'bg-[radial-gradient(800px_circle_at_50%_-15%,rgba(20,184,166,0.18),transparent_70%),linear-gradient(180deg,#f2fbf9,#eef6f4)]'
-              : 'bg-[radial-gradient(800px_circle_at_50%_-15%,rgba(244,63,94,0.15),transparent_70%),linear-gradient(180deg,#fff7f7,#fdeef0)]'}`}>
-            <div className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold tracking-wide ${passed ? 'bg-teal-100 text-teal-700' : 'bg-rose-100 text-rose-700'}`}>
-              {passed ? <CheckCircle size={13} /> : <XCircle size={13} />}
-              {passed ? 'PASSED' : 'FAILED'}
+              : verdictPending
+                ? 'bg-[radial-gradient(800px_circle_at_50%_-15%,rgba(37,99,235,0.14),transparent_70%),linear-gradient(180deg,#f7faff,#eef3fb)]'
+                : 'bg-[radial-gradient(800px_circle_at_50%_-15%,rgba(244,63,94,0.15),transparent_70%),linear-gradient(180deg,#fff7f7,#fdeef0)]'}`}>
+            <div className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold tracking-wide ${passed ? 'bg-teal-100 text-teal-700' : verdictPending ? 'bg-blue-100 text-blue-700' : 'bg-rose-100 text-rose-700'}`}>
+              {passed ? <CheckCircle size={13} /> : verdictPending ? <Clock size={13} /> : <XCircle size={13} />}
+              {passed ? 'PASSED' : verdictPending ? 'PENDING EVALUATION' : 'FAILED'}
             </div>
-            <h1 className="text-3xl font-bold mt-3 mb-1">{passed ? 'Examination Passed' : 'Examination Failed'}</h1>
+            <h1 className="text-3xl font-bold mt-3 mb-1">{passed ? 'Examination Passed' : verdictPending ? 'Result Pending Evaluation' : 'Examination Failed'}</h1>
             <p className="text-slate-500">{exam.title} · {student.fullName}</p>
+            {verdictPending && (
+              <p className="mt-2 text-sm text-slate-600 max-w-xl mx-auto">
+                {pendingCount === 1 ? '1 written answer is' : `${pendingCount} written answers are`} still to be marked by an examiner.
+                The score below covers the auto-graded questions only; your final result will be confirmed after evaluation.
+              </p>
+            )}
 
             {/* Circular score gauge */}
             <div className="mt-8 flex flex-col items-center">
@@ -252,7 +275,7 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
                   />
                 </svg>
                 <div className="absolute inset-0 flex flex-col items-center justify-center">
-                  <span className={`text-5xl font-bold ${passed ? 'text-teal-600' : 'text-rose-600'}`}>
+                  <span className={`text-5xl font-bold ${passed ? 'text-teal-600' : verdictPending ? 'text-blue-600' : 'text-rose-600'}`}>
                     {percentage}<span className="text-2xl align-top">%</span>
                   </span>
                   <span className="text-[10px] uppercase tracking-widest text-slate-400 mt-1">Score</span>
@@ -276,7 +299,8 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
               </div>
               <div className="rounded-2xl bg-rose-50/80 backdrop-blur border border-rose-100 px-4 py-4">
                 <div className="text-2xl font-bold text-rose-500">{incorrectCount}</div>
-                <div className="text-[11px] uppercase tracking-wide text-rose-500/80 mt-0.5">Incorrect</div>
+                {/* Counts wrong AND unanswered questions (matches the per-question badges below). */}
+                <div className="text-[11px] uppercase tracking-wide text-rose-500/80 mt-0.5">Wrong / Skipped</div>
               </div>
               <div className="rounded-2xl bg-blue-50/80 backdrop-blur border border-blue-100 px-4 py-4">
                 <div className="text-2xl font-bold text-blue-600">{pendingCount}</div>
@@ -286,7 +310,7 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
           </div>
 
           {/* Detailed Review */}
-          <div className="p-8">
+          <div className="p-4 sm:p-8">
             <h3 className="text-xl font-bold text-slate-800 mb-6">Performance Breakdown</h3>
             <div className="space-y-6">
               {questionsToGrade.map((q, idx) => {
@@ -312,12 +336,15 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
                     if (grade === 'incorrect' && q.negativeMarks) {
                         marksAwarded = -q.negativeMarks;
                     }
-                    statusBadge = <span className="text-xs font-bold px-2 py-0.5 rounded bg-orange-100 text-orange-700 border border-orange-200">INCORRECT</span>;
+                    // A skipped question was labelled INCORRECT, which read as a wrong answer.
+                    statusBadge = grade === 'unanswered'
+                      ? <span className="text-xs font-bold px-2 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200">NOT ANSWERED</span>
+                      : <span className="text-xs font-bold px-2 py-0.5 rounded bg-orange-100 text-orange-700 border border-orange-200">INCORRECT</span>;
                 }
 
                 return (
-                  <div key={q.id} className={`border rounded-xl p-6 transition-all ${isCorrect || isText ? 'bg-white border-slate-200 hover:border-slate-300' : 'bg-orange-50/50 border-orange-200'}`}>
-                    <div className="flex gap-4">
+                  <div key={q.id} className={`border rounded-xl p-4 sm:p-6 transition-all ${isCorrect || isText ? 'bg-white border-slate-200 hover:border-slate-300' : 'bg-orange-50/50 border-orange-200'}`}>
+                    <div className="flex gap-3 sm:gap-4">
                       <div className="flex-shrink-0 mt-1">
                         {isText ? (
                           <div className="w-8 h-8 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center" title="Pending Grading">
@@ -333,16 +360,17 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
                           </div>
                         )}
                       </div>
-                      <div className="flex-1">
-                         <div className="flex justify-between items-start mb-3">
-                           <div>
-                             <h4 className="font-medium text-slate-900 text-lg flex items-center gap-3">
+                      <div className="flex-1 min-w-0">
+                         {/* Wraps on phones: the title, status badge and marks pill used to overflow the card. */}
+                         <div className="flex flex-wrap justify-between items-start gap-2 mb-3">
+                           <div className="min-w-0">
+                             <h4 className="font-medium text-slate-900 text-lg flex flex-wrap items-center gap-x-3 gap-y-1">
                                 Question {idx+1}
                                 {statusBadge}
                              </h4>
                            </div>
                            <div className="text-right">
-                             <div className="text-sm font-semibold text-slate-900 flex items-center justify-end gap-1.5 bg-slate-100 px-3 py-1 rounded-full">
+                             <div className="text-sm font-semibold text-slate-900 flex items-center justify-end gap-1.5 bg-slate-100 px-3 py-1 rounded-full whitespace-nowrap">
                                 <Award size={14} className="text-slate-500" />
                                 <span>{marksAwarded} / {q.marks} Marks</span>
                              </div>
@@ -417,12 +445,15 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
           </div>
 
           {/* Footer */}
-          <FeedbackBox />
+          {renderFeedbackBox()}
           <div className="bg-slate-50 p-6 border-t border-slate-200 flex flex-col gap-3 sm:flex-row sm:justify-between sm:items-center">
+             {/* Was a Math.random() string that changed on every re-render and matched nothing on
+                 record — useless (and misleading) if a candidate quoted it to support. */}
              <div className="text-sm text-slate-500 font-mono">
-               Session ID: {Math.random().toString(36).substr(2, 12).toUpperCase()}
+               {sessionId ? `Session ID: ${sessionId}` : ''}
              </div>
-             <button 
+             <button
+               type="button"
                onClick={onExit}
                className="px-6 py-2 lsc-button-primary flex items-center gap-2"
              >

@@ -165,36 +165,69 @@ export const resetAuthExpiryGuard = () => {
   authExpiryHandled = false;
 };
 
-export const apiGet = async <T,>(path: string): Promise<T> => {
-  const res = await fetch(buildUrl(path), { method: 'GET', headers: buildHeaders() });
-  const text = await res.text();
-  const body = text.trim();
-  if (!res.ok) {
-    handleAuthExpiry(res.status);
-    throw new Error(body || `API GET failed: ${res.status}`);
+// Error thrown by the api helpers. `message` deliberately stays the raw response body — callers
+// JSON.parse it to read structured error codes (e.g. ACCESS_REQUEST_REQUIRED) — with the HTTP
+// `status` attached (0 = the request never reached the server). Use getApiErrorMessage() to turn
+// one into text that is safe to show a user.
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
   }
+}
+
+// fetch() only rejects when the request never got a response (offline, DNS, CORS, connection
+// reset). Browsers report that as a bare "Failed to fetch" / "Load failed", which the UI used to
+// show verbatim — replace it with something a user can act on.
+const send = async (url: string, init: RequestInit): Promise<Response> => {
   try {
-    return JSON.parse(body) as T;
-  } catch {
-    throw new Error(body || 'API GET failed: Invalid JSON response.');
+    return await fetch(url, init);
+  } catch (e) {
+    const err = new ApiError('Network error: could not reach the server. Check your internet connection and try again.', 0);
+    (err as any).cause = e;
+    throw err;
   }
+};
+
+// Proxy/gateway errors (nginx 502/504 while PHP-FPM restarts, 413 for an oversized upload) and
+// PHP fatals come back as an HTML page, not JSON. Never surface a whole HTML document as an error
+// message — summarise it instead. JSON / plain-text bodies pass through untouched.
+const looksLikeHtml = (body: string) => /^<(!doctype|html|head|body|center|h1|br|b)\b/i.test(body);
+
+const errorBodyText = (body: string, label: string, status: number): string => {
+  if (!body) return `${label} failed: ${status}`;
+  if (looksLikeHtml(body)) {
+    if (status === 413) return 'The upload is too large for the server (HTTP 413).';
+    return `Server error (HTTP ${status}). Please try again in a moment.`;
+  }
+  return body;
 };
 
 const parseJsonResponse = async <T,>(res: Response, label: string): Promise<T> => {
   const body = (await res.text()).trim();
   if (!res.ok) {
     handleAuthExpiry(res.status);
-    throw new Error(body || `${label} failed: ${res.status}`);
+    throw new ApiError(errorBodyText(body, label, res.status), res.status);
   }
   try {
     return JSON.parse(body) as T;
   } catch {
-    throw new Error(body || `${label} failed: Invalid JSON response.`);
+    if (looksLikeHtml(body)) {
+      throw new ApiError('Unexpected response from the server. Please try again.', res.status);
+    }
+    throw new ApiError(body || `${label} failed: Invalid JSON response.`, res.status);
   }
 };
 
+export const apiGet = async <T,>(path: string): Promise<T> => {
+  const res = await send(buildUrl(path), { method: 'GET', headers: buildHeaders() });
+  return parseJsonResponse<T>(res, 'API GET');
+};
+
 export const apiPost = async <T,>(path: string, body: unknown): Promise<T> => {
-  const res = await fetch(buildUrl(path), {
+  const res = await send(buildUrl(path), {
     method: 'POST',
     headers: buildHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
@@ -203,10 +236,29 @@ export const apiPost = async <T,>(path: string, body: unknown): Promise<T> => {
 };
 
 export const apiPostForm = async <T,>(path: string, formData: FormData): Promise<T> => {
-  const res = await fetch(buildUrl(path), {
+  const res = await send(buildUrl(path), {
     method: 'POST',
     headers: buildHeaders(),
     body: formData,
   });
   return parseJsonResponse<T>(res, 'API POST form');
+};
+
+// Human-readable text for an error thrown by the helpers above. Server errors arrive as JSON
+// bodies such as {"error":"Email already exists"} or {"error":"CODE","message":"Readable text"};
+// showing e.message directly puts raw JSON in front of the user.
+export const getApiErrorMessage = (error: unknown, fallback = 'Something went wrong. Please try again.'): string => {
+  const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  const text = String(raw || '').trim();
+  if (!text) return fallback;
+  if (text.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(text);
+      const readable = [parsed?.message, parsed?.error].find(v => typeof v === 'string' && v.trim() !== '');
+      return readable ? String(readable).trim() : fallback;
+    } catch {
+      // not JSON — show the text as-is
+    }
+  }
+  return text;
 };

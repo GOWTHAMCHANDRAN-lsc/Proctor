@@ -2,7 +2,7 @@
 import { Award, Ban, BarChart3, CheckCircle2, ChevronDown, ClipboardList, Download, FileText, GraduationCap, Search, ShieldAlert, TrendingUp, Trophy, UserX, Users, XCircle } from 'lucide-react';
 import { apiGet, apiPost } from '../../services/api';
 import { Pagination, usePagination } from './Pagination';
-import { Exam, ExamResultRecord, QuestionType, ResultAuditLog, SessionFeedback, Student } from '../../types';
+import { Exam, ExamResultRecord, QuestionType, ResultAuditLog, SessionFeedback, Student, UserRole, isManualGraded } from '../../types';
 import { formatResultAnswer } from '../../services/answerFormat';
 import { resolveExamTimezone, formatScheduleShort } from '../../services/timezone';
 import { groupViolationEpisodes, formatEpisodeDuration } from '../../services/violationEpisodes';
@@ -10,11 +10,43 @@ import { groupViolationEpisodes, formatEpisodeDuration } from '../../services/vi
 interface ResultsProps {
   exams: Exam[];
   students: Student[];
+  /** Signed-in staff role. Falls back to the stored admin session when the caller doesn't pass it. */
+  role?: UserRole;
 }
 
 // Stable empty list for the not-attempted roster when no exam is selected — a fresh `[]` each render
 // would make the paging hook recompute its slice on every pass.
 const EMPTY_ROSTER: never[] = [];
+
+// Same source App.tsx uses for the signed-in role; only consulted when no `role` prop is passed.
+const getStoredStaffRole = (): string => {
+  if (typeof window === 'undefined') return UserRole.ADMIN;
+  try {
+    const raw = localStorage.getItem('pg_admin_auth');
+    if (!raw) return UserRole.ADMIN;
+    return String(JSON.parse(raw)?.role || UserRole.ADMIN).trim().toUpperCase();
+  } catch {
+    return UserRole.ADMIN;
+  }
+};
+
+// The super-admin's globally selected company (the top-bar switcher writes it; services/api.ts sends
+// it as X-Company-Id). This screen stays mounted across a switch, so its data must reload when this
+// changes — otherwise the previous company's attempts keep showing under the new company's exams.
+const getActiveCompanyScope = (): string => {
+  if (typeof window === 'undefined') return '';
+  try {
+    return localStorage.getItem('pg_admin_active_company') || '';
+  } catch {
+    return '';
+  }
+};
+
+// Spreadsheet apps execute a cell that starts with = + - @ (or a tab/CR) as a formula. Student names,
+// free-text answers and feedback all flow into these exports, so neutralise them with a leading
+// apostrophe — but leave plain numbers (e.g. "-1" marks) and the "-" placeholder untouched.
+const neutraliseCsvFormula = (str: string): string =>
+  /^[=+\-@\t\r]/.test(str) && str !== '-' && !/^-?\d+(\.\d+)?%?$/.test(str) ? `'${str}` : str;
 
 interface QuestionAnalytics {
   questionId: string;
@@ -96,7 +128,12 @@ interface EnterpriseReport {
   }>;
 }
 
-export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
+export const Results: React.FC<ResultsProps> = ({ exams, students, role }) => {
+  // Regrading and certificate issuance are ADMIN / SUPER_ADMIN actions (the API rejects anyone else);
+  // a read-only VIEWER must not be offered them.
+  const effectiveRole = role ?? getStoredStaffRole();
+  const canManageResults = effectiveRole === UserRole.ADMIN || effectiveRole === UserRole.SUPER_ADMIN;
+  const companyScope = getActiveCompanyScope();
   const [results, setResults] = useState<ExamResultRecord[]>([]);
   const [selectedExamId, setSelectedExamId] = useState<string>('ALL');
   const [selectedStudentId, setSelectedStudentId] = useState<string>('ALL');
@@ -138,28 +175,48 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
     batch?: string | null;
   }>>([]);
 
+  // Only the newest request may write state: a slow response for a previous company (or a previous
+  // report date range) must not land on top of the current one.
+  const resultsRequestRef = useRef(0);
+  const reportRequestRef = useRef(0);
+
   const loadResults = async () => {
+    const requestId = ++resultsRequestRef.current;
     setLoading(true);
     setLoadError('');
     try {
       const data = await apiGet<{ results: ExamResultRecord[] }>('results.php');
+      if (requestId !== resultsRequestRef.current) return;
       if (data?.results) {
         setResults(data.results);
       }
     } catch (e) {
+      if (requestId !== resultsRequestRef.current) return;
       const message = e instanceof Error ? e.message : 'Failed to load results.';
       setLoadError(message);
       console.error('Failed to load results:', e);
     } finally {
-      setLoading(false);
+      if (requestId === resultsRequestRef.current) setLoading(false);
     }
   };
 
+  // Reload whenever the super admin switches company (the screen is not remounted by the switch).
+  // Filters pointing at the previous company's exam/student/attempt are cleared with it.
+  const lastCompanyScopeRef = useRef(companyScope);
   useEffect(() => {
+    if (lastCompanyScopeRef.current !== companyScope) {
+      lastCompanyScopeRef.current = companyScope;
+      setResults([]);
+      setSelectedExamId('ALL');
+      setSelectedStudentId('ALL');
+      setSelectedSessionId(null);
+    }
     loadResults();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyScope]);
 
   const loadEnterpriseReport = async (fromDate = reportFromDate, toDate = reportToDate) => {
+    const requestId = ++reportRequestRef.current;
     setReportLoading(true);
     try {
       const params = new URLSearchParams();
@@ -167,19 +224,21 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
       if (toDate) params.set('to', toDate);
       const query = params.toString();
       const data = await apiGet<EnterpriseReport>(`reports.php${query ? `?${query}` : ''}`);
+      if (requestId !== reportRequestRef.current) return;
       setReport(data || null);
     } catch (e) {
+      if (requestId !== reportRequestRef.current) return;
       console.error('Failed to load enterprise report:', e);
       setReport(null);
     } finally {
-      setReportLoading(false);
+      if (requestId === reportRequestRef.current) setReportLoading(false);
     }
   };
 
   useEffect(() => {
     loadEnterpriseReport();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [companyScope]);
 
   const handleApplyReportDateFilter = () => {
     loadEnterpriseReport(reportFromDate, reportToDate);
@@ -209,6 +268,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
   }, [reportsMenuOpen]);
 
   useEffect(() => {
+    let cancelled = false;
     const loadFeedback = async () => {
       try {
         const data = await apiGet<{ feedback: Array<SessionFeedback & {
@@ -217,33 +277,38 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
           registrationId?: string;
           batch?: string | null;
         }> }>('feedback.php?limit=250');
-        setFeedback(data?.feedback || []);
+        if (!cancelled) setFeedback(data?.feedback || []);
       } catch (e) {
         console.error('Failed to load feedback:', e);
-        setFeedback([]);
+        if (!cancelled) setFeedback([]);
       }
     };
     loadFeedback();
-  }, []);
+    return () => { cancelled = true; };
+  }, [companyScope]);
 
   useEffect(() => {
+    // Switching exams quickly must not let the previous exam's (slower) analytics overwrite these.
+    let cancelled = false;
     const loadAnalytics = async () => {
       if (selectedExamId === 'ALL') {
         setAnalytics([]);
+        setAnalyticsLoading(false);
         return;
       }
       setAnalyticsLoading(true);
       try {
-        const data = await apiGet<{ questions: QuestionAnalytics[] }>(`analytics.php?examId=${selectedExamId}`);
-        setAnalytics(data?.questions || []);
+        const data = await apiGet<{ questions: QuestionAnalytics[] }>(`analytics.php?examId=${encodeURIComponent(selectedExamId)}`);
+        if (!cancelled) setAnalytics(data?.questions || []);
       } catch (e) {
         console.error('Failed to load analytics:', e);
-        setAnalytics([]);
+        if (!cancelled) setAnalytics([]);
       } finally {
-        setAnalyticsLoading(false);
+        if (!cancelled) setAnalyticsLoading(false);
       }
     };
     loadAnalytics();
+    return () => { cancelled = true; };
   }, [selectedExamId]);
 
   // Load the plain-language "why no attempt" reasons (from access logs) for the selected exam.
@@ -302,20 +367,25 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
     return filteredResults[0] || null;
   }, [filteredResults, selectedSessionId]);
 
+  // Clicking through attempts quickly must not show one attempt's regrade history under another.
+  const auditRequestRef = useRef(0);
   const loadAudit = async (sessionId: number) => {
+    const requestId = ++auditRequestRef.current;
     setAuditLoading(true);
     try {
       const data = await apiGet<{ audits: ResultAuditLog[] }>(`results.php?audit=1&sessionId=${sessionId}`);
+      if (requestId !== auditRequestRef.current) return;
       if (data?.audits) {
         setAuditLogs(data.audits);
       } else {
         setAuditLogs([]);
       }
     } catch (e) {
+      if (requestId !== auditRequestRef.current) return;
       console.error('Failed to load audit logs:', e);
       setAuditLogs([]);
     } finally {
-      setAuditLoading(false);
+      if (requestId === auditRequestRef.current) setAuditLoading(false);
     }
   };
 
@@ -360,16 +430,25 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
     const avgPercent = totalFinalMax > 0 ? Math.round((totalFinalScore / totalFinalMax) * 100) : 0;
     const completed = finals.filter(r => r.finalPercent !== null && r.finalPercent !== undefined).length;
     const passed = finals.filter(r => r.finalPassed).length;
-    const passRate = completed > 0 ? Math.round((passed / completed) * 100) : 0;
+    // Pass rate is over attempts that have a verdict. Attempts still awaiting manual grading have no
+    // pass/fail yet and must not count as failures (this matches the Exam Report PDF).
+    const graded = finals.filter(r => r.finalPassed !== null && r.finalPassed !== undefined).length;
+    const passRate = graded > 0 ? Math.round((passed / graded) * 100) : 0;
 
+    // Top performer = best PERCENTAGE (raw marks aren't comparable across exams with different
+    // totals), ties broken by raw score. Terminated attempts are recorded as fails, never as the top.
+    const pct = (r: ExamResultRecord) => (r.finalScore || 0) / (r.finalMaxScore || 1);
     let topResult: ExamResultRecord | null = null;
-    scoredFinals.forEach(r => {
-      if (!topResult) {
+    for (const r of scoredFinals) {
+      if (r.status === 'TERMINATED') continue;
+      if (
+        !topResult ||
+        pct(r) > pct(topResult) ||
+        (pct(r) === pct(topResult) && (r.finalScore || 0) > (topResult.finalScore || 0))
+      ) {
         topResult = r;
-        return;
       }
-      if ((r.finalScore || 0) > (topResult.finalScore || 0)) topResult = r;
-    });
+    }
 
     const completedCount = filteredResults.filter(r => r.status === 'COMPLETED').length;
     const terminatedCount = filteredResults.filter(r => r.status === 'TERMINATED').length;
@@ -467,8 +546,8 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
 
   const csvEscape = (value: string | number | null | undefined) => {
     if (value === null || value === undefined) return '';
-    const str = String(value);
-    if (/[",\n]/.test(str)) {
+    const str = neutraliseCsvFormula(String(value));
+    if (/[",\r\n]/.test(str)) {
       return `"${str.replace(/"/g, '""')}"`;
     }
     return str;
@@ -476,7 +555,8 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
 
   const downloadCsv = (filename: string, rows: string[][]) => {
     const csv = rows.map(r => r.map(csvEscape).join(',')).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    // BOM so Excel opens UTF-8 (Arabic / accented names) correctly — same as ExamManager's exports.
+    const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -611,13 +691,9 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
       </html>
     `;
 
-    const win = window.open('', '_blank');
-    if (!win) return;
-    win.document.open();
-    win.document.write(html);
-    win.document.close();
-    win.focus();
-    win.print();
+    // Shared opener (defined below; runs at click time): tells the admin to allow pop-ups instead of
+    // silently doing nothing when the browser blocks the report window.
+    openPrintWindow(html);
   };
 
   // ---- Detailed student reports (dossier + roster) ----
@@ -907,7 +983,9 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
       const data = await apiGet<{ violations: DossierViolation[] }>(
         `violations.php?examId=${encodeURIComponent(examId)}&limit=2000`
       );
-      return Array.isArray(data?.violations) ? data.violations : [];
+      // Incidents, not raw detector pings — same as the dossier and the Results list's violation
+      // counts, so the Exam Report / ZIP don't report one 19-minute webcam failure as 112 violations.
+      return asIncidents(Array.isArray(data?.violations) ? data.violations : []);
     } catch {
       return [];
     }
@@ -1006,11 +1084,14 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
         const student = students.find(s => s.id === v.studentId);
         const conf = v.confidence !== null && v.confidence !== undefined ? `${Math.round(Number(v.confidence) * 100)}%` : '-';
         const img = v.snapshot ? `<img class="snap" src="${escapeHtml(String(v.snapshot))}" alt="snapshot" />` : '<span class="muted">—</span>';
+        const span = (v.episodeCount ?? 1) > 1 && (v.episodeMs ?? 0) >= 1000
+          ? ` <span class="muted">(continuous ${escapeHtml(formatEpisodeDuration(v.episodeMs || 0))}, ${v.episodeCount}×)</span>`
+          : '';
         return `
           <tr>
             <td>${escapeHtml(new Date(v.timestamp).toLocaleString())}</td>
             <td>${escapeHtml(student?.fullName || v.studentId || '-')}</td>
-            <td>${escapeHtml(v.type.replace(/_/g, ' '))}</td>
+            <td>${escapeHtml(v.type.replace(/_/g, ' '))}${span}</td>
             <td>${conf}</td>
             <td>${escapeHtml(v.description || '')}</td>
             <td>${img}</td>
@@ -1256,7 +1337,9 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
         head: [['Time', 'Type', 'Conf.', 'Description']],
         body: sortedVios.slice(0, 60).map(v => [
           new Date(v.timestamp).toLocaleString(),
-          v.type.replace(/_/g, ' '),
+          v.type.replace(/_/g, ' ') + ((v.episodeCount ?? 1) > 1 && (v.episodeMs ?? 0) >= 1000
+            ? ` (continuous ${formatEpisodeDuration(v.episodeMs || 0)}, ${v.episodeCount}x)`
+            : ''),
           v.confidence !== null && v.confidence !== undefined ? `${Math.round(Number(v.confidence) * 100)}%` : '—',
           v.description || '—',
         ]),
@@ -1486,7 +1569,8 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
 
   const handleExportFiltered = () => {
     const rows: string[][] = [
-      ['Student Name', 'Registration ID', 'Exam Title', 'Attempt', 'Status', 'Score', 'Percent', 'Final Score', 'Final Percent', 'Start Time', 'End Time'],
+      // 'Result' is appended last so existing column positions are unchanged for anyone parsing this.
+      ['Student Name', 'Registration ID', 'Exam Title', 'Attempt', 'Status', 'Score', 'Percent', 'Final Score', 'Final Percent', 'Start Time', 'End Time', 'Result'],
     ];
 
     filteredResults.forEach(result => {
@@ -1504,6 +1588,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
         formatFinalPercent(result),
         formatScheduleShort(result.startTime, resolveExamTimezone(exam?.timezone)),
         result.endTime ? formatScheduleShort(result.endTime, resolveExamTimezone(exam?.timezone)) : '',
+        getPassBadge(result).label,
       ]);
     });
 
@@ -1561,7 +1646,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
         <tr>
           <td>${idx + 1}</td>
           <td>${escapeHtml(a.questionText)}</td>
-          <td>${a.questionType}</td>
+          <td>${escapeHtml(String(a.questionType || ''))}</td>
           <td>${escapeHtml(answerText)}</td>
           <td>${escapeHtml(correctText)}</td>
           <td>${a.marks}</td>
@@ -1634,13 +1719,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
       </html>
     `;
 
-    const win = window.open('', '_blank');
-    if (!win) return;
-    win.document.open();
-    win.document.write(html);
-    win.document.close();
-    win.focus();
-    win.print();
+    openPrintWindow(html);
   };
 
   const handleSaveRegrade = async () => {
@@ -1656,10 +1735,23 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
           awardedMarks: Number.isNaN(normalized) ? null : normalized,
         };
       })
-      .filter(Boolean);
+      .filter((c): c is { questionId: string; awardedMarks: number | null } => c !== null);
 
-    if (changes.length === 0) {
-      setEditMode(false);
+    // The server stores whatever number it is sent, so an out-of-range mark (e.g. 50 on a 5-mark
+    // question) would push the attempt past 100% and could flip it to PASS. Hold the input to the
+    // same 0..marks range the field advertises; clearing a field (back to "Pending") is still allowed.
+    const invalid = changes.filter(c => {
+      if (c.awardedMarks === null) return false;
+      const max = selectedResult.answers.find(a => a.questionId === c.questionId)?.marks ?? 0;
+      return !Number.isFinite(c.awardedMarks) || c.awardedMarks < 0 || c.awardedMarks > max;
+    });
+    if (invalid.length > 0) {
+      const labels = invalid.map(c => {
+        const idx = selectedResult.answers.findIndex(a => a.questionId === c.questionId);
+        const max = selectedResult.answers[idx]?.marks ?? 0;
+        return `Question ${idx + 1} (0–${max})`;
+      });
+      alert(`Marks must be between 0 and the question's maximum:\n${labels.join('\n')}`);
       return;
     }
 
@@ -1697,6 +1789,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
             <input
               type="text"
               placeholder="Search student or exam..."
+              aria-label="Search results by student or exam"
               className="pl-9 pr-4 py-2 border border-slate-200 rounded-lg outline-none w-full sm:w-64 text-sm bg-white"
               value={search}
               onChange={e => setSearch(e.target.value)}
@@ -1866,7 +1959,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
         <StatTile icon={<TrendingUp size={16} />} label="Pass Rate" value={`${summary.passRate}%`}
           sub={`avg ${summary.avgPercent}%`} tone="primary" />
         <StatTile icon={<Award size={16} />} label="Avg Score" value={`${summary.avgPercent}%`}
-          sub="of graded attempts" tone="neutral" />
+          sub="across scored attempts" tone="neutral" />
         <StatTile icon={<ShieldAlert size={16} />} label="Violations" value={summary.violations}
           sub={summary.violations > 0 ? 'flagged events' : 'clean'} tone={summary.violations > 0 ? 'warm' : 'neutral'} />
       </div>
@@ -1925,16 +2018,18 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <div className="flex items-center gap-1.5">
-              <label className="text-[11px] font-medium text-slate-500">From</label>
+              <label htmlFor="report-from-date" className="text-[11px] font-medium text-slate-500">From</label>
               <input
+                id="report-from-date"
                 type="date"
                 value={reportFromDate}
                 max={reportToDate || undefined}
                 onChange={e => setReportFromDate(e.target.value)}
                 className="px-2 py-1.5 border border-slate-200 rounded-lg text-xs outline-none bg-white"
               />
-              <label className="text-[11px] font-medium text-slate-500">To</label>
+              <label htmlFor="report-to-date" className="text-[11px] font-medium text-slate-500">To</label>
               <input
+                id="report-to-date"
                 type="date"
                 value={reportToDate}
                 min={reportFromDate || undefined}
@@ -2091,6 +2186,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
                 <select
                   value={selectedExamId}
                   onChange={e => setSelectedExamId(e.target.value)}
+                  aria-label="Choose an exam for question analytics"
                   className="mt-4 px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white max-w-xs"
                 >
                   <option value="ALL">Choose an exam…</option>
@@ -2255,6 +2351,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
               <select
                 value={selectedExamId}
                 onChange={e => setSelectedExamId(e.target.value)}
+                aria-label="Filter by exam"
                 className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white"
               >
                 <option value="ALL">All Exams</option>
@@ -2265,6 +2362,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
               <select
                 value={selectedStudentId}
                 onChange={e => setSelectedStudentId(e.target.value)}
+                aria-label="Filter by student"
                 className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white"
               >
                 <option value="ALL">All Students</option>
@@ -2277,6 +2375,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
                   <button
                     key={s}
                     onClick={() => setStatusFilter(s)}
+                    aria-pressed={statusFilter === s}
                     className={`flex-1 px-2 py-1.5 rounded-lg text-[11px] font-semibold border transition-colors ${
                       statusFilter === s
                         ? (s === 'TERMINATED' ? 'border-rose-300 bg-rose-50 text-rose-700'
@@ -2361,11 +2460,12 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
         </div>
 
         <div className="lsc-panel overflow-hidden">
-          <div className="p-4 lsc-panel-header flex items-center justify-between">
+          {/* Wraps on narrow screens — the panel clips overflow, so a single row hid the export buttons. */}
+          <div className="p-4 lsc-panel-header flex flex-wrap items-center justify-between gap-3">
             <div className="text-sm font-semibold text-slate-800 flex items-center gap-2">
               <Award size={16} className="text-[var(--lsc-primary)]" /> Answer Sheet
             </div>
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-2 sm:gap-3">
               {selectedResult && (
                 <div className="text-xs text-slate-500">
                   Attempt {selectedResult.attemptIndex || 1}
@@ -2374,7 +2474,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
                   Final {formatFinalScore(selectedResult)} ({formatFinalPercent(selectedResult)})
                 </div>
               )}
-              {selectedResult && !editMode && (
+              {canManageResults && selectedResult && !editMode && (
                 <button
                   onClick={() => {
                     setDraftMarks(buildDraftMarks(selectedResult));
@@ -2385,7 +2485,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
                   Regrade
                 </button>
               )}
-              {selectedResult && editMode && (
+              {canManageResults && selectedResult && editMode && (
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => {
@@ -2427,7 +2527,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
               >
                 {dossierBusy ? 'Building…' : 'Student Dossier'}
               </button>
-              {selectedResult && selectedResult.finalPassed && exams.find(e => e.id === selectedResult.examId)?.certificateEnabled && (
+              {canManageResults && selectedResult && selectedResult.finalPassed && exams.find(e => e.id === selectedResult.examId)?.certificateEnabled && (
                 <button
                   onClick={() => handleIssueCertificate(selectedResult.sessionId)}
                   disabled={certBusy}
@@ -2492,8 +2592,9 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
               {editMode && (
                 <div className="border border-slate-200 rounded-lg p-3 grid grid-cols-1 md:grid-cols-[1fr_2fr] gap-3">
                   <div>
-                    <label className="text-[11px] uppercase tracking-widest text-slate-400">Graded By</label>
+                    <label htmlFor="regrade-grader" className="text-[11px] uppercase tracking-widest text-slate-400">Graded By</label>
                     <input
+                      id="regrade-grader"
                       type="text"
                       className="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none"
                       value={graderName}
@@ -2502,8 +2603,9 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
                     />
                   </div>
                   <div>
-                    <label className="text-[11px] uppercase tracking-widest text-slate-400">Regrade Note</label>
+                    <label htmlFor="regrade-note" className="text-[11px] uppercase tracking-widest text-slate-400">Regrade Note</label>
                     <input
+                      id="regrade-note"
                       type="text"
                       className="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none"
                       value={gradeNote}
@@ -2519,12 +2621,27 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
               )}
 
               {selectedResult.answers.map((answer, idx) => {
-                const isMcq = answer.questionType === QuestionType.MCQ;
+                // MCQ / True-False / Yes-No all store a single option index, so all three render as
+                // the option list. Every other type stores its response in answer_json (or as a
+                // scalar), which only formatResultAnswer knows how to read — answerText alone is
+                // empty for them, which used to show "No response provided." for answered questions.
+                const isOptionType = answer.questionType === QuestionType.MCQ
+                  || answer.questionType === QuestionType.TRUE_FALSE
+                  || answer.questionType === QuestionType.YES_NO;
+                const isMcq = isOptionType && Array.isArray(answer.options) && answer.options.length > 0;
+                const isManual = isManualGraded(answer.questionType);
+                const formatted = isMcq ? null : formatResultAnswer(answer);
+                const responseText = formatted && formatted.answerText && formatted.answerText !== '—'
+                  ? formatted.answerText
+                  : 'No response provided.';
+                const correctText = formatted && !isManual && formatted.correctText !== '—' ? formatted.correctText : '';
                 const selectedIdx = answer.answerOptionIndex;
                 const correctIdx = answer.correctOptionIndex;
-                const awardedText = isMcq
-                  ? `${answer.awardedMarks ?? 0}`
-                  : (answer.awardedMarks === null || answer.awardedMarks === undefined ? 'Pending' : `${answer.awardedMarks}`);
+                // Only manually graded (free-text) questions can be "Pending"; an unanswered
+                // auto-graded question simply scored nothing.
+                const awardedText = answer.awardedMarks === null || answer.awardedMarks === undefined
+                  ? (isManual ? 'Pending' : '0')
+                  : `${answer.awardedMarks}`;
                 const timeLabel = answer.timeSpentSec !== null && answer.timeSpentSec !== undefined
                   ? formatSeconds(answer.timeSpentSec)
                   : '-';
@@ -2543,6 +2660,7 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
                               type="number"
                               min="0"
                               max={answer.marks}
+                              aria-label={`Marks for question ${idx + 1} (out of ${answer.marks})`}
                               className="w-20 px-2 py-1 border border-slate-200 rounded text-xs outline-none"
                               value={draftMarks[answer.questionId] ?? ''}
                               onChange={e => setDraftMarks(prev => ({ ...prev, [answer.questionId]: e.target.value }))}
@@ -2584,8 +2702,13 @@ export const Results: React.FC<ResultsProps> = ({ exams, students }) => {
                     )}
 
                     {!isMcq && (
-                      <div className="mt-3 border border-slate-200 rounded-lg p-3 bg-slate-50 text-sm text-slate-700">
-                        {answer.answerText || 'No response provided.'}
+                      <div className="mt-3 border border-slate-200 rounded-lg p-3 bg-slate-50 text-sm text-slate-700 whitespace-pre-wrap break-words">
+                        {responseText}
+                      </div>
+                    )}
+                    {!isMcq && correctText && (
+                      <div className="mt-2 text-xs text-teal-700">
+                        <span className="font-semibold">Correct answer:</span> {correctText}
                       </div>
                     )}
 

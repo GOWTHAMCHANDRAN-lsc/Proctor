@@ -214,9 +214,11 @@ if ($method === 'POST') {
             json_response(['ok' => false, 'error' => 'sessionId, examId and studentId are required.'], 400);
         }
 
-        // The session must belong to this company (defence in depth).
-        $chk = $pdo->prepare("SELECT id FROM exam_sessions WHERE id = ? AND company_id = ? LIMIT 1");
-        $chk->execute([$sessionId, $companyId]);
+        // The session must belong to this company AND to the exam/candidate the push claims to be
+        // (defence in depth). Session ids are sequential, so checking the company alone let any
+        // client overwrite another candidate's live tile (frame + status) by guessing a neighbour id.
+        $chk = $pdo->prepare("SELECT id FROM exam_sessions WHERE id = ? AND company_id = ? AND exam_id = ? AND student_id = ? LIMIT 1");
+        $chk->execute([$sessionId, $companyId, $examId, $studentId]);
         if (!$chk->fetch()) {
             $chk->closeCursor();
             json_response(['ok' => false, 'error' => 'SESSION_NOT_FOUND'], 404);

@@ -52,6 +52,7 @@ for _lib in ("libGLdispatch.so.0", "libGLESv2.so.2", "libEGL.so.1", "libgbm.so.1
         pass  # best-effort; if the system already has them this is a no-op
 
 import base64
+import hashlib
 import io
 import logging
 import threading
@@ -87,7 +88,7 @@ MODELS_DIR = Path(__file__).parent / "models"
 # / risk stay consistent (no multi-process routing needed). Pool size tracks cores, capped so we
 # don't oversubscribe the shared box.
 import queue as _queue
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 POOL_SIZE = max(1, min(int(os.getenv("PROCTOR_POOL", "0") or 0) or (os.cpu_count() or 4) // 2, 6))
 cv2.setNumThreads(2)  # keep each OpenCV (YuNet/SFace) call from grabbing every core under a pool
@@ -180,6 +181,16 @@ BASELINE_NEAR = 0.10      # |yaw - baseline| below this is treated as "near cent
 BASELINE_EMA = 0.10       # how fast the neutral baseline adapts while near centre
 SFACE_COSINE_MATCH = 0.363  # OpenCV-recommended SFace same-person cosine threshold
 SESSION_TTL_SEC = 3 * 3600  # drop idle session state after 3h
+SESSION_MAX = 10000         # hard cap on tracked sessions (oldest-idle evicted beyond this)
+SESSION_GC_EVERY_SEC = 60.0 # run the idle-session sweep at most this often
+SESSION_KEY_MAX_LEN = 256   # longer keys are hashed so a huge key can't pin memory
+
+# ── Input guards ──────────────────────────────────────────────────────────────
+# The client downscales frames to ≤640px before upload; these only stop abusive payloads from
+# exhausting memory (a single 9000×9000 JPEG peaked at ~1.6 GB RSS) without affecting real frames.
+MAX_IMAGE_PIXELS = 4096 * 4096  # reject anything larger outright (decompression-bomb guard)
+MAX_IMAGE_SIDE = 1920           # larger frames are downscaled to this longest side before analysis
+ENROLL_MAX_IMAGES = 10          # client sends 4; extra samples are ignored
 
 # ── Blendshape (eye-tracking) tunables ────────────────────────────────────────
 # Blendshape scores are 0..1. Neutral forward gaze sits low (~0.1-0.25); a decisive
@@ -278,7 +289,10 @@ async def _api_error_handler(request: Request, exc: ApiError):  # noqa: ANN001
 
 @app.on_event("startup")
 def _bootstrap_business_schema() -> None:
-    bootstrap_schema()
+    # Schema/seed bootstrap only serves the business API. While that API is disabled the AI
+    # service must not connect to MySQL or run DDL / seed INSERTs on every restart.
+    if os.getenv("PG_ENABLE_BUSINESS_API") == "1":
+        bootstrap_schema()
 
 
 # ── Per-session adaptive state ────────────────────────────────────────────────
@@ -295,7 +309,15 @@ class SessionState:
     pitch_baseline: float | None = None  # learned neutral head pitch
     yaw_warmup: list = field(default_factory=list)    # early yaw samples, averaged into the baseline
     pitch_warmup: list = field(default_factory=list)  # early pitch samples
-    last_seen: float = field(default_factory=time.time)
+    # All session timing uses time.monotonic() so an NTP/VM clock step can't fake durations,
+    # freeze cooldowns or inflate the decaying risk score. (Observation timestamps sent to the
+    # client stay epoch-ms — see _observe.)
+    last_seen: float = field(default_factory=time.monotonic)
+    # Serialises frames of the SAME session. When the client aborts a slow /analyze (5 s) and
+    # sends the next frame, both requests can run at once; unsynchronised they mutate these deques
+    # mid-iteration ("RuntimeError: deque mutated during iteration" → 500) and race the episode
+    # state (away_since/talk_since set to None between a check and its use).
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     # ── Virtual-proctor memory (episodes + patterns + risk) ──────────────────
     away_since: float | None = None      # start of the current gaze-away episode
     away_frames: int = 0                 # frames inside the current away episode
@@ -313,19 +335,36 @@ class SessionState:
 
 _sessions: dict[str, SessionState] = {}
 _sessions_lock = threading.Lock()
+_sessions_gc_at = 0.0
+
+
+def _gc_sessions(now: float) -> None:
+    """Drop idle sessions; if still at the hard cap, evict the least-recently-seen. Caller holds
+    _sessions_lock. /analyze is publicly reachable, so arbitrary sessionKeys must not be able to
+    grow this dict (and the per-request sweep over it) without bound."""
+    for k in [k for k, s in _sessions.items() if now - s.last_seen > SESSION_TTL_SEC]:
+        _sessions.pop(k, None)
+    if len(_sessions) >= SESSION_MAX:
+        by_age = sorted(_sessions.items(), key=lambda kv: kv[1].last_seen)
+        for k, _ in by_age[: len(_sessions) - int(SESSION_MAX * 0.9)]:
+            _sessions.pop(k, None)
 
 
 def _get_session(key: str | None) -> SessionState | None:
+    global _sessions_gc_at
     if not key:
         return None
-    now = time.time()
+    if len(key) > SESSION_KEY_MAX_LEN:
+        key = hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()
+    now = time.monotonic()
     with _sessions_lock:
-        # opportunistic GC of stale sessions
-        if len(_sessions) > 256:
-            for k in [k for k, s in _sessions.items() if now - s.last_seen > SESSION_TTL_SEC]:
-                _sessions.pop(k, None)
         st = _sessions.get(key)
         if st is None:
+            # Sweep only when a NEW session is created, at most once a minute (or at the cap),
+            # instead of scanning every session on every frame.
+            if now - _sessions_gc_at >= SESSION_GC_EVERY_SEC or len(_sessions) >= SESSION_MAX:
+                _sessions_gc_at = now
+                _gc_sessions(now)
             st = SessionState()
             _sessions[key] = st
         st.last_seen = now
@@ -353,7 +392,19 @@ class VerifyRequest(BaseModel):
 def _decode_rgb(b64: str) -> np.ndarray:
     try:
         data = base64.b64decode(b64.split(",")[-1])
-        img = Image.open(io.BytesIO(data)).convert("RGB")
+        img = Image.open(io.BytesIO(data))
+        w, h = img.size  # header only — nothing decoded yet
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid image: {exc}") from exc
+    if w * h > MAX_IMAGE_PIXELS:
+        raise HTTPException(413, f"Image too large ({w}x{h}).")
+    try:
+        if max(w, h) > MAX_IMAGE_SIDE:
+            img.draft("RGB", (MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))  # JPEG: decode at reduced scale
+            img = img.convert("RGB")
+            img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+        else:
+            img = img.convert("RGB")
         return np.array(img, dtype=np.uint8)
     except Exception as exc:
         raise HTTPException(400, f"Invalid image: {exc}") from exc
@@ -465,6 +516,10 @@ def _blendshape_signals(blendshapes) -> dict:
 def _sface_embed(bgr: np.ndarray) -> list[float] | None:
     """Largest-face 128-d SFace embedding, L2-normalised. None if no usable face."""
     h, w = bgr.shape[:2]
+    if min(h, w) < 32:
+        # Too small to hold a recognisable face; YuNet on degenerate inputs (e.g. 1x1) has been
+        # seen to return a spurious box, which would become a junk enrollment template.
+        return None
     with _borrow(_cv_pool) as (yunet, sface):
         yunet.setInputSize((w, h))
         _, faces = yunet.detect(bgr)
@@ -488,15 +543,19 @@ def _cosine(a: list[float], b: list[float]) -> float:
     # embeddings are already L2-normalised, but normalise defensively
     da = np.linalg.norm(na) or 1.0
     db = np.linalg.norm(nb) or 1.0
-    return float(np.dot(na, nb) / (da * db))
+    cos = float(np.dot(na, nb) / (da * db))
+    # A NaN/Infinity in a client descriptor would otherwise yield NaN, which the JSON encoder
+    # rejects (allow_nan=False) → 500. Treat it as a non-match.
+    return cos if np.isfinite(cos) else -1.0
 
 
-def _detect(rgb: np.ndarray):
-    """Run MediaPipe face + object models on a pooled instance (concurrent across requests)."""
+def _detect(rgb: np.ndarray, with_objects: bool = True):
+    """Run MediaPipe face + object models on a pooled instance (concurrent across requests).
+    /enroll and /verify only need faces, so they skip the (costlier) object detector."""
     mpimg = _mp_image(rgb)
     with _borrow(_mp_pool) as (face_landmarker, object_detector):
         faces = face_landmarker.detect(mpimg)
-        objects = object_detector.detect(mpimg)
+        objects = object_detector.detect(mpimg) if with_objects else None
     return faces, objects
 
 
@@ -557,15 +616,18 @@ def _sustained(flags: deque, need_frac: float = 0.6) -> tuple[bool, float]:
 
 # ── Virtual proctor: behavioural pattern reasoning + live risk score ──────────
 def _observe(st: SessionState, now: float, text: str) -> None:
-    """Write a line in the proctor's notebook (deduped against the latest entry)."""
+    """Write a line in the proctor's notebook (deduped against the latest entry).
+    `now` is the monotonic session clock; the stored timestamp is wall-clock because it is
+    returned to the client as epoch milliseconds."""
+    wall = time.time()
     if st.observations and st.observations[-1][1] == text:
-        st.observations[-1] = (now, text)
+        st.observations[-1] = (wall, text)
         return
-    st.observations.append((now, text))
+    st.observations.append((wall, text))
 
 
 def _pattern_ready(st: SessionState, now: float, name: str) -> bool:
-    if now - st.pattern_last.get(name, 0.0) < PATTERN_COOLDOWN_SEC:
+    if now - st.pattern_last.get(name, float("-inf")) < PATTERN_COOLDOWN_SEC:
         return False
     st.pattern_last[name] = now
     return True
@@ -574,7 +636,7 @@ def _pattern_ready(st: SessionState, now: float, name: str) -> bool:
 def _add_risk(st: SessionState, now: float, key: str, weight: float) -> None:
     """Accumulate risk for an event type, rate-limited so a sustained condition
     (which re-appears in `violations` every frame) doesn't explode the score."""
-    if now - st.risk_last_add.get(key, 0.0) < RISK_ADD_COOLDOWN_SEC:
+    if now - st.risk_last_add.get(key, float("-inf")) < RISK_ADD_COOLDOWN_SEC:
         return
     st.risk_last_add[key] = now
     st.risk_events.append((now, weight))
@@ -737,15 +799,23 @@ def health() -> dict:
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest) -> dict:
     rgb = _decode_rgb(req.image)
+    faces, objects = _detect(rgb)  # heavy inference runs outside any session lock
+    st = _get_session(req.sessionKey)
+    # Frames of one session are applied to its state one at a time (see SessionState.lock);
+    # different sessions still run fully in parallel.
+    with (st.lock if st is not None else nullcontext()):
+        return _analyze_frame(req, rgb, faces, objects, st)
+
+
+def _analyze_frame(req: AnalyzeRequest, rgb: np.ndarray, faces, objects,
+                   st: SessionState | None) -> dict:
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     h, w = rgb.shape[:2]
 
-    faces, objects = _detect(rgb)
     # Size-aware people count — filters out posters / photos / reflections so a lone candidate
     # isn't falsely flagged for MULTIPLE_FACES. primary_idx is the candidate (largest face).
     face_count, primary_idx = _count_people(faces.face_landmarks)
 
-    st = _get_session(req.sessionKey)
     if st is not None:
         st.face_counts.append(face_count)
 
@@ -962,7 +1032,7 @@ def analyze(req: AnalyzeRequest) -> dict:
     proctor = None
     if st is not None:
         proctor = _virtual_proctor(
-            st, time.time(),
+            st, time.monotonic(),
             face_count=face_count,
             away_raw=away_raw,
             eye_dir=eye_dir,
@@ -1003,14 +1073,21 @@ def enroll(req: EnrollRequest) -> dict:
     images = req.images if req.images else ([req.image] if req.image else [])
     if not images:
         raise HTTPException(400, "No image provided.")
+    # Each sample costs a full face pipeline on a pooled model; cap so one request can't hold a
+    # pool slot for minutes with thousands of tiny images.
+    images = images[:ENROLL_MAX_IMAGES]
 
     embeddings: list[list[float]] = []
     multi_face = False
     for b64 in images:
         rgb = _decode_rgb(b64)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        faces, _ = _detect(rgb)
-        if len(faces.face_landmarks) > 1:
+        faces, _ = _detect(rgb, with_objects=False)
+        # Same size-aware people count as /analyze: a poster / photo / reflection behind the
+        # candidate is not a second person. Counting raw landmark sets here rejected every sample
+        # for such candidates, so the client's auto-enrollment (gated on /analyze faceCount == 1)
+        # retried forever and identity was never checked.
+        if _count_people(faces.face_landmarks)[0] > 1:
             multi_face = True
             continue
         emb = _sface_embed(bgr)
@@ -1035,7 +1112,7 @@ def enroll(req: EnrollRequest) -> dict:
 def verify(req: VerifyRequest) -> dict:
     rgb = _decode_rgb(req.image)
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    faces, _ = _detect(rgb)
+    faces, _ = _detect(rgb, with_objects=False)
 
     if not faces.face_landmarks:
         return {"match": False, "distance": None, "reason": "no_face"}

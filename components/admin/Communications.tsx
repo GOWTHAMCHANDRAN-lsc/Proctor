@@ -20,6 +20,10 @@ export const Communications: React.FC = () => {
   const [activeTemplate, setActiveTemplate] = useState<NotificationTemplate | null>(null);
   const [draft, setDraft] = useState(emptyTemplate);
   const [search, setSearch] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [notice, setNotice] = useState<{ tone: 'success' | 'error'; text: string } | null>(null);
+  const canSave = draft.name.trim() !== '' && draft.body.trim() !== '';
 
   const loadTemplates = async () => {
     setLoadingTemplates(true);
@@ -57,22 +61,52 @@ export const Communications: React.FC = () => {
     setDraft(emptyTemplate);
   };
 
+  // Save / delete used to have no error handling (a failed request was an unhandled rejection and the
+  // admin saw nothing happen), no busy state (a double-click inserted the template twice), and an
+  // empty name/body silently did nothing.
   const handleSave = async () => {
-    if (!draft.name.trim() || !draft.body.trim()) return;
-    await apiPost('templates.php', {
-      template: {
-        id: activeTemplate?.id,
-        ...draft
-      }
-    });
-    await loadTemplates();
-    resetDraft();
+    if (saving) return;
+    if (!canSave) {
+      setNotice({ tone: 'error', text: 'A template needs a name and a body.' });
+      return;
+    }
+    setSaving(true);
+    setNotice(null);
+    const wasEditing = !!activeTemplate;
+    try {
+      await apiPost('templates.php', {
+        template: {
+          id: activeTemplate?.id,
+          ...draft
+        }
+      });
+      await loadTemplates();
+      resetDraft();
+      setNotice({ tone: 'success', text: wasEditing ? 'Template updated.' : 'Template saved.' });
+    } catch (e: any) {
+      console.error('Failed to save template:', e);
+      setNotice({ tone: 'error', text: e?.message || 'Could not save the template.' });
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const handleDelete = async (id: number) => {
-    await apiPost('templates.php', { id, action: 'DELETE' });
-    await loadTemplates();
-    if (activeTemplate?.id === id) resetDraft();
+  const handleDelete = async (template: NotificationTemplate) => {
+    if (deletingId !== null) return;
+    if (!window.confirm(`Delete the template "${template.name}"? This cannot be undone.`)) return;
+    setDeletingId(template.id);
+    setNotice(null);
+    try {
+      await apiPost('templates.php', { id: template.id, action: 'DELETE' });
+      await loadTemplates();
+      if (activeTemplate?.id === template.id) resetDraft();
+      setNotice({ tone: 'success', text: 'Template deleted.' });
+    } catch (e: any) {
+      console.error('Failed to delete template:', e);
+      setNotice({ tone: 'error', text: e?.message || 'Could not delete the template.' });
+    } finally {
+      setDeletingId(null);
+    }
   };
 
   const filteredLogs = useMemo(() => {
@@ -115,17 +149,30 @@ export const Communications: React.FC = () => {
         <div className="lsc-panel overflow-hidden">
           <div className="p-4 lsc-panel-header">
             <div className="text-sm font-semibold text-slate-800">Template Editor</div>
+            <div className="text-xs text-slate-500 mt-0.5 truncate">
+              {activeTemplate ? `Editing “${activeTemplate.name}”` : 'New template'}
+            </div>
           </div>
           <div className="p-4 space-y-3">
+            {notice && (
+              <div
+                role={notice.tone === 'error' ? 'alert' : 'status'}
+                className={`text-xs rounded-lg border px-3 py-2 ${notice.tone === 'error' ? 'bg-rose-50 border-rose-200 text-rose-700' : 'bg-teal-50 border-teal-200 text-teal-700'}`}
+              >
+                {notice.text}
+              </div>
+            )}
             <input
               type="text"
               className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none"
+              aria-label="Template name"
               placeholder="Template name"
               value={draft.name}
               onChange={e => setDraft({ ...draft, name: e.target.value })}
             />
             <select
               className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white"
+              aria-label="Channel"
               value={draft.channel}
               onChange={e => setDraft({ ...draft, channel: e.target.value as NotificationTemplate['channel'] })}
             >
@@ -136,6 +183,7 @@ export const Communications: React.FC = () => {
               <input
                 type="text"
                 className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none"
+                aria-label="Email subject"
                 placeholder="Email subject"
                 value={draft.subject || ''}
                 onChange={e => setDraft({ ...draft, subject: e.target.value })}
@@ -143,6 +191,7 @@ export const Communications: React.FC = () => {
             )}
             <textarea
               className="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none min-h-[140px]"
+              aria-label="Template body"
               placeholder="Template body"
               value={draft.body}
               onChange={e => setDraft({ ...draft, body: e.target.value })}
@@ -158,9 +207,11 @@ export const Communications: React.FC = () => {
             <div className="flex gap-2">
               <button
                 onClick={handleSave}
-                className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg lsc-button-primary text-sm"
+                disabled={saving || !canSave}
+                title={!canSave ? 'Enter a template name and body first' : undefined}
+                className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg lsc-button-primary text-sm disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <Save size={14} /> Save
+                <Save size={14} /> {saving ? 'Saving…' : activeTemplate ? 'Update' : 'Save'}
               </button>
               <button
                 onClick={resetDraft}
@@ -203,9 +254,11 @@ export const Communications: React.FC = () => {
                     </div>
                   </button>
                   <button
-                    onClick={() => handleDelete(template.id)}
-                    className="text-slate-400 hover:text-rose-500"
+                    onClick={() => handleDelete(template)}
+                    disabled={deletingId === template.id}
+                    className="text-slate-400 hover:text-rose-500 disabled:opacity-50"
                     title="Delete template"
+                    aria-label={`Delete template ${template.name}`}
                   >
                     <Trash2 size={16} />
                   </button>
@@ -223,6 +276,7 @@ export const Communications: React.FC = () => {
               <input
                 type="text"
                 placeholder="Search recipient or status..."
+                aria-label="Search delivery logs"
                 className="pl-8 pr-3 py-2 border border-slate-200 rounded-lg text-xs outline-none bg-white"
                 value={search}
                 onChange={e => setSearch(e.target.value)}

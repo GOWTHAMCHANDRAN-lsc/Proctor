@@ -101,7 +101,18 @@ function array_get_path(array $data, string $path) {
 
 function connector_field_map(array $connector): array {
     $decoded = json_decode((string)($connector['field_map_json'] ?? ''), true);
-    return array_merge(default_field_map(), is_array($decoded) ? $decoded : []);
+    // Only string dot-paths are usable; a null/number/array value stored via the API would otherwise
+    // be passed to array_get_path(string $path) and TypeError the webhook (strict_types).
+    $custom = is_array($decoded) ? array_filter($decoded, 'is_string') : [];
+    return array_merge(default_field_map(), $custom);
+}
+
+/** A mapped payload field as a trimmed string. An object/array at that path (malformed or unexpected
+ *  sender payload) yields '' instead of an "Array to string conversion" error, which used to 500 the
+ *  webhook and leave the event stuck outside the retry sweep. */
+function payload_field_string(array $payload, string $path): string {
+    $value = array_get_path($payload, $path);
+    return is_scalar($value) ? trim((string)$value) : '';
 }
 
 // ---------------------------------------------------------------------------
@@ -145,27 +156,52 @@ function mark_event_failed(PDO $pdo, array $event, string $error): void {
  *  existing match — a webhook must not clobber an identity a human already set up. */
 function upsert_integration_candidate(PDO $pdo, int $companyId, string $fullName, string $email, string $registrationId, ?int $batchId): string {
     $email = strtolower(trim($email));
-    $fullName = $fullName !== '' ? $fullName : $email;
+    $fullName = trim($fullName);
 
-    $existingStmt = $pdo->prepare("SELECT id FROM students
-                                   WHERE company_id = ? AND (registration_id = ? OR email = ?)
-                                   ORDER BY CASE WHEN registration_id = ? THEN 0 ELSE 1 END
-                                   LIMIT 1");
-    $existingStmt->execute([$companyId, $registrationId, $email, $registrationId]);
+    // Match on email only when the event actually carried one. A learnerId-only event has email ''
+    // and "OR email = ''" matched the FIRST email-less learner's row, merging a different person
+    // into that student record (and renaming it).
+    if ($email !== '') {
+        $existingStmt = $pdo->prepare("SELECT id FROM students
+                                       WHERE company_id = ? AND (registration_id = ? OR email = ?)
+                                       ORDER BY CASE WHEN registration_id = ? THEN 0 ELSE 1 END
+                                       LIMIT 1");
+        $existingStmt->execute([$companyId, $registrationId, $email, $registrationId]);
+    } else {
+        $existingStmt = $pdo->prepare('SELECT id FROM students WHERE company_id = ? AND registration_id = ? LIMIT 1');
+        $existingStmt->execute([$companyId, $registrationId]);
+    }
     $existing = $existingStmt->fetch();
     $existingStmt->closeCursor();
 
     if ($existing) {
         $studentId = (string)$existing['id'];
-        $update = $pdo->prepare('UPDATE students SET full_name = ?, email = ? WHERE id = ? AND company_id = ?');
-        $update->execute([$fullName, $email, $studentId, $companyId]);
-        $update->closeCursor();
+        // Only overwrite what the event actually supplied — an event without a name or email must
+        // not blank the email or replace a human-entered name with the email address.
+        $sets = [];
+        $params = [];
+        if ($fullName !== '') {
+            $sets[] = 'full_name = ?';
+            $params[] = $fullName;
+        }
+        if ($email !== '') {
+            $sets[] = 'email = ?';
+            $params[] = $email;
+        }
+        if ($sets !== []) {
+            $params[] = $studentId;
+            $params[] = $companyId;
+            $update = $pdo->prepare('UPDATE students SET ' . implode(', ', $sets) . ' WHERE id = ? AND company_id = ?');
+            $update->execute($params);
+            $update->closeCursor();
+        }
         if ($batchId !== null) {
             add_student_batch($pdo, $studentId, $batchId);
         }
         return $studentId;
     }
 
+    $fullName = $fullName !== '' ? $fullName : $email;
     $studentId = 'ext_' . bin2hex(random_bytes(8));
     $insert = $pdo->prepare('INSERT INTO students (id, company_id, full_name, email, registration_id) VALUES (?, ?, ?, ?, ?)');
     $insert->execute([$studentId, $companyId, $fullName, $email, $registrationId]);
@@ -251,7 +287,7 @@ function send_exam_invitation_locked(PDO $pdo, array $env, int $companyId, array
 
     $subject = "Your exam is ready: {$exam['title']}";
     $body = <<<HTML
-<!doctype html><html><head><meta charset="utf-8"><title>{$subject}</title></head>
+<!doctype html><html><head><meta charset="utf-8"><title>Your exam is ready: {$safeExamTitle}</title></head>
 <body style="margin:0;padding:24px;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;font-size:14px;line-height:1.6;color:#0f172a;background-color:#f8fafc;">
 <div style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:12px;border:1px solid #e2e8f0;padding:32px;">
   <h2 style="margin:0 0 16px;font-size:20px;color:#1e293b;">Your exam is ready</h2>
@@ -271,10 +307,7 @@ HTML;
         // Not configured on this environment: log SKIPPED (not FAILED — nothing to retry) and still
         // mark the invitation as sent so a later retry doesn't loop on an environment that will never
         // have SMTP configured.
-        $log = $pdo->prepare('CALL sp_add_delivery_log(?, ?, ?, ?, ?, ?, ?, ?, ?)');
-        $log->execute([$companyId, 'EMAIL', $email, $subject, $body, 'SKIPPED', 'SMTP not configured', null, null]);
-        while ($log->nextRowset()) {}
-        $log->closeCursor();
+        add_delivery_log($pdo, $companyId, 'EMAIL', $email, $subject, $body, 'SKIPPED', 'SMTP not configured');
     } else {
         $result = smtp_send(
             $smtpHost,
@@ -289,10 +322,14 @@ HTML;
         );
         // sp_add_delivery_log is the shared logging path notify.php uses for every send — call the
         // same procedure here instead of a hand-rolled INSERT so delivery_logs stays consistent.
-        $log = $pdo->prepare('CALL sp_add_delivery_log(?, ?, ?, ?, ?, ?, ?, ?, ?)');
-        $log->execute([$companyId, 'EMAIL', $email, $subject, $body, $result['ok'] ? 'SENT' : 'FAILED', $result['ok'] ? null : ($result['error'] ?? 'Send failed'), null, null]);
-        while ($log->nextRowset()) {}
-        $log->closeCursor();
+        add_delivery_log($pdo, $companyId, 'EMAIL', $email, $subject, $body, $result['ok'] ? 'SENT' : 'FAILED', $result['ok'] ? null : ($result['error'] ?? 'Send failed'));
+        if (!$result['ok']) {
+            // Do NOT record exam_invitations for a failed send: that row is the "already mailed"
+            // idempotency marker, so writing it here meant every retry skipped the candidate and the
+            // event was marked PROCESSED — the invitation was silently lost for good. Throwing lands
+            // the event in FAILED (see process_integration_event) so the retry sweep re-sends it.
+            throw new RuntimeException((string)($result['error'] ?? 'Send failed'));
+        }
     }
 
     $inv = $pdo->prepare('INSERT IGNORE INTO exam_invitations (exam_id, student_id) VALUES (?, ?)');
@@ -318,7 +355,7 @@ function process_integration_event(PDO $pdo, array $env, array $event): void {
     $payload = json_decode((string)$event['payload_json'], true);
     $payload = is_array($payload) ? $payload : [];
 
-    $eventType = strtolower(trim((string)array_get_path($payload, $map['eventType'])));
+    $eventType = strtolower(payload_field_string($payload, $map['eventType']));
     if ($eventType !== 'completed') {
         // Phase 1 gate is ON_COMPLETE only (per product decision) — enrollment-only events are a
         // deliberate no-op, not an error.
@@ -326,10 +363,10 @@ function process_integration_event(PDO $pdo, array $env, array $event): void {
         return;
     }
 
-    $courseId = trim((string)array_get_path($payload, $map['courseId']));
-    $learnerId = trim((string)array_get_path($payload, $map['learnerId']));
-    $email = strtolower(trim((string)array_get_path($payload, $map['email'])));
-    $fullName = trim((string)array_get_path($payload, $map['fullName']));
+    $courseId = payload_field_string($payload, $map['courseId']);
+    $learnerId = payload_field_string($payload, $map['learnerId']);
+    $email = strtolower(payload_field_string($payload, $map['email']));
+    $fullName = payload_field_string($payload, $map['fullName']);
 
     if ($courseId === '' || ($email === '' && $learnerId === '')) {
         mark_event($pdo, (int)$event['id'], 'FAILED', 'Payload is missing courseId or a learner identity (email/learnerId).');
@@ -435,13 +472,18 @@ function handle_inbound_webhook(PDO $pdo, array $env, string $connectorId): void
     }
 
     $map = connector_field_map($connector);
-    $externalEventId = trim((string)array_get_path($payload, $map['externalEventId']));
+    $externalEventId = payload_field_string($payload, $map['externalEventId']);
     if ($externalEventId === '') {
         // No idempotency key supplied: fall back to a content hash so at least an identical redelivery
         // still dedupes, per the Stripe/GitHub-webhook pattern the PRD calls out.
         $externalEventId = sha1($raw);
+    } elseif (strlen($externalEventId) > 255) {
+        // Column is VARCHAR(255): an over-long id failed the INSERT, fell into the duplicate branch
+        // below, found no row and 500'd. Hash it so it still dedupes deterministically.
+        $externalEventId = sha1($externalEventId);
     }
-    $eventType = trim((string)array_get_path($payload, $map['eventType']));
+    // event_type is VARCHAR(64) and informational only.
+    $eventType = mb_substr(payload_field_string($payload, $map['eventType']), 0, 64, 'UTF-8');
     $companyId = (int)$connector['company_id'];
 
     try {
@@ -606,14 +648,21 @@ if ($method === 'POST') {
             json_response(['error' => 'id is required.'], 400);
         }
         $name = trim((string)($payload['name'] ?? ''));
-        $status = strtoupper(trim((string)($payload['status'] ?? 'ACTIVE')));
-        if (!in_array($status, ['ACTIVE', 'DISABLED'], true)) {
-            $status = 'ACTIVE';
-        }
         $fieldMap = is_array($payload['fieldMap'] ?? null) ? $payload['fieldMap'] : null;
 
-        $sets = ['status = ?'];
-        $params = [$status];
+        // Status is only touched when the caller actually sends one. It used to default to ACTIVE,
+        // so saving a field map (Integrations.tsx sends only {id, fieldMap}) silently re-enabled a
+        // connector an admin had deliberately disabled.
+        $sets = [];
+        $params = [];
+        if (array_key_exists('status', $payload) && $payload['status'] !== null) {
+            $status = strtoupper(trim((string)$payload['status']));
+            if (!in_array($status, ['ACTIVE', 'DISABLED'], true)) {
+                json_response(['error' => 'status must be ACTIVE or DISABLED.'], 400);
+            }
+            $sets[] = 'status = ?';
+            $params[] = $status;
+        }
         if ($name !== '') {
             $sets[] = 'name = ?';
             $params[] = $name;
@@ -622,11 +671,13 @@ if ($method === 'POST') {
             $sets[] = 'field_map_json = ?';
             $params[] = json_encode($fieldMap);
         }
-        $params[] = $id;
-        $params[] = $companyId;
-        $stmt = $pdo->prepare('UPDATE integration_connectors SET ' . implode(', ', $sets) . ' WHERE id = ? AND company_id = ?');
-        $stmt->execute($params);
-        $stmt->closeCursor();
+        if ($sets !== []) {
+            $params[] = $id;
+            $params[] = $companyId;
+            $stmt = $pdo->prepare('UPDATE integration_connectors SET ' . implode(', ', $sets) . ' WHERE id = ? AND company_id = ?');
+            $stmt->execute($params);
+            $stmt->closeCursor();
+        }
 
         audit_log($pdo, [
             'companyId' => $companyId, 'actorRole' => $actorRole, 'actorId' => get_actor_id($payload),
@@ -695,6 +746,17 @@ if ($method === 'POST') {
             json_response(['error' => 'Exam not found in this company.'], 404);
         }
         $examCheck->closeCursor();
+
+        // batch ids are global, so without this an admin could map to ANOTHER company's batch and
+        // the pipeline would enroll this company's candidates into it (add_student_batch).
+        if ($batchId !== null) {
+            $batchCheck = $pdo->prepare('SELECT id FROM batches WHERE id = ? AND company_id = ?');
+            $batchCheck->execute([$batchId, $companyId]);
+            if (!$batchCheck->fetchColumn()) {
+                json_response(['error' => 'Batch not found in this company.'], 404);
+            }
+            $batchCheck->closeCursor();
+        }
 
         $stmt = $pdo->prepare('INSERT INTO course_exam_mappings (company_id, connector_id, external_course_id, exam_id, batch_id, active)
                                VALUES (?, ?, ?, ?, ?, ?)

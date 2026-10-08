@@ -58,6 +58,27 @@ const resolveVideoUrl = (raw?: string | null) => {
   return `/api/${raw}`;
 };
 
+// Stream size for the button label. Rounding to whole MB labelled every short (<0.5 MB) recording
+// "0MB", which read as an empty/broken file even though it plays.
+const formatStreamSize = (bytes?: number | null): string => {
+  const b = bytes || 0;
+  if (b <= 0) return '0MB';
+  if (b < 1024 * 1024) return `${Math.max(1, Math.round(b / 1024))}KB`;
+  return `${Math.round(b / 1024 / 1024)}MB`;
+};
+
+// Staff role from the stored auth payload. Recheck is ADMIN / SUPER_ADMIN only server-side
+// (recordings.php RECHECK), but this screen is also open to proctors.
+const getStoredAdminRole = (): string => {
+  if (typeof window === 'undefined') return '';
+  try {
+    const raw = localStorage.getItem('pg_admin_auth');
+    return raw ? String(JSON.parse(raw)?.role || '').toUpperCase() : '';
+  } catch {
+    return '';
+  }
+};
+
 export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
   const [summary, setSummary] = useState<RecordingSummary>({
     cameraCount: 0,
@@ -78,26 +99,47 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
   const [violationsLoading, setViolationsLoading] = useState(false);
   const [recheckStarting, setRecheckStarting] = useState<Record<number, boolean>>({});
   const videoRef = useRef<HTMLVideoElement>(null);
+  const canRecheck = ['ADMIN', 'SUPER_ADMIN'].includes(getStoredAdminRole());
+  // Guards for the 15s list refresh: never stack overlapping list requests, and drop responses that
+  // land after the screen was closed.
+  const loadInFlightRef = useRef(false);
+  const mountedRef = useRef(true);
+  // Identifies the stream whose proctoring timeline is currently wanted, so a slow violations response
+  // for a previously opened (or already closed) recording can't overwrite the current one.
+  const violationsReqRef = useRef(0);
 
   const load = async () => {
+    loadInFlightRef.current = true;
     try {
       const [sumRes, listRes] = await Promise.all([
         apiGet<{ summary: RecordingSummary }>('recordings.php?mode=summary'),
         apiGet<{ recordings: RecordingSessionRecord[] }>('recordings.php?mode=list&limit=250'),
       ]);
+      if (!mountedRef.current) return;
       if (sumRes?.summary) setSummary(sumRes.summary);
       if (listRes?.recordings) setSessions(listRes.recordings);
     } catch (e) {
       console.error('Failed to load recordings:', e);
+    } finally {
+      loadInFlightRef.current = false;
     }
   };
 
   useEffect(() => {
+    mountedRef.current = true;
     void load();
-    const id = window.setInterval(() => {
-      void load();
-    }, 15000);
-    return () => window.clearInterval(id);
+    // Background refresh: paused while the tab is hidden (catches up as soon as it is visible again)
+    // and skipped while a previous refresh is still running. Explicit loads (e.g. after Recheck)
+    // always run.
+    const tick = () => { if (!document.hidden && !loadInFlightRef.current) void load(); };
+    const id = window.setInterval(tick, 15000);
+    const onVisible = tick;
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      mountedRef.current = false;
+      window.clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, []);
 
   // Starts an on-demand re-analysis of this recording's camera stream against the live AI
@@ -212,22 +254,28 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
   const timeline = useMemo(() => groupViolationEpisodes(sessionViolations), [sessionViolations]);
 
   const loadSessionViolations = async (session: RecordingSessionRecord) => {
+    const reqId = ++violationsReqRef.current;
     setSessionViolations([]);
-    if (!session.sessionId) return;
+    if (!session.sessionId) {
+      setViolationsLoading(false);
+      return;
+    }
     setViolationsLoading(true);
     try {
       const res = await apiGet<{ violations: RecordingViolation[] }>(
         `violations.php?sessionId=${session.sessionId}&limit=2000`
       );
+      if (reqId !== violationsReqRef.current || !mountedRef.current) return;
       const list = Array.isArray(res?.violations) ? res.violations : [];
       // Oldest first so the timeline reads top-to-bottom with the video.
       list.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
       setSessionViolations(list);
     } catch (e) {
+      if (reqId !== violationsReqRef.current || !mountedRef.current) return;
       console.error('Failed to load session violations:', e);
       setSessionViolations([]);
     } finally {
-      setViolationsLoading(false);
+      if (reqId === violationsReqRef.current && mountedRef.current) setViolationsLoading(false);
     }
   };
 
@@ -260,10 +308,22 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
   };
 
   const closeStream = () => {
+    violationsReqRef.current += 1; // discard any timeline request still in flight
     setActiveStream(null);
     setVideoError(null);
     setSessionViolations([]);
+    setViolationsLoading(false);
   };
+
+  // Escape closes the player.
+  useEffect(() => {
+    if (!activeStream) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closeStream(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // closeStream only touches refs and state setters, so the latest render's copy is equivalent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeStream]);
 
   return (
     <div className="space-y-6">
@@ -283,6 +343,7 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
             <input
               type="text"
               placeholder="Search exam, student, or IDs..."
+              aria-label="Search recordings"
               className="pl-9 pr-4 py-2 border border-slate-200 rounded-lg outline-none w-full text-sm bg-white"
               value={search}
               onChange={e => setSearch(e.target.value)}
@@ -292,6 +353,7 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
             className="px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white outline-none"
             value={selectedExamId}
             onChange={e => setSelectedExamId(e.target.value)}
+            aria-label="Filter by exam"
           >
             <option value="ALL">All Exams</option>
             {examOptions.map(opt => (
@@ -302,6 +364,7 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
             className="px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white outline-none"
             value={selectedStudentId}
             onChange={e => setSelectedStudentId(e.target.value)}
+            aria-label="Filter by student"
           >
             <option value="ALL">All Students</option>
             {studentOptions.map(opt => (
@@ -312,6 +375,7 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
             className="px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white outline-none"
             value={selectedStatus}
             onChange={e => setSelectedStatus(e.target.value as typeof selectedStatus)}
+            aria-label="Filter by status"
           >
             <option value="ALL">All Status</option>
             <option value="INIT">INIT</option>
@@ -323,6 +387,7 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
             className="px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white outline-none"
             value={selectedStreamType}
             onChange={e => setSelectedStreamType(e.target.value as typeof selectedStreamType)}
+            aria-label="Filter by stream type"
           >
             <option value="ALL">All Streams</option>
             <option value="camera">Camera</option>
@@ -408,17 +473,17 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
                     <td className="px-4 py-3">
                       <div className="flex flex-wrap gap-2">
                         <StreamButton
-                          label={`Camera (${Math.round((cam?.sizeBytes || 0) / 1024 / 1024)}MB)`}
+                          label={`Camera (${formatStreamSize(cam?.sizeBytes)})`}
                           disabled={!cam?.hasFile}
                           onClick={() => openStream(session, 'camera')}
                         />
                         <StreamButton
-                          label={`Screen (${Math.round((scr?.sizeBytes || 0) / 1024 / 1024)}MB)`}
+                          label={`Screen (${formatStreamSize(scr?.sizeBytes)})`}
                           disabled={!scr?.hasFile}
                           onClick={() => openStream(session, 'screen')}
                         />
                         <StreamButton
-                          label={`Combined (${Math.round((cmb?.sizeBytes || 0) / 1024 / 1024)}MB)`}
+                          label={`Combined (${formatStreamSize(cmb?.sizeBytes)})`}
                           disabled={!cmb?.hasFile}
                           onClick={() => openStream(session, 'combined')}
                         />
@@ -447,8 +512,12 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
                           <div className="flex flex-col gap-1 items-start">
                             <button
                               onClick={() => handleRecheck(session.id)}
-                              disabled={!cam?.hasFile || !session.sessionId}
-                              title={!session.sessionId ? 'No linked exam session' : 'Re-analyze this recording against the live AI detector and log any violations it finds'}
+                              disabled={!canRecheck || !cam?.hasFile || !session.sessionId}
+                              title={!canRecheck
+                                ? 'Only admins can start a recheck'
+                                : !session.sessionId
+                                  ? 'No linked exam session'
+                                  : 'Re-analyze this recording against the live AI detector and log any violations it finds'}
                               className="px-2.5 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:hover:bg-transparent inline-flex items-center gap-1.5"
                             >
                               <ScanSearch size={13} /> Recheck
@@ -487,7 +556,12 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
 
       {activeStream && (
         <div className="fixed inset-0 z-[220] bg-slate-900/60 flex items-center justify-center p-4">
-          <div className="bg-white w-full max-w-6xl rounded-xl overflow-hidden shadow-2xl flex flex-col max-h-[92vh]">
+          <div
+            className="bg-white w-full max-w-6xl rounded-xl overflow-hidden shadow-2xl flex flex-col max-h-[92vh]"
+            role="dialog"
+            aria-modal="true"
+            aria-label={activeStream.label}
+          >
             <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-3 flex-wrap">
               <h4 className="font-semibold text-slate-900 flex-1 min-w-0 truncate">{activeStream.label}</h4>
               <div className="flex items-center gap-2 shrink-0">
@@ -516,6 +590,7 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
                 <button
                   onClick={closeStream}
                   className="text-sm text-slate-500 hover:text-slate-800 px-2"
+                  title="Close (Esc)"
                 >
                   Close
                 </button>
@@ -602,7 +677,7 @@ export const Recordings: React.FC<RecordingsProps> = ({ exams, students }) => {
                                 {sev.toUpperCase()}
                               </span>
                               <span className="text-xs font-medium text-slate-800 truncate">
-                                {VIOLATION_LABELS[ep.type] || ep.type}
+                                {(VIOLATION_LABELS as Record<string, string>)[ep.type] || ep.type}
                               </span>
                               {sustained && (
                                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 shrink-0">

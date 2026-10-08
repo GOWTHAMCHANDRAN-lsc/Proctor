@@ -57,7 +57,7 @@ export const Dashboard: React.FC<{ exams: Exam[]; students: Student[]; sessions:
     let mounted = true;
     const loadViolations = async () => {
       try {
-        const data = await apiGet<{ violations: ViolationFeedRow[] }>('violations.php?limit=200');
+        const data = await apiGet<{ violations: ViolationFeedRow[] }>('violations.php?limit=200&noSnapshots=1');
         if (mounted && data?.violations) {
           // Count INCIDENTS, not raw detector events. A single candidate whose camera fed a
           // placeholder image for 19 minutes emits 100+ NO_FACE rows, which used to read on this
@@ -71,10 +71,15 @@ export const Dashboard: React.FC<{ exams: Exam[]; students: Student[]; sessions:
       }
     };
     loadViolations();
-    const id = window.setInterval(loadViolations, 15000);
+    // Don't keep pulling the violation feed while the tab is in the background; catch up the moment
+    // it becomes visible again instead.
+    const id = window.setInterval(() => { if (!document.hidden) void loadViolations(); }, 15000);
+    const onVisible = () => { if (!document.hidden) void loadViolations(); };
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
       mounted = false;
       window.clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
     };
   }, []);
 
@@ -103,16 +108,21 @@ export const Dashboard: React.FC<{ exams: Exam[]; students: Student[]; sessions:
 
   const data = useMemo(() => {
     if (exams.length === 0) return [] as { name: string; passed: number; failed: number }[];
-    return exams.map(exam => {
-      const examSessions = sessions.filter(s => s.examId === exam.id);
-      const completed = examSessions.filter(s => s.status === 'COMPLETED').length;
-      const failed = examSessions.filter(s => s.status === 'TERMINATED').length;
-      return {
-        name: exam.title,
-        passed: completed,
-        failed,
-      };
-    });
+    return exams
+      .map(exam => {
+        const examSessions = sessions.filter(s => s.examId === exam.id);
+        const completed = examSessions.filter(s => s.status === 'COMPLETED').length;
+        const failed = examSessions.filter(s => s.status === 'TERMINATED').length;
+        return {
+          name: exam.title,
+          passed: completed,
+          failed,
+        };
+      })
+      // Only exams that actually have finished attempts belong on the chart. Draft / not-yet-taken
+      // exams just rendered rows of zero-height bars (and crowded the axis labels), and they kept the
+      // "No exam performance data yet" empty state from ever showing.
+      .filter(row => row.passed + row.failed > 0);
   }, [exams, sessions]);
 
   return (

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Building2, Download, Globe2, Shield, Users, FileBarChart2 } from 'lucide-react';
 import {
   CompanyDirectoryRecord,
@@ -36,15 +36,26 @@ const emptyOverview: PlatformOverview = {
 const downloadCsv = (filename: string, rows: Array<Record<string, unknown>>) => {
   if (rows.length === 0) return;
   const headers = Object.keys(rows[0]);
-  const escape = (value: unknown) => `"${String(value ?? '').replace(/"/g, '""')}"`;
+  const escape = (value: unknown) => {
+    let text = String(value ?? '');
+    // Spreadsheet formula injection: a student/company name such as "=HYPERLINK(...)" would run as a
+    // formula when the export is opened in Excel/Sheets. Prefix text cells that start with a formula
+    // trigger so they are shown literally.
+    if (typeof value === 'string' && /^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+    return `"${text.replace(/"/g, '""')}"`;
+  };
   const csv = [headers.join(','), ...rows.map(row => headers.map(header => escape(row[header])).join(','))].join('\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
   link.download = filename;
+  // Attach before clicking and revoke on the next tick: revoking synchronously right after click()
+  // can cancel the download in some browsers.
+  document.body.appendChild(link);
   link.click();
-  URL.revokeObjectURL(url);
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
 };
 
 export const SuperAdminControl: React.FC = () => {
@@ -82,7 +93,13 @@ export const SuperAdminControl: React.FC = () => {
     }
   };
 
+  // Latest report request wins. Switching companies (or applying a date range) while an earlier
+  // report is still loading used to let the slower, older response land last and paint the
+  // previous company's numbers under the newly selected company.
+  const reportReqRef = useRef(0);
+
   const loadReports = async (from = fromDate, to = toDate) => {
+    const reqId = ++reportReqRef.current;
     setLoading(true);
     setError('');
     try {
@@ -92,6 +109,7 @@ export const SuperAdminControl: React.FC = () => {
       if (to) params.set('to', to);
       const query = params.toString();
       const result = await apiGet<PlatformReportResponse>(`platform_reports.php${query ? `?${query}` : ''}`);
+      if (reqId !== reportReqRef.current) return;
       setOverview(result?.overview || emptyOverview);
       setDateFilter(result?.dateFilter || null);
       setCompanyRows(result?.companyRows || []);
@@ -99,10 +117,11 @@ export const SuperAdminControl: React.FC = () => {
       setBatchRows(result?.batchRows || []);
       setStudentRows(result?.studentRows || []);
     } catch (e: any) {
+      if (reqId !== reportReqRef.current) return;
       console.error('Failed to load platform reports:', e);
       setError(e?.message || 'Failed to load platform reports.');
     } finally {
-      setLoading(false);
+      if (reqId === reportReqRef.current) setLoading(false);
     }
   };
 
@@ -160,6 +179,8 @@ export const SuperAdminControl: React.FC = () => {
   };
 
   const spotlightCompanies = useMemo(() => companyRows.slice(0, 6), [companyRows]);
+  // Changes whenever the report scope does, so the paged report tables return to page 1.
+  const reportFilterKey = `${selectedCompanyId}|${dateFilter?.from ?? ''}|${dateFilter?.to ?? ''}`;
 
   return (
     <div className="space-y-6">
@@ -174,6 +195,7 @@ export const SuperAdminControl: React.FC = () => {
           <select
             value={selectedCompanyId}
             onChange={e => setSelectedCompanyId(e.target.value === 'ALL' ? 'ALL' : Number(e.target.value))}
+            aria-label="Filter reports by company"
             className="px-4 py-2.5 border border-slate-200 rounded-xl bg-white text-sm outline-none"
           >
             <option value="ALL">All Companies</option>
@@ -188,6 +210,7 @@ export const SuperAdminControl: React.FC = () => {
               value={fromDate}
               max={toDate || undefined}
               onChange={e => setFromDate(e.target.value)}
+              aria-label="From date"
               className="px-2.5 py-2 border border-slate-200 rounded-xl text-xs outline-none bg-white"
             />
             <label className="text-[11px] font-medium text-slate-500">To</label>
@@ -196,6 +219,7 @@ export const SuperAdminControl: React.FC = () => {
               value={toDate}
               min={fromDate || undefined}
               onChange={e => setToDate(e.target.value)}
+              aria-label="To date"
               className="px-2.5 py-2 border border-slate-200 rounded-xl text-xs outline-none bg-white"
             />
           </div>
@@ -217,7 +241,9 @@ export const SuperAdminControl: React.FC = () => {
           )}
           <button
             onClick={() => downloadCsv('exam-report.csv', examRows as unknown as Array<Record<string, unknown>>)}
-            className="px-4 py-2.5 rounded-xl border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2"
+            disabled={examRows.length === 0}
+            title={examRows.length === 0 ? 'No exam rows for the current filter' : undefined}
+            className="px-4 py-2.5 rounded-xl border border-slate-200 bg-white text-sm text-slate-700 hover:bg-slate-50 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <Download size={15} /> Export Exam Report
           </button>
@@ -251,6 +277,8 @@ export const SuperAdminControl: React.FC = () => {
               <input
                 value={companyForm.name}
                 onChange={e => setCompanyForm(current => ({ ...current, name: e.target.value }))}
+                required
+                aria-label="Company name"
                 className="mt-2 w-full px-4 py-3 border border-slate-200 rounded-xl bg-white outline-none text-sm"
                 placeholder="LSC India"
               />
@@ -259,6 +287,8 @@ export const SuperAdminControl: React.FC = () => {
               <input
                 value={companyForm.code}
                 onChange={e => setCompanyForm(current => ({ ...current, code: e.target.value }))}
+                required
+                aria-label="Company code"
                 className="mt-2 w-full px-4 py-3 border border-slate-200 rounded-xl bg-white outline-none text-sm"
                 placeholder="lsc-india"
               />
@@ -339,6 +369,7 @@ export const SuperAdminControl: React.FC = () => {
           <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
             <ReportTable
               title="Exam Report"
+              resetKey={reportFilterKey}
               rows={examRows.map(row => ({
                 Company: row.companyName || row.companyId,
                 Exam: row.examTitle,
@@ -351,6 +382,7 @@ export const SuperAdminControl: React.FC = () => {
             />
             <ReportTable
               title="Batch Report"
+              resetKey={reportFilterKey}
               rows={batchRows.map(row => ({
                 Company: row.companyName || row.companyId,
                 Batch: row.batchName,
@@ -362,6 +394,7 @@ export const SuperAdminControl: React.FC = () => {
             />
             <ReportTable
               title="Student Report"
+              resetKey={reportFilterKey}
               rows={studentRows.map(row => ({
                 Company: row.companyName || row.companyId,
                 Student: row.fullName,
@@ -405,10 +438,10 @@ const Stat = ({ label, value }: { label: string; value: number }) => (
 
 const REPORT_TABLE_PAGE_SIZE = 8;
 
-const ReportTable = ({ title, rows, onDownload }: { title: string; rows: Array<Record<string, unknown>>; onDownload: () => void }) => {
+const ReportTable = ({ title, rows, onDownload, resetKey }: { title: string; rows: Array<Record<string, unknown>>; onDownload: () => void; resetKey?: string }) => {
   // Report tables sit several to a screen, so they keep a small fixed page size rather than following
-  // the global "Rows per page" preference.
-  const paging = usePagination(rows, title, REPORT_TABLE_PAGE_SIZE);
+  // the global "Rows per page" preference. They jump back to page 1 when the report filter changes.
+  const paging = usePagination(rows, `${title}|${resetKey ?? ''}`, REPORT_TABLE_PAGE_SIZE);
 
   return (
     <div className="lsc-panel overflow-hidden">
@@ -417,7 +450,12 @@ const ReportTable = ({ title, rows, onDownload }: { title: string; rows: Array<R
           <div className="font-semibold text-slate-900">{title}</div>
           <div className="text-xs text-slate-500 mt-1">{rows.length} row{rows.length === 1 ? '' : 's'} for the current filter</div>
         </div>
-        <button onClick={onDownload} className="text-xs px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 flex items-center gap-2">
+        <button
+          onClick={onDownload}
+          disabled={rows.length === 0}
+          aria-label={`Download ${title} as CSV`}
+          className="text-xs px-3 py-2 rounded-lg border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
           <Download size={14} /> CSV
         </button>
       </div>

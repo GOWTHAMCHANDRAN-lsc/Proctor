@@ -41,7 +41,9 @@ ensure_feedback_schema($pdo);
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
-    require_role(['ADMIN', 'PROCTOR']);
+    // Any staff reader. Was ADMIN/PROCTOR only, so the read-only VIEWER role — whose whole console is
+    // Dashboard + Results — got a 403 and an always-empty feedback panel on the Results screen.
+    require_staff();
     $companyId = require_company_id();
     $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 250;
     if ($limit <= 0) $limit = 250;
@@ -105,6 +107,19 @@ if ($method === 'POST') {
 
     if ($examId === '' || $studentId === '') {
         json_response(['error' => 'examId and studentId are required.'], 400);
+    }
+
+    // A client-supplied sessionId must belong to this company/exam/student. session_feedback has a
+    // UNIQUE session_id + ON DUPLICATE KEY UPDATE, so an unchecked (sequential) id let any caller
+    // overwrite the rating/comment stored for someone else's session, in any company.
+    if ($sessionId !== null) {
+        $ownStmt = $pdo->prepare('SELECT id FROM exam_sessions WHERE id = ? AND company_id = ? AND exam_id = ? AND student_id = ? LIMIT 1');
+        $ownStmt->execute([$sessionId, $companyId, $examId, $studentId]);
+        $ownsSession = (bool)$ownStmt->fetch();
+        $ownStmt->closeCursor();
+        if (!$ownsSession) {
+            $sessionId = null;
+        }
     }
 
     if ($sessionId === null) {

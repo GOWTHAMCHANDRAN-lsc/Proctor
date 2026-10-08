@@ -17,6 +17,32 @@ function ensure_enrollment_schema(PDO $pdo): void {
     db_add_column_if_missing($pdo, 'students', 'enrolled_at', 'TIMESTAMP NULL DEFAULT NULL AFTER face_photo');
 }
 
+/**
+ * Who may read or replace a student's biometric template. Previously nobody was checked: anyone
+ * with a companyId + studentId could download a candidate's face embedding or overwrite it with
+ * their own face (defeating IDENTITY_CHANGE for an impersonator). Allowed now:
+ *  - the candidate themself, via the signed exam-access token (X-Exam-Token) for THAT student and
+ *    company — every candidate on the exam page already sends it (exams.php won't load without it);
+ *  - signed-in staff (company-scoped by require_company_id);
+ *  - legacy header trust only while AUTH_ENFORCE_TOKEN is off.
+ */
+function authorize_enrollment_access(string $studentId, int $companyId, ?array $payload = null): void {
+    $examClaims = current_exam_token_claims();
+    if ($examClaims !== null) {
+        if (strcasecmp((string)$examClaims['sid'], $studentId) !== 0 || (int)$examClaims['cid'] !== $companyId) {
+            json_response(['error' => 'Forbidden for this student.'], 403);
+        }
+        return;
+    }
+    if (current_session_claims() !== null) {
+        require_staff($payload);
+        return;
+    }
+    if (auth_enforced()) {
+        json_response(['error' => 'Authentication required.'], 401);
+    }
+}
+
 ensure_enrollment_schema($pdo);
 
 $method = $_SERVER['REQUEST_METHOD'];
@@ -27,6 +53,7 @@ if ($method === 'GET') {
     if ($studentId === '') {
         json_response(['error' => 'studentId is required.'], 400);
     }
+    authorize_enrollment_access($studentId, $companyId);
     if (!db_column_exists($pdo, 'students', 'face_descriptor')) {
         json_response(['enrolled' => false, 'descriptor' => null]);
     }
@@ -74,6 +101,7 @@ if ($method === 'POST') {
     if ($studentId === '' || !is_array($descriptor)) {
         json_response(['error' => 'studentId and descriptor are required.'], 400);
     }
+    authorize_enrollment_access($studentId, $companyId, $payload);
 
     $descriptor = array_values(array_map('floatval', $descriptor));
     $len = count($descriptor);

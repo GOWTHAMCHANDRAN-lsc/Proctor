@@ -195,6 +195,21 @@ if ($method === 'POST') {
         if ($examId === '' || $studentId === '') {
             json_response(['error' => 'examId and studentId are required.'], 400);
         }
+        // This endpoint is unauthenticated (students have no session token), so bind the request to
+        // the candidate's SIGNED exam link whenever the browser sends one (X-Exam-Token), exactly as
+        // sessions.php start does. Without it anyone could file a DEVICE_CHANGE request for another
+        // student's live session with their own device fingerprint and, if granted, take it over.
+        // Unsigned/legacy links stay allowed until EXAM_ENFORCE_TOKEN is switched on.
+        $examTokenClaims = current_exam_token_claims();
+        if ($examTokenClaims !== null) {
+            if ((string)($examTokenClaims['eid'] ?? '') !== $examId
+                || (string)($examTokenClaims['sid'] ?? '') !== $studentId
+                || (int)($examTokenClaims['cid'] ?? 0) !== $companyId) {
+                json_response(['error' => 'INVALID_ACCESS_TOKEN', 'message' => 'This request does not match your exam link.'], 403);
+            }
+        } elseif (exam_token_enforced()) {
+            json_response(['error' => 'INVALID_ACCESS_TOKEN', 'message' => 'This exam link is invalid or has been tampered with. Please use the original link from your invitation email.'], 403);
+        }
         if ($requestType === 'DEVICE_CHANGE' && $reason === '') {
             json_response(['error' => 'COMMENT_REQUIRED', 'message' => 'Please explain why you need to continue from a different device.'], 400);
         }
@@ -324,7 +339,10 @@ if ($method === 'POST') {
         }
         $requestId = isset($payload['requestId']) ? (int)$payload['requestId'] : 0;
         $decision = strtoupper(trim((string)($payload['decision'] ?? '')));
-        $reviewer = trim((string)($payload['reviewer'] ?? (get_actor_id($payload) ?? '')));
+        // The verified identity wins over the client-supplied `reviewer` label (which any caller could
+        // set to someone else's name in the audit trail). reviewed_by is VARCHAR(64).
+        $reviewer = trim((string)(get_actor_id($payload) ?? ($payload['reviewer'] ?? '')));
+        $reviewer = mb_substr($reviewer, 0, 64, 'UTF-8');
         $note = trim((string)($payload['note'] ?? ''));
 
         if ($requestId <= 0 || !in_array($decision, ['GRANTED', 'REVOKED'], true)) {

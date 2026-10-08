@@ -83,12 +83,18 @@ const SERVICE_RECHECK_MS = 15000;
 export const checkAiService = async (): Promise<boolean> => {
   if (_serviceAvailable === true) return true;
   if (_serviceAvailable === false && (Date.now() - _serviceCheckedAt) < SERVICE_RECHECK_MS) return false;
+  // Bounded like every other AI call: an unresponsive service would otherwise hold this probe for
+  // the proxy's full connect+read timeout (~30 s), keeping the detection loop un-armed that long.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 6000);
   try {
-    const res = await fetch(`${AI_BASE}?endpoint=health`, { method: 'GET' });
+    const res = await fetch(`${AI_BASE}?endpoint=health`, { method: 'GET', signal: controller.signal });
     const json = await res.json();
     _serviceAvailable = json?.status === 'ok';
   } catch {
     _serviceAvailable = false;
+  } finally {
+    clearTimeout(timer);
   }
   _serviceCheckedAt = Date.now();
   return _serviceAvailable ?? false;

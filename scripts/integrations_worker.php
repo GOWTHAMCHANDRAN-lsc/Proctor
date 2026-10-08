@@ -28,11 +28,19 @@ $stmt->closeCursor();
 
 $count = 0;
 foreach ($ids as $id) {
-    $event = fetch_event_by_id($pdo, $id);
-    if (!$event) {
-        continue;
+    // process_integration_event() is designed not to throw, but (as in certificates_worker.php) this
+    // loop must survive an unexpected error: uncaught, it would hit _bootstrap's exception handler and
+    // exit, and because the sweep is ordered oldest-first the same poison event would abort every
+    // future run too.
+    try {
+        $event = fetch_event_by_id($pdo, $id);
+        if (!$event) {
+            continue;
+        }
+        process_integration_event($pdo, $env, $event);
+    } catch (Throwable $e) {
+        fwrite(STDOUT, sprintf("[%s] integrations_worker: unexpected error on event %d: %s\n", date('c'), $id, $e->getMessage()));
     }
-    process_integration_event($pdo, $env, $event);
     $count++;
 }
 

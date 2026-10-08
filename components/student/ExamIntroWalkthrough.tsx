@@ -211,10 +211,13 @@ export const ExamIntroWalkthrough: React.FC<ExamIntroWalkthroughProps> = ({
     title: "You're ready to begin",
     body: (
       <div className="space-y-2.5">
-        <div className="flex items-start gap-2 text-sm text-slate-600">
-          <CheckCircle2 size={16} className="mt-0.5 shrink-0 text-emerald-500" />
-          Keep your face visible and stay in frame for the whole exam.
-        </div>
+        {/* Only relevant when the camera is actually used — no-camera exams were told to stay in frame. */}
+        {needsCamera && (
+          <div className="flex items-start gap-2 text-sm text-slate-600">
+            <CheckCircle2 size={16} className="mt-0.5 shrink-0 text-emerald-500" />
+            Keep your face visible and stay in frame for the whole exam.
+          </div>
+        )}
         <div className="flex items-start gap-2 text-sm text-slate-600">
           <CheckCircle2 size={16} className="mt-0.5 shrink-0 text-emerald-500" />
           Don't switch tabs, minimise, or leave the exam window.
@@ -232,12 +235,20 @@ export const ExamIntroWalkthrough: React.FC<ExamIntroWalkthroughProps> = ({
   });
 
   const [stepIdx, setStepIdx] = useState(0);
-  const step = steps[stepIdx];
-  const isLast = stepIdx === steps.length - 1;
+  // Clamp so a change in the step list (e.g. a requirement prop flipping) can never index past the
+  // end and crash on `step.eyebrow`.
+  const safeIdx = Math.min(stepIdx, steps.length - 1);
+  const step = steps[safeIdx];
+  const isLast = safeIdx === steps.length - 1;
 
   return (
     <div className="fixed inset-0 z-[220] bg-slate-900/55 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg my-8 border border-slate-200 overflow-hidden">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="intro-step-title"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-lg my-8 border border-slate-200 overflow-hidden"
+      >
         <div className="bg-gradient-to-br from-[var(--lsc-primary,#1d4ed8)] to-blue-600 px-6 py-5 text-white">
           <div className="flex items-center gap-2 mb-2">
             <div className="inline-flex items-center justify-center w-9 h-9 rounded-full bg-white/15 shrink-0">
@@ -252,18 +263,19 @@ export const ExamIntroWalkthrough: React.FC<ExamIntroWalkthroughProps> = ({
             <p className="text-blue-100 text-xs whitespace-normal">{scheduleLabel}</p>
           )}
           {/* progress dots */}
-          <div className="flex items-center gap-1.5 mt-3">
+          <div className="flex items-center gap-1.5 mt-3" aria-hidden="true">
             {steps.map((s, i) => (
               <div
                 key={s.key}
-                className={`h-1.5 rounded-full transition-all ${i === stepIdx ? 'w-6 bg-white' : i < stepIdx ? 'w-1.5 bg-white/70' : 'w-1.5 bg-white/30'}`}
+                className={`h-1.5 rounded-full transition-all ${i === safeIdx ? 'w-6 bg-white' : i < safeIdx ? 'w-1.5 bg-white/70' : 'w-1.5 bg-white/30'}`}
               />
             ))}
           </div>
+          <span className="sr-only">Step {safeIdx + 1} of {steps.length}</span>
         </div>
 
         <div className="px-6 py-5">
-          <h2 className="text-lg font-bold text-slate-900">{step.title}</h2>
+          <h2 id="intro-step-title" className="text-lg font-bold text-slate-900">{step.title}</h2>
           <div className="mt-3">{step.body}</div>
 
           {step.illustration && (
@@ -273,16 +285,18 @@ export const ExamIntroWalkthrough: React.FC<ExamIntroWalkthroughProps> = ({
           )}
 
           <div className="mt-6 flex items-center gap-3">
-            {stepIdx > 0 && (
+            {safeIdx > 0 && (
               <button
-                onClick={() => setStepIdx(i => Math.max(0, i - 1))}
+                type="button"
+                onClick={() => setStepIdx(Math.max(0, safeIdx - 1))}
                 className="flex items-center gap-1.5 px-4 py-3 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 font-semibold text-sm"
               >
                 <ChevronLeft size={16} /> Back
               </button>
             )}
             <button
-              onClick={() => (isLast ? onContinue() : setStepIdx(i => Math.min(steps.length - 1, i + 1)))}
+              type="button"
+              onClick={() => (isLast ? onContinue() : setStepIdx(Math.min(steps.length - 1, safeIdx + 1)))}
               className="flex-1 py-3 bg-[var(--lsc-primary,#1d4ed8)] text-white rounded-lg hover:brightness-110 font-semibold flex items-center justify-center gap-2 transition"
             >
               {isLast ? <>I'm Ready — Continue <ShieldCheck size={18} /></> : <>Next <ChevronRight size={18} /></>}

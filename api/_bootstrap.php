@@ -206,6 +206,33 @@ function current_session_claims(): ?array {
         }
     }
     $claims = $token !== '' ? verify_session_token($token) : null;
+
+    // Revocation: a token is self-contained and lives 12h, so without this check disabling,
+    // deleting, re-roling or moving a staff user to another company did NOT take effect until the
+    // token expired — a disabled proctor kept full access to live walls / recordings for hours.
+    // Re-check the directory row (one PK lookup, staff requests only). Fails OPEN on a DB error so
+    // a transient glitch can't log every admin out.
+    if ($claims !== null && isset($claims['uid']) && (int)$claims['uid'] > 0) {
+        $pdo = $GLOBALS['pdo'] ?? null;
+        if ($pdo instanceof PDO) {
+            try {
+                $st = $pdo->prepare('SELECT role, status, company_id FROM platform_users WHERE id = ? LIMIT 1');
+                $st->execute([(int)$claims['uid']]);
+                $row = $st->fetch();
+                $st->closeCursor();
+                $tokenRole = strtoupper(trim((string)($claims['role'] ?? '')));
+                if (!$row
+                    || strtoupper((string)$row['status']) === 'DISABLED'
+                    || strtoupper((string)$row['role']) !== $tokenRole
+                    || ($tokenRole !== 'SUPER_ADMIN' && (int)($row['company_id'] ?? 0) !== (int)($claims['cid'] ?? 0))
+                ) {
+                    $claims = null;
+                }
+            } catch (Throwable $e) {
+                // Fail open — keep the verified claims.
+            }
+        }
+    }
     return $claims;
 }
 
@@ -1065,8 +1092,16 @@ function ensure_platform_user_schema(PDO $pdo, array $env): void {
         db_add_column_if_missing($pdo, 'platform_users', 'notes', "TEXT NULL AFTER password_updated_at");
 
         // Ensure the role enum includes the read-only VIEWER role on already-provisioned databases.
-        // Idempotent: re-running MODIFY with the same definition is a no-op.
-        $pdo->exec("ALTER TABLE platform_users MODIFY role ENUM('SUPER_ADMIN','ADMIN','VIEWER','PROCTOR','STUDENT') NOT NULL");
+        // Only ALTER when VIEWER is actually missing: this runs on EVERY API request, and an
+        // unconditional ALTER TABLE (even a no-op one) takes an exclusive metadata lock on
+        // platform_users, forces an implicit commit and is written to the binlog each time.
+        $roleStmt = $pdo->query("SHOW COLUMNS FROM platform_users LIKE 'role'");
+        $roleCol = $roleStmt ? $roleStmt->fetch() : null;
+        if ($roleStmt) $roleStmt->closeCursor();
+        $roleType = is_array($roleCol) ? (string)($roleCol['Type'] ?? '') : '';
+        if ($roleType !== '' && stripos($roleType, 'VIEWER') === false) {
+            $pdo->exec("ALTER TABLE platform_users MODIFY role ENUM('SUPER_ADMIN','ADMIN','VIEWER','PROCTOR','STUDENT') NOT NULL");
+        }
 
         foreach (list_seed_super_admin_emails($env) as $email) {
             $seed = $pdo->prepare("INSERT INTO platform_users (company_id, role, full_name, email, status)
@@ -1093,9 +1128,24 @@ set_error_handler(function (int $severity, string $message, string $file, int $l
 });
 
 set_exception_handler(function (Throwable $e): void {
+    // The raw message is logged server-side only. Echoing it leaked SQL/schema details and data
+    // values (e.g. "SQLSTATE[23000] ... Duplicate entry 'x@y.com' for key ...") to the browser,
+    // where several admin screens render the error body verbatim. The `ref` ties the generic
+    // response to the log line.
+    $ref = bin2hex(random_bytes(4));
+    error_log(sprintf('[proctor-api %s] %s: %s in %s:%d', $ref, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine()));
+    if ($e instanceof PDOException && (string)$e->getCode() === '23000') {
+        $driverCode = (int)($e->errorInfo[1] ?? 0);
+        if ($driverCode === 1062) {
+            json_response(['error' => 'A record with the same unique value already exists.', 'ref' => $ref], 409);
+        }
+        if ($driverCode === 1451 || $driverCode === 1452) {
+            json_response(['error' => 'This change conflicts with related records.', 'ref' => $ref], 409);
+        }
+    }
     json_response([
         'error' => 'Server error.',
-        'detail' => $e->getMessage(),
+        'ref' => $ref,
     ], 500);
 });
 
@@ -1124,6 +1174,45 @@ function audit_log(PDO $pdo, array $entry): void {
             $metadataJson = json_encode($metadata);
         } elseif (is_string($metadata)) {
             $metadataJson = $metadata;
+        }
+
+        // The routine's VARCHAR params are strict: an over-long value (e.g. a >512-char in-app
+        // browser user agent, or a long email as actor id) made the whole CALL fail and the audit row
+        // was silently dropped. Clip to the column widths instead.
+        $clip = static function ($value, int $max) {
+            if ($value === null) return null;
+            $value = (string)$value;
+            return function_exists('mb_substr') ? mb_substr($value, 0, $max) : substr($value, 0, $max);
+        };
+        $actorId = $clip($actorId, 64);
+        $action = $clip($action, 64);
+        $targetType = $clip($targetType, 64);
+        $targetId = $clip($targetId, 64);
+        $ipAddress = $clip($ipAddress, 64);
+        $userAgent = $clip($userAgent, 512);
+
+        // The live sp_add_audit's p_actor_role is ENUM('ADMIN','STUDENT','SYSTEM') (created under
+        // STRICT_TRANS_TABLES), so every PROCTOR-attributed write (violation review, access-request
+        // review, ...) errored inside the CALL and was swallowed below — audit_logs holds zero
+        // PROCTOR rows. audit_logs.actor_role itself does accept PROCTOR, so roles the routine can't
+        // take are written with the same INSERT the routine performs.
+        if (!in_array($actorRole, ['ADMIN', 'STUDENT', 'SYSTEM'], true)) {
+            $stmt = $pdo->prepare('INSERT INTO audit_logs (company_id, actor_role, actor_id, action, target_type, target_id, message, metadata, ip_address, user_agent)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+            $stmt->execute([
+                $companyId,
+                $actorRole,
+                $actorId,
+                $action,
+                $targetType,
+                $targetId,
+                $message,
+                $metadataJson,
+                $ipAddress,
+                $userAgent
+            ]);
+            $stmt->closeCursor();
+            return;
         }
 
         $stmt = $pdo->prepare('CALL sp_add_audit(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');

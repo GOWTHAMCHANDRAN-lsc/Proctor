@@ -208,18 +208,25 @@ if ($method === 'POST') {
     if ($name === '') {
         json_response(['error' => 'Batch name is required.'], 400);
     }
+    if (mb_strlen($name, 'UTF-8') > 255) {
+        // batches.name is VARCHAR(255); strict mode turned an over-long name into a raw 500.
+        json_response(['error' => 'Batch name must be 255 characters or fewer.'], 400);
+    }
 
-    $check = $pdo->prepare("SELECT id, company_id, name, description, created_at
-                            FROM batches
-                            WHERE company_id = ? AND name = ?
+    $check = $pdo->prepare("SELECT b.id, b.company_id, b.name, b.description, b.created_at,
+                                   (SELECT COUNT(DISTINCT sb.student_id) FROM student_batches sb WHERE sb.batch_id = b.id) AS student_count
+                            FROM batches b
+                            WHERE b.company_id = ? AND b.name = ?
                             LIMIT 1");
     $check->execute([$companyId, $name]);
     $existing = $check->fetch();
     $check->closeCursor();
 
     if ($existing) {
+        // Return the batch's REAL roster size: StudentManager merges this object over its existing
+        // list entry, so the old hardcoded student_count = 0 reset that batch's count to 0 on screen.
         json_response([
-            'batch' => normalize_batch_row(array_merge($existing, ['student_count' => 0])),
+            'batch' => normalize_batch_row($existing),
             'created' => false,
         ]);
     }

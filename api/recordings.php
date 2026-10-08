@@ -137,9 +137,16 @@ function stream_file_with_range(string $path, string $mime): void {
     $status = 200;
 
     $range = $_SERVER['HTTP_RANGE'] ?? '';
-    if (is_string($range) && preg_match('/bytes=(\d*)-(\d*)/', $range, $m)) {
-        $rangeStart = $m[1] !== '' ? (int)$m[1] : 0;
-        $rangeEnd = $m[2] !== '' ? (int)$m[2] : $end;
+    if (is_string($range) && preg_match('/bytes=(\d*)-(\d*)/', $range, $m) && ($m[1] !== '' || $m[2] !== '')) {
+        if ($m[1] === '') {
+            // Suffix range "bytes=-N" = the LAST N bytes (RFC 9110), not bytes 0..N. Media players
+            // use it to read trailing metadata; serving the head instead hands them garbage.
+            $rangeStart = max(0, $size - (int)$m[2]);
+            $rangeEnd = $end;
+        } else {
+            $rangeStart = (int)$m[1];
+            $rangeEnd = $m[2] !== '' ? (int)$m[2] : $end;
+        }
         if ($rangeStart <= $rangeEnd && $rangeStart < $size) {
             $start = max(0, $rangeStart);
             $end = min($end, $rangeEnd);
@@ -505,7 +512,11 @@ if ($method === 'POST') {
                 chunk_count = chunk_count + 1");
         $upsert->execute([$recordingId, $streamType, $mimeType, $path, (int)$written]);
 
-        $statusStmt = $pdo->prepare("UPDATE recording_sessions SET status = 'RECORDING' WHERE id = ? AND company_id = ?");
+        // Only promote INIT -> RECORDING. A chunk still draining from the client's upload queue after
+        // the recording was finalized (client COMPLETE, or the server-side close-out when the exam
+        // session ended) used to flip a COMPLETED/FAILED recording back to RECORDING, leaving it
+        // looking live/stuck again. The bytes are still appended above; only the status is protected.
+        $statusStmt = $pdo->prepare("UPDATE recording_sessions SET status = 'RECORDING' WHERE id = ? AND company_id = ? AND status = 'INIT'");
         $statusStmt->execute([$recordingId, $companyId]);
 
         json_response(['ok' => true, 'written' => (int)$written]);

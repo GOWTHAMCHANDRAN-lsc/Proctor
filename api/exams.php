@@ -346,7 +346,13 @@ if ($method === 'GET') {
         if (!$row) {
             json_response(['error' => 'Exam not found.'], 404);
         }
-        json_response(['exams' => [build_exam_response($row, $pdo, $tokenCompanyId)]]);
+        $studentExam = build_exam_response($row, $pdo, $tokenCompanyId);
+        // The candidate's page never uses the roster, and handing every candidate the student ids of
+        // everyone else assigned to the exam let them address classmates' attempts directly through
+        // the (unauthenticated) session/violation endpoints, which are keyed on examId + studentId.
+        $studentExam['assignedStudentIds'] = [];
+        $studentExam['assignedBatchIds'] = [];
+        json_response(['exams' => [$studentExam]]);
     }
 
     require_staff(); // admin-only read: blocks tokenless/forged-header access
@@ -886,6 +892,46 @@ if ($method === 'POST') {
 
     $assignedIds = array_values(array_unique($assignedIds));
 
+    // Exam, question and section ids are global primary keys and the save below is an upsert. For a
+    // regular admin, refuse ids that already belong to ANOTHER company: otherwise a crafted save
+    // reusing another company's exam id would move that exam into this company (company_id =
+    // VALUES(company_id)) and wipe its questions/sections/assignments, and a reused question or
+    // section id would silently rewrite the other company's question text and answer key. The
+    // editor, duplicate and import flows always mint fresh ids, so legitimate saves never hit this.
+    if (get_actor_role($payload) !== 'SUPER_ADMIN') {
+        $foreignStmt = $pdo->prepare('SELECT 1 FROM exams WHERE id = ? AND company_id <> ? LIMIT 1');
+        $foreignStmt->execute([$id, $companyId]);
+        $foreignExam = (bool)$foreignStmt->fetchColumn();
+        $foreignStmt->closeCursor();
+
+        $foreignChild = false;
+        $questionIdList = array_values(array_map('strval', array_keys($questionMap)));
+        if (!$foreignExam && count($questionIdList) > 0) {
+            $qPh = implode(',', array_fill(0, count($questionIdList), '?'));
+            $fqStmt = $pdo->prepare("SELECT 1 FROM exam_questions eq
+                                     JOIN exams e ON e.id = eq.exam_id
+                                     WHERE eq.question_id IN ($qPh) AND e.company_id <> ?
+                                     LIMIT 1");
+            $fqStmt->execute(array_merge($questionIdList, [$companyId]));
+            $foreignChild = (bool)$fqStmt->fetchColumn();
+            $fqStmt->closeCursor();
+        }
+        $sectionIdList = array_values(array_map(static fn($s) => (string)$s['id'], $sections));
+        if (!$foreignExam && !$foreignChild && count($sectionIdList) > 0) {
+            $sPh = implode(',', array_fill(0, count($sectionIdList), '?'));
+            $fsStmt = $pdo->prepare("SELECT 1 FROM exam_sections es
+                                     JOIN exams e ON e.id = es.exam_id
+                                     WHERE es.id IN ($sPh) AND e.company_id <> ?
+                                     LIMIT 1");
+            $fsStmt->execute(array_merge($sectionIdList, [$companyId]));
+            $foreignChild = (bool)$fsStmt->fetchColumn();
+            $fsStmt->closeCursor();
+        }
+        if ($foreignExam || $foreignChild) {
+            json_response(['error' => 'This exam (or one of its questions/sections) belongs to another company and cannot be saved here.'], 409);
+        }
+    }
+
     try {
         $pdo->beginTransaction();
 
@@ -1112,7 +1158,7 @@ if ($method === 'POST') {
     audit_log($pdo, [
         'companyId' => $companyId,
         'actorRole' => 'ADMIN',
-        'actorId' => $exam['actor'] ?? null,
+        'actorId' => get_actor_id($payload) ?? ($exam['actor'] ?? null),
         'action' => 'EXAM_SAVE',
         'targetType' => 'exam',
         'targetId' => $id,

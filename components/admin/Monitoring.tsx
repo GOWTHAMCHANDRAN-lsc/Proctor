@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ExamSession, Student, Exam } from '../../types';
 import { Monitor, Wifi, MapPin, Search, AlertTriangle, Network, RotateCcw } from 'lucide-react';
 import { apiPost } from '../../services/api';
@@ -11,16 +11,55 @@ interface MonitoringProps {
   onRefreshSessions: () => Promise<void>;
 }
 
+// Session list refresh cadence while this screen is open (paused while the tab is hidden).
+const SESSION_REFRESH_MS = 30000;
+
+// The signed-in staff role (same stored auth payload Layout/Dashboard read).
+const getStoredAdminRole = (): string => {
+  if (typeof window === 'undefined') return '';
+  try {
+    const raw = localStorage.getItem('pg_admin_auth');
+    return raw ? String(JSON.parse(raw)?.role || '').toUpperCase() : '';
+  } catch {
+    return '';
+  }
+};
+
 export const Monitoring: React.FC<MonitoringProps> = ({ sessions, students, exams, onRefreshSessions }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [filterType, setFilterType] = useState<'ALL' | 'SUSPICIOUS'>('ALL');
   const [resettingKey, setResettingKey] = useState<string | null>(null);
+  // Resetting a MAC binding is ADMIN / SUPER_ADMIN only server-side (sessions.php reset_mac), so a
+  // proctor would only ever get "Failed to reset MAC binding." — don't offer them the button.
+  const canResetMac = ['ADMIN', 'SUPER_ADMIN'].includes(getStoredAdminRole());
+
+  // The session list lives in App and was only fetched at login, so this "real-time" screen showed
+  // whatever was true back then. Pull a fresh copy on open and keep it current while visible.
+  const refreshRef = useRef(onRefreshSessions);
+  refreshRef.current = onRefreshSessions;
+  useEffect(() => {
+    void refreshRef.current().catch(() => {});
+    const id = window.setInterval(() => {
+      if (!document.hidden) void refreshRef.current().catch(() => {});
+    }, SESSION_REFRESH_MS);
+    return () => window.clearInterval(id);
+  }, []);
 
   // --- Analysis Logic ---
   // NOTE: Students attending from the same public IP (shared campus/office network, common
   // household router, mobile carrier NAT, etc.) is expected and is NOT treated as suspicious —
   // only an IP *changing* mid-session, a device change, or a location change are flagged.
   const activeCount = sessions.filter(s => s.status === 'IN_PROGRESS').length;
+
+  // sessions.php `reset` always acts on the student's MOST RECENT attempt for the exam, whichever row
+  // was clicked. Renew on an older, superseded row would therefore flip the newer attempt (possibly a
+  // COMPLETED, passed one) to TERMINATED — so Renew is only offered on the latest attempt's row.
+  const latestStartByKey = new Map<string, number>();
+  sessions.forEach(s => {
+    const k = `${s.examId}:${s.studentId}`;
+    const prev = latestStartByKey.get(k);
+    if (prev === undefined || s.startTime > prev) latestStartByKey.set(k, s.startTime);
+  });
 
   // Combine data for display
   const displayData = sessions.map(session => {
@@ -33,6 +72,7 @@ export const Monitoring: React.FC<MonitoringProps> = ({ sessions, students, exam
         studentReg: student?.registrationId || '---',
         examTitle: exam?.title || 'Unknown Exam',
         isActive: session.status === 'IN_PROGRESS',
+        isLatestAttempt: latestStartByKey.get(`${session.examId}:${session.studentId}`) === session.startTime,
         isIpChanged: !!session.ipChangeDetected,
         isDeviceChanged: !!session.deviceChangeDetected,
         isLocationChanged: !!session.locationChangeDetected
@@ -115,10 +155,11 @@ export const Monitoring: React.FC<MonitoringProps> = ({ sessions, students, exam
                  </tr>
              </thead>
              <tbody className="divide-y divide-slate-100">
-                 {paging.pageItems.map((session, idx) => (
+                 {paging.pageItems.map(session => (
                      // Keyed by the session identity, not the row index — with paging the index is
-                     // page-local and would make React reuse the wrong row across page changes.
-                     <tr key={`${session.examId}:${session.studentId}:${idx}`} className="hover:bg-slate-50/80 transition-colors">
+                     // page-local and would make React reuse the wrong row across page changes. The
+                     // start time disambiguates renewed attempts of the same exam + student.
+                     <tr key={`${session.examId}:${session.studentId}:${session.startTime}`} className="hover:bg-slate-50/80 transition-colors">
                          <td className="px-6 py-4">
                              <div className="font-bold text-slate-900">{session.studentName}</div>
                              <div className="text-xs text-slate-500 font-mono">{session.studentReg}</div>
@@ -126,7 +167,14 @@ export const Monitoring: React.FC<MonitoringProps> = ({ sessions, students, exam
                          <td className="px-6 py-4">
                              <div className="text-slate-700 font-medium truncate max-w-[200px]" title={session.examTitle}>{session.examTitle}</div>
                              <div className="text-xs text-slate-500 flex items-center gap-1 mt-0.5">
-                                 <ClockIcon /> {Math.floor((Date.now() - session.startTime) / 60000)}m elapsed
+                                 {/* "Elapsed" only means something while the attempt is running — for a
+                                     finished one it used to keep counting forever ("4320m elapsed"). */}
+                                 <ClockIcon />{' '}
+                                 {!session.startTime
+                                   ? 'Start time unknown'
+                                   : session.isActive
+                                     ? `${Math.max(0, Math.floor((Date.now() - session.startTime) / 60000))}m elapsed`
+                                     : `Started ${new Date(session.startTime).toLocaleString()}`}
                              </div>
                          </td>
                          <td className="px-6 py-4 font-mono">
@@ -205,6 +253,11 @@ export const Monitoring: React.FC<MonitoringProps> = ({ sessions, students, exam
                                      )}
                                  </div>
                                  <div className="flex items-center gap-2">
+                                     {!session.isLatestAttempt ? (
+                                       <span className="text-[11px] font-semibold text-slate-400" title="A newer attempt exists for this student and exam — manage it from that row.">
+                                         Superseded
+                                       </span>
+                                     ) : (
                                      <button
                                        onClick={async () => {
                                          if (!window.confirm(
@@ -231,15 +284,20 @@ export const Monitoring: React.FC<MonitoringProps> = ({ sessions, students, exam
                                            setResettingKey(null);
                                          }
                                        }}
-                                       className="flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100"
+                                       className="flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 disabled:opacity-60 disabled:cursor-not-allowed"
                                        title="Renew link — previous attempt is preserved, never deleted"
                                        disabled={resettingKey === `${session.examId}:${session.studentId}`}
                                      >
                                        <RotateCcw size={12} />
                                        {resettingKey === `${session.examId}:${session.studentId}` ? 'Renewing...' : 'Renew'}
                                      </button>
+                                     )}
+                                     {canResetMac && (
                                      <button
                                        onClick={async () => {
+                                         if (!window.confirm('Reset the MAC binding? The student will be able to continue this exam from a different device.')) {
+                                           return;
+                                         }
                                          const key = `mac:${session.examId}:${session.studentId}`;
                                          setResettingKey(key);
                                          try {
@@ -257,13 +315,14 @@ export const Monitoring: React.FC<MonitoringProps> = ({ sessions, students, exam
                                            setResettingKey(null);
                                          }
                                        }}
-                                       className="flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold border border-purple-200 bg-purple-50 text-purple-700 hover:bg-purple-100"
+                                       className="flex items-center gap-1 px-3 py-1 rounded-full text-xs font-bold border border-purple-200 bg-purple-50 text-purple-700 hover:bg-purple-100 disabled:opacity-60 disabled:cursor-not-allowed"
                                        title="Reset MAC binding to allow student to take exam from different device"
                                        disabled={resettingKey === `mac:${session.examId}:${session.studentId}`}
                                      >
                                        <RotateCcw size={12} />
                                        {resettingKey === `mac:${session.examId}:${session.studentId}` ? 'Resetting...' : 'Reset MAC'}
                                      </button>
+                                     )}
                                  </div>
                              </div>
                          </td>
@@ -272,7 +331,9 @@ export const Monitoring: React.FC<MonitoringProps> = ({ sessions, students, exam
                  {displayData.length === 0 && (
                      <tr>
                          <td colSpan={5} className="py-12 text-center text-slate-400">
-                             No active sessions match your criteria.
+                             {filterType === 'SUSPICIOUS'
+                               ? 'No active sessions are flagged right now.'
+                               : 'No sessions match your criteria.'}
                          </td>
                      </tr>
                  )}

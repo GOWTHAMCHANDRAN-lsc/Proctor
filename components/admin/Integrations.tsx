@@ -35,6 +35,7 @@ const FieldMapEditor: React.FC<{ value: Record<string, string>; onChange: (v: Re
         <label className="block text-[11px] font-medium text-slate-500 mb-1">{label}</label>
         <input
           className={inputCls}
+          aria-label={label}
           placeholder={DEFAULT_FIELD_MAP[key]}
           value={value[key] ?? ''}
           onChange={e => onChange({ ...value, [key]: e.target.value })}
@@ -62,7 +63,7 @@ const StatusBadge: React.FC<{ status: string }> = ({ status }) => (
 
 const Section: React.FC<{ icon: React.ReactNode; title: string; subtitle: string; action?: React.ReactNode; children: React.ReactNode }> = ({ icon, title, subtitle, action, children }) => (
   <div className="lsc-panel p-5 sm:p-6">
-    <div className="flex items-start justify-between gap-3 mb-5">
+    <div className="flex flex-wrap items-start justify-between gap-3 mb-5">
       <div className="flex items-start gap-3 min-w-0">
         <div className="lsc-icon-tile-primary p-2.5 shrink-0">{icon}</div>
         <div className="min-w-0">
@@ -84,15 +85,29 @@ const webhookUrlFor = (connectorId: string) => {
 };
 
 const CopyButton: React.FC<{ value: string }> = ({ value }) => {
-  const [copied, setCopied] = useState(false);
+  const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  // Only claim "Copied" once the clipboard write actually succeeded. It used to flash "Copied" even
+  // when the Clipboard API was unavailable or refused — and the webhook secret is shown only once, so
+  // an admin who trusted that and dismissed the banner lost the secret and had to rotate it.
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(value);
+      setState('copied');
+    } catch {
+      setState('failed');
+    }
+    window.setTimeout(() => setState('idle'), 1600);
+  };
   return (
     <button
       type="button"
-      onClick={() => { navigator.clipboard?.writeText(value); setCopied(true); window.setTimeout(() => setCopied(false), 1200); }}
+      onClick={() => { void copy(); }}
+      title={state === 'failed' ? 'Copy failed — select the text and copy it manually' : undefined}
       className="px-2.5 py-1.5 lsc-button-ghost text-xs inline-flex items-center gap-1.5 shrink-0"
     >
-      {copied ? <Check size={13} /> : <Copy size={13} />}
-      {copied ? 'Copied' : 'Copy'}
+      {state === 'copied' ? <Check size={13} /> : state === 'failed' ? <AlertCircle size={13} /> : <Copy size={13} />}
+      {state === 'copied' ? 'Copied' : state === 'failed' ? 'Copy failed' : 'Copy'}
     </button>
   );
 };
@@ -104,6 +119,7 @@ export const Integrations: React.FC<{ role?: UserRole }> = ({ role }) => {
   const [exams, setExams] = useState<Exam[]>([]);
   const [batches, setBatches] = useState<Batch[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [expandedEvent, setExpandedEvent] = useState<number | null>(null);
   const [retryingId, setRetryingId] = useState<number | null>(null);
@@ -124,21 +140,27 @@ export const Integrations: React.FC<{ role?: UserRole }> = ({ role }) => {
 
   const loadAll = async () => {
     setLoading(true);
+    setLoadError('');
     try {
-      const [connRes, mapRes, evtRes, examRes, batchRes] = await Promise.all([
+      // allSettled, not all: one failing request (e.g. batches) used to blank the whole screen, which
+      // then read as "No connectors yet" — indistinguishable from a genuinely empty setup.
+      const [connRes, mapRes, evtRes, examRes, batchRes] = await Promise.allSettled([
         apiGet<{ connectors: IntegrationConnector[] }>('integrations.php'),
         apiGet<{ mappings: CourseExamMapping[] }>('integrations.php?action=mappings'),
         apiGet<{ events: IntegrationEvent[] }>('integrations.php?action=events'),
         apiGet<{ exams: Exam[] }>('exams.php'),
         apiGet<{ batches: Batch[] }>('batches.php'),
       ]);
-      setConnectors(connRes?.connectors || []);
-      setMappings(mapRes?.mappings || []);
-      setEvents(evtRes?.events || []);
-      setExams(examRes?.exams || []);
-      setBatches(batchRes?.batches || []);
-    } catch (e) {
-      console.error('Failed to load integrations:', e);
+      if (connRes.status === 'fulfilled') setConnectors(connRes.value?.connectors || []);
+      if (mapRes.status === 'fulfilled') setMappings(mapRes.value?.mappings || []);
+      if (evtRes.status === 'fulfilled') setEvents(evtRes.value?.events || []);
+      if (examRes.status === 'fulfilled') setExams(examRes.value?.exams || []);
+      if (batchRes.status === 'fulfilled') setBatches(batchRes.value?.batches || []);
+      const failed = [connRes, mapRes, evtRes, examRes, batchRes].filter(r => r.status === 'rejected');
+      if (failed.length > 0) {
+        failed.forEach(r => console.error('Failed to load integrations data:', (r as PromiseRejectedResult).reason));
+        setLoadError('Some integration data could not be loaded. The lists below may be incomplete — try Refresh.');
+      }
     } finally {
       setLoading(false);
     }
@@ -292,10 +314,17 @@ export const Integrations: React.FC<{ role?: UserRole }> = ({ role }) => {
             Connect an external course platform's completion webhook to auto-schedule the matching exam — no manual invite needed.
           </p>
         </div>
-        <button onClick={loadAll} className="px-3.5 py-2 lsc-button-ghost text-sm inline-flex items-center gap-2 self-start">
+        <button onClick={loadAll} disabled={loading} className="px-3.5 py-2 lsc-button-ghost text-sm inline-flex items-center gap-2 self-start disabled:opacity-60">
           <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> Refresh
         </button>
       </div>
+
+      {loadError && (
+        <div role="alert" className="flex items-start gap-2 text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3.5 py-2.5">
+          <AlertCircle size={16} className="mt-0.5 shrink-0" />
+          <span>{loadError}</span>
+        </div>
+      )}
 
       {/* Connectors */}
       <Section
@@ -307,6 +336,7 @@ export const Integrations: React.FC<{ role?: UserRole }> = ({ role }) => {
             <input
               className={`${inputCls} w-48`}
               placeholder="Connector name"
+              aria-label="New connector name"
               value={newConnectorName}
               onChange={e => setNewConnectorName(e.target.value)}
             />
@@ -372,7 +402,7 @@ export const Integrations: React.FC<{ role?: UserRole }> = ({ role }) => {
                   </div>
                   <code className="text-xs text-slate-400 truncate block mt-0.5">{webhookUrlFor(c.id)}</code>
                 </div>
-                <div className="flex items-center gap-1.5 shrink-0">
+                <div className="flex flex-wrap items-center gap-1.5">
                   <button
                     onClick={() => { setEditingMappingFor(editingMappingFor === c.id ? null : c.id); setEditFieldMap(c.fieldMap || {}); }}
                     className="px-2.5 py-1.5 lsc-button-ghost text-xs inline-flex items-center gap-1.5"
@@ -385,7 +415,12 @@ export const Integrations: React.FC<{ role?: UserRole }> = ({ role }) => {
                   <button onClick={() => handleToggleConnector(c)} className="px-2.5 py-1.5 lsc-button-ghost text-xs inline-flex items-center gap-1.5">
                     <Ban size={13} /> {c.status === 'ACTIVE' ? 'Disable' : 'Enable'}
                   </button>
-                  <button onClick={() => handleDeleteConnector(c)} className="px-2.5 py-1.5 text-xs text-slate-500 hover:text-red-600 inline-flex items-center gap-1.5">
+                  <button
+                    onClick={() => handleDeleteConnector(c)}
+                    className="px-2.5 py-1.5 text-xs text-slate-500 hover:text-red-600 inline-flex items-center gap-1.5"
+                    title="Delete connector"
+                    aria-label={`Delete connector ${c.name}`}
+                  >
                     <Trash2 size={13} />
                   </button>
                 </div>
@@ -417,21 +452,22 @@ export const Integrations: React.FC<{ role?: UserRole }> = ({ role }) => {
         subtitle="When a mapped course's completion event arrives, the exam below is auto-assigned and invited. Unmapped courses are held, never dropped."
       >
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 mb-5">
-          <select className={inputCls} value={mappingForm.connectorId} onChange={e => setMappingForm(f => ({ ...f, connectorId: e.target.value }))}>
+          <select className={inputCls} aria-label="Connector" value={mappingForm.connectorId} onChange={e => setMappingForm(f => ({ ...f, connectorId: e.target.value }))}>
             <option value="">Connector…</option>
             {connectors.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
           <input
             className={inputCls}
             placeholder="External course id"
+            aria-label="External course id"
             value={mappingForm.externalCourseId}
             onChange={e => setMappingForm(f => ({ ...f, externalCourseId: e.target.value }))}
           />
-          <select className={inputCls} value={mappingForm.examId} onChange={e => setMappingForm(f => ({ ...f, examId: e.target.value }))}>
+          <select className={inputCls} aria-label="Exam" value={mappingForm.examId} onChange={e => setMappingForm(f => ({ ...f, examId: e.target.value }))}>
             <option value="">Exam…</option>
             {exams.map(e => <option key={e.id} value={e.id}>{e.title}</option>)}
           </select>
-          <select className={inputCls} value={mappingForm.batchId} onChange={e => setMappingForm(f => ({ ...f, batchId: e.target.value }))}>
+          <select className={inputCls} aria-label="Batch (optional)" value={mappingForm.batchId} onChange={e => setMappingForm(f => ({ ...f, batchId: e.target.value }))}>
             <option value="">Batch (optional)</option>
             {batches.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
           </select>
@@ -457,7 +493,12 @@ export const Integrations: React.FC<{ role?: UserRole }> = ({ role }) => {
                 {m.batchName && <span className="text-slate-400 ml-2">· batch {m.batchName}</span>}
                 {!m.active && <span className="ml-2 text-xs text-slate-400">(inactive)</span>}
               </div>
-              <button onClick={() => handleDeleteMapping(m)} className="px-2.5 py-1.5 text-xs text-slate-500 hover:text-red-600 inline-flex items-center gap-1.5 shrink-0">
+              <button
+                onClick={() => handleDeleteMapping(m)}
+                className="px-2.5 py-1.5 text-xs text-slate-500 hover:text-red-600 inline-flex items-center gap-1.5 shrink-0"
+                title="Remove mapping"
+                aria-label={`Remove mapping for course ${m.externalCourseId}`}
+              >
                 <Trash2 size={13} />
               </button>
             </div>
@@ -469,7 +510,7 @@ export const Integrations: React.FC<{ role?: UserRole }> = ({ role }) => {
       <div className="lsc-panel overflow-hidden">
         <div className="p-4 lsc-panel-header flex flex-wrap items-center justify-between gap-3">
           <div className="text-sm font-semibold text-slate-800">Event log</div>
-          <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} className="px-3 py-1.5 border border-slate-200 rounded-lg text-xs outline-none bg-white">
+          <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)} aria-label="Filter events by status" className="px-3 py-1.5 border border-slate-200 rounded-lg text-xs outline-none bg-white">
             <option value="ALL">All statuses</option>
             {Object.keys(STATUS_TONE).map(s => <option key={s} value={s}>{s}</option>)}
           </select>

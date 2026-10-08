@@ -114,19 +114,28 @@ export const LiveProctoring: React.FC<LiveProctoringProps> = ({ exams, students 
   const [loaded, setLoaded] = useState(false);
   const [focusTick, setFocusTick] = useState(0); // drives the focused modal's fast frame refresh
   const timerRef = useRef<number | null>(null);
+  // One wall request at a time. On a busy exam day a roster call can take longer than POLL_MS; without
+  // this guard the 2s ticks stacked up concurrent requests whose responses could land out of order
+  // (an older roster overwriting a newer one), and kept arriving after the screen was closed.
+  const inFlightRef = useRef(false);
+  const mountedRef = useRef(true);
 
   const load = async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     try {
       const res = await apiGet<{ live: LiveItem[] }>('live.php?mode=wall');
-      setItems(Array.isArray(res?.live) ? res.live : []);
+      if (mountedRef.current) setItems(Array.isArray(res?.live) ? res.live : []);
     } catch (e) {
       console.error('Failed to load live wall:', e);
     } finally {
-      setLoaded(true);
+      inFlightRef.current = false;
+      if (mountedRef.current) setLoaded(true);
     }
   };
 
   useEffect(() => {
+    mountedRef.current = true;
     // Only poll while the tab is visible — a backgrounded wall shouldn't keep hammering the server.
     const tick = () => { if (!document.hidden) void load(); };
     void load();
@@ -134,10 +143,19 @@ export const LiveProctoring: React.FC<LiveProctoringProps> = ({ exams, students 
     const onVisible = () => { if (!document.hidden) void load(); };
     document.addEventListener('visibilitychange', onVisible);
     return () => {
+      mountedRef.current = false;
       if (timerRef.current) window.clearInterval(timerRef.current);
       document.removeEventListener('visibilitychange', onVisible);
     };
   }, []);
+
+  // Escape closes the enlarged candidate view.
+  useEffect(() => {
+    if (!focused) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFocused(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [focused]);
 
   // While a candidate is enlarged: (1) ping WATCH so the server tells that student to push at a high
   // frame rate, and (2) tick a fast cache-buster so the modal keeps pulling the freshest frame. Both
@@ -157,9 +175,12 @@ export const LiveProctoring: React.FC<LiveProctoringProps> = ({ exams, students 
   const examTitle = (id: string) => exams.find(e => e.id === id)?.title || id;
 
   const examOptions = useMemo(() => {
-    const ids = Array.from(new Set<string>(items.map(i => i.examId)));
-    return ids.map(id => ({ id, label: examTitle(id) })).sort((a, b) => a.label.localeCompare(b.label));
-  }, [items, exams]);
+    const ids = new Set<string>(items.map(i => i.examId));
+    // Keep the selected exam listed even after its last candidate drops off the wall. Otherwise the
+    // <select> silently showed "All Exams" while the hidden filter still emptied the wall.
+    if (selectedExamId !== 'ALL') ids.add(selectedExamId);
+    return Array.from(ids).map(id => ({ id, label: examTitle(id) })).sort((a, b) => a.label.localeCompare(b.label));
+  }, [items, exams, selectedExamId]);
 
   const visible = useMemo(() => {
     const term = search.trim().toLowerCase();
@@ -227,6 +248,7 @@ export const LiveProctoring: React.FC<LiveProctoringProps> = ({ exams, students 
             className="px-3 py-2 border border-slate-200 rounded-lg text-sm bg-white outline-none"
             value={selectedExamId}
             onChange={e => setSelectedExamId(e.target.value)}
+            aria-label="Filter by exam"
           >
             <option value="ALL">All Exams</option>
             {examOptions.map(o => <option key={o.id} value={o.id}>{o.label}</option>)}
@@ -237,6 +259,7 @@ export const LiveProctoring: React.FC<LiveProctoringProps> = ({ exams, students 
           <input
             type="text"
             placeholder="Search student or exam..."
+            aria-label="Search student or exam"
             className="pl-9 pr-4 py-2 border border-slate-200 rounded-lg outline-none w-full sm:w-64 text-sm bg-white"
             value={search}
             onChange={e => setSearch(e.target.value)}
@@ -246,7 +269,11 @@ export const LiveProctoring: React.FC<LiveProctoringProps> = ({ exams, students 
 
       {visible.length === 0 ? (
         <div className="lsc-panel p-12 text-center text-slate-400">
-          {loaded ? 'No active candidates are being proctored right now.' : 'Loading live wall…'}
+          {!loaded
+            ? 'Loading live wall…'
+            : items.length > 0
+              ? 'No candidates match the current filters.'
+              : 'No active candidates are being proctored right now.'}
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
@@ -309,7 +336,13 @@ export const LiveProctoring: React.FC<LiveProctoringProps> = ({ exams, students 
 
       {focusedFresh && (
         <div className="fixed inset-0 z-[220] bg-slate-900/70 flex items-center justify-center p-4" onClick={() => setFocused(null)}>
-          <div className="bg-white w-full max-w-3xl rounded-xl overflow-hidden shadow-2xl" onClick={e => e.stopPropagation()}>
+          <div
+            className="bg-white w-full max-w-3xl rounded-xl overflow-hidden shadow-2xl max-h-[92vh] overflow-y-auto"
+            onClick={e => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label={`Live view: ${studentName(focusedFresh.studentId)}`}
+          >
             <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <h4 className="font-semibold text-slate-900 truncate">{studentName(focusedFresh.studentId)}</h4>
@@ -317,7 +350,7 @@ export const LiveProctoring: React.FC<LiveProctoringProps> = ({ exams, students 
                   {studentReg(focusedFresh.studentId)} · {examTitle(focusedFresh.examId)}
                 </p>
               </div>
-              <button onClick={() => setFocused(null)} className="text-slate-500 hover:text-slate-800 p-1"><X size={18} /></button>
+              <button onClick={() => setFocused(null)} className="text-slate-500 hover:text-slate-800 p-1" aria-label="Close live view" title="Close (Esc)"><X size={18} /></button>
             </div>
             <div className="relative bg-slate-900 aspect-video">
               <LiveFrame

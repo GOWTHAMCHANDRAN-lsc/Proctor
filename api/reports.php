@@ -44,7 +44,9 @@ $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
     require_staff(); // admin-only read: blocks tokenless/forged-header access
-    require_role(['ADMIN', 'PROCTOR']);
+    // VIEWER is the read-only "Dashboard + Results" role and Results.tsx loads this report for every
+    // viewer of that tab; leaving VIEWER out 403'd it so their Reports panel was always empty.
+    require_role(['ADMIN', 'PROCTOR', 'VIEWER']);
     $companyId = require_company_id();
     $hasBatches = report_table_exists($pdo, 'batches');
     if ($hasBatches) {

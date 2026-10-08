@@ -480,8 +480,20 @@ if ($method === 'POST') {
                 $latestRequest = $requestStmt->fetch();
                 $requestStmt->closeCursor();
 
+                // An admin "Renew" (action=reset, staff-only) issued AFTER the block is an explicit
+                // decision to let this candidate reattempt — the same authority as granting their
+                // access request. Without this, Renew on a violation-blocked candidate reported
+                // "Link renewed" while start kept refusing them with ACCESS_REQUEST_REQUIRED.
+                $renewStmt = $pdo->prepare("SELECT id FROM exam_access_logs
+                                            WHERE company_id = ? AND exam_id = ? AND student_id = ?
+                                              AND action = 'RESET' AND status = 'OK' AND id > ?
+                                            LIMIT 1");
+                $renewStmt->execute([$companyId, $examId, $studentId, (int)$latestBlock['id']]);
+                $renewedAfterBlock = (bool)$renewStmt->fetch();
+                $renewStmt->closeCursor();
+
                 $status = $latestRequest['status'] ?? null;
-                if ($status !== 'GRANTED') {
+                if ($status !== 'GRANTED' && !$renewedAfterBlock) {
                     $errorCode = 'ACCESS_REQUEST_REQUIRED';
                     $message = 'Access blocked due to policy violation. Request admin approval to reattempt.';
                     if ($status === 'PENDING') {
@@ -614,8 +626,13 @@ if ($method === 'POST') {
                 json_response(['error' => 'RECONNECT_LIMIT', 'message' => 'No more reconnection is possible. Please contact administrator.'], 409);
             }
 
-            $countStmt = $pdo->prepare("SELECT COUNT(*) AS cnt FROM exam_access_logs WHERE company_id = ? AND exam_id = ? AND student_id = ? AND action = 'RECONNECT' AND status = 'OK'");
-            $countStmt->execute([$companyId, $examId, $studentId]);
+            // Count only reconnects into THIS attempt. Counting every reconnect ever logged for the
+            // exam meant a candidate renewed by an admin inherited the old attempt's used-up allowance
+            // and was refused ("No more reconnection is possible") on their very first reload.
+            // created_at has second precision, so compare against the attempt start truncated to the second.
+            $attemptStartedAt = substr((string)($existing['start_time'] ?? ''), 0, 19);
+            $countStmt = $pdo->prepare("SELECT COUNT(*) AS cnt FROM exam_access_logs WHERE company_id = ? AND exam_id = ? AND student_id = ? AND action = 'RECONNECT' AND status = 'OK' AND created_at >= ?");
+            $countStmt->execute([$companyId, $examId, $studentId, $attemptStartedAt !== '' ? $attemptStartedAt : '1970-01-01 00:00:01']);
             $countRow = $countStmt->fetch();
             $count = $countRow ? (int)$countRow['cnt'] : 0;
 
@@ -662,6 +679,34 @@ if ($method === 'POST') {
             ]);
         }
 
+        // Entry gate for a NEW attempt (a reconnect into a live attempt returned above, so a started
+        // exam still always runs its full duration). The browser checks the window too, but only
+        // against the candidate's own clock — a machine clock set back, or a direct API call, could
+        // otherwise open an archived exam or one whose window closed hours ago. A few minutes of
+        // slack absorbs ordinary clock skew between the candidate's device and the server.
+        $windowStmt = $pdo->prepare("SELECT status,
+                                            (start_time IS NOT NULL AND NOW(3) < DATE_SUB(start_time, INTERVAL 5 MINUTE)) AS not_open,
+                                            (end_time IS NOT NULL AND NOW(3) > DATE_ADD(end_time, INTERVAL 5 MINUTE)) AS closed
+                                     FROM exams WHERE id = ? AND company_id = ? LIMIT 1");
+        $windowStmt->execute([$examId, $companyId]);
+        $windowRow = $windowStmt->fetch();
+        $windowStmt->closeCursor();
+        $windowError = null;
+        if ($windowRow && ($windowRow['status'] ?? '') === 'ARCHIVED') {
+            $windowError = ['EXAM_ARCHIVED', 'This exam is archived.'];
+        } elseif ($windowRow && !empty($windowRow['not_open'])) {
+            $windowError = ['EXAM_NOT_OPEN', 'This exam has not opened yet. Please use your link during the scheduled exam window.'];
+        } elseif ($windowRow && !empty($windowRow['closed'])) {
+            $windowError = ['EXAM_WINDOW_CLOSED', 'The exam window has closed. Please contact your administrator.'];
+        }
+        if ($windowError !== null) {
+            $log = $pdo->prepare('CALL sp_log_access(?, ?, ?, ?, ?, ?)');
+            $log->execute([$companyId, $examId, $studentId, 'START', 'DENY', $windowError[1]]);
+            while ($log->nextRowset()) {}
+            $log->closeCursor();
+            json_response(['error' => $windowError[0], 'message' => $windowError[1]], 403);
+        }
+
         $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
         $ipAddress = $_SERVER['REMOTE_ADDR'] ?? '';
         $location = $geo['label'] ?? ($payload['location'] ?? null);
@@ -670,6 +715,7 @@ if ($method === 'POST') {
             $deviceFingerprint = substr($deviceFingerprint, 0, 128);
         }
 
+        $sessionId = null;
         try {
             $start = $pdo->prepare('INSERT INTO exam_sessions
                 (company_id, exam_id, student_id, start_time, status, ip_address, user_agent, location, location_lat, location_lng, location_accuracy_m, device_fingerprint, device_metadata_json, mac_address, mac_bound)
@@ -689,6 +735,10 @@ if ($method === 'POST') {
                 $macAddress,
                 $macAddress ? 1 : 0
             ]);
+            // The id of THIS insert — re-selecting "latest by start_time" could return a different
+            // row when two starts land in the same millisecond (double-click / duplicate request).
+            $insertedId = (int)$pdo->lastInsertId();
+            $sessionId = $insertedId > 0 ? $insertedId : null;
         } catch (Throwable $e) {
             $errorMsg = $e->getMessage();
             if (strpos($errorMsg, 'MAC_ADDRESS_MISMATCH') !== false) {
@@ -710,10 +760,12 @@ if ($method === 'POST') {
         $attemptRow = $attemptCountStmt->fetch();
         $attemptNumber = ($attemptRow ? (int)$attemptRow['cnt'] : 1);
 
-        $sessionStmt = $pdo->prepare('SELECT id FROM exam_sessions WHERE company_id = ? AND exam_id = ? AND student_id = ? ORDER BY start_time DESC LIMIT 1');
-        $sessionStmt->execute([$companyId, $examId, $studentId]);
-        $session = $sessionStmt->fetch();
-        $sessionId = $session ? (int)$session['id'] : null;
+        if ($sessionId === null) {
+            $sessionStmt = $pdo->prepare('SELECT id FROM exam_sessions WHERE company_id = ? AND exam_id = ? AND student_id = ? ORDER BY start_time DESC LIMIT 1');
+            $sessionStmt->execute([$companyId, $examId, $studentId]);
+            $session = $sessionStmt->fetch();
+            $sessionId = $session ? (int)$session['id'] : null;
+        }
 
         if ($sessionId && ($geo['lat'] !== null || $geo['lng'] !== null || $location !== null)) {
             $loc = $pdo->prepare('INSERT INTO exam_location_logs
@@ -820,26 +872,40 @@ if ($method === 'POST') {
         // the tab / loses the browser before submitting leaves NO answers on the server, so their
         // attended questions can't be scored. Grading here (idempotent) means an abandoned attempt
         // is later finalized as a FAIL that still reflects what they actually answered.
-        $sessionStmt = $pdo->prepare("SELECT id, status FROM exam_sessions
-                                      WHERE company_id = ? AND exam_id = ? AND student_id = ?
-                                      ORDER BY start_time DESC LIMIT 1");
-        $sessionStmt->execute([$companyId, $examId, $studentId]);
-        $session = $sessionStmt->fetch();
-        $sessionStmt->closeCursor();
+        // Row-locked so an autosave that was already in flight when the candidate submitted can't
+        // land AFTER 'complete' and overwrite the final graded answers with its older snapshot:
+        // whichever runs second sees the other's committed status.
+        $pdo->beginTransaction();
+        try {
+            $sessionStmt = $pdo->prepare("SELECT id, status FROM exam_sessions
+                                          WHERE company_id = ? AND exam_id = ? AND student_id = ?
+                                          ORDER BY start_time DESC LIMIT 1
+                                          FOR UPDATE");
+            $sessionStmt->execute([$companyId, $examId, $studentId]);
+            $session = $sessionStmt->fetch();
+            $sessionStmt->closeCursor();
 
-        // Only autosave into a live attempt; a completed/terminated session is final.
-        if (!$session || ($session['status'] ?? '') !== 'IN_PROGRESS') {
-            json_response(['ok' => true, 'saved' => false]);
-        }
+            // Only autosave into a live attempt; a completed/terminated session is final.
+            if (!$session || ($session['status'] ?? '') !== 'IN_PROGRESS') {
+                $pdo->rollBack();
+                json_response(['ok' => true, 'saved' => false]);
+            }
 
-        $sessionId = (int)$session['id'];
-        [$totalScore, $maxScore, $answeredCount] = grade_and_store_answers(
-            $pdo, $companyId, (string)$examId, $sessionId,
-            $payload['answers'] ?? null, $payload['questionIds'] ?? null, $payload['questionTimes'] ?? null
-        );
-        if ($maxScore > 0) {
-            $update = $pdo->prepare('UPDATE exam_sessions SET total_score = ?, max_score = ? WHERE id = ? AND company_id = ?');
-            $update->execute([$totalScore, $maxScore, $sessionId, $companyId]);
+            $sessionId = (int)$session['id'];
+            [$totalScore, $maxScore, $answeredCount] = grade_and_store_answers(
+                $pdo, $companyId, (string)$examId, $sessionId,
+                $payload['answers'] ?? null, $payload['questionIds'] ?? null, $payload['questionTimes'] ?? null
+            );
+            if ($maxScore > 0) {
+                $update = $pdo->prepare('UPDATE exam_sessions SET total_score = ?, max_score = ? WHERE id = ? AND company_id = ?');
+                $update->execute([$totalScore, $maxScore, $sessionId, $companyId]);
+            }
+            $pdo->commit();
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
         }
         json_response(['ok' => true, 'saved' => true, 'answered' => $answeredCount]);
     }
@@ -934,37 +1000,76 @@ if ($method === 'POST') {
             }, $payload['questions']);
         }
 
-        $done = $pdo->prepare('CALL sp_complete_exam_session(?, ?, ?)');
-        $done->execute([$companyId, $examId, $studentId]);
-        while ($done->nextRowset()) {}
-        $done->closeCursor();
+        // Only a LIVE attempt can be submitted. This used to complete-then-regrade whatever the latest
+        // session was, so a 'complete' arriving for an attempt that had already ended rewrote it:
+        //  - a TERMINATED attempt (violation block, admin Renew, abandoned sweep) flipped back to
+        //    COMPLETED with a freshly computed pass — undoing the block/renewal, and letting a blocked
+        //    candidate post a passing submission;
+        //  - a COMPLETED attempt was re-graded from whatever answers the new request carried, so a
+        //    candidate could re-submit different answers after seeing their result.
+        // Grading now happens BEFORE the status flip, in one row-locked transaction, so a retry after
+        // a failed first attempt still finds the session IN_PROGRESS and grades it, while a retry
+        // after a successful one is a harmless no-op.
+        $pdo->beginTransaction();
+        try {
+            $sessionStmt = $pdo->prepare('SELECT id, status FROM exam_sessions WHERE company_id = ? AND exam_id = ? AND student_id = ? ORDER BY start_time DESC LIMIT 1 FOR UPDATE');
+            $sessionStmt->execute([$companyId, $examId, $studentId]);
+            $session = $sessionStmt->fetch();
+            $sessionStmt->closeCursor();
 
-        $sessionStmt = $pdo->prepare('SELECT id FROM exam_sessions WHERE company_id = ? AND exam_id = ? AND student_id = ? ORDER BY start_time DESC LIMIT 1');
-        $sessionStmt->execute([$companyId, $examId, $studentId]);
-        $session = $sessionStmt->fetch();
+            if (!$session) {
+                $pdo->rollBack();
+                json_response(['error' => 'SESSION_NOT_FOUND'], 404);
+            }
 
-        if (!$session) {
-            json_response(['error' => 'SESSION_NOT_FOUND'], 404);
-        }
+            $sessionId = (int)$session['id'];
+            $sessionStatus = (string)($session['status'] ?? '');
 
-        $sessionId = (int)$session['id'];
+            if ($sessionStatus === 'COMPLETED') {
+                // Already submitted (e.g. a retry whose first request landed but whose response was lost).
+                $pdo->rollBack();
+                json_response(['ok' => true, 'alreadyCompleted' => true]);
+            }
+            if ($sessionStatus !== 'IN_PROGRESS') {
+                $pdo->rollBack();
+                json_response([
+                    'error' => 'SESSION_TERMINATED',
+                    'message' => 'This exam attempt has already ended and can no longer be submitted. Please contact your administrator.',
+                ], 409);
+            }
 
-        [$totalScore, $maxScore, $answeredCount] = grade_and_store_answers(
-            $pdo, $companyId, (string)$examId, $sessionId, $answers, $questionIds, $questionTimes
-        );
+            [$totalScore, $maxScore, $answeredCount] = grade_and_store_answers(
+                $pdo, $companyId, (string)$examId, $sessionId, $answers, $questionIds, $questionTimes
+            );
 
-        if ($maxScore > 0) {
-            $passed = null;
-            $passStmt = $pdo->prepare('SELECT pass_percent FROM exams WHERE id = ? AND company_id = ? LIMIT 1');
-            $passStmt->execute([$examId, $companyId]);
-            $passRow = $passStmt->fetch();
-            $passPercent = $passRow && isset($passRow['pass_percent']) ? (int)$passRow['pass_percent'] : 60;
-            if ($passPercent < 0) $passPercent = 0;
-            if ($passPercent > 100) $passPercent = 100;
-            $passed = ($totalScore / $maxScore) >= ($passPercent / 100) ? 1 : 0;
+            if ($maxScore > 0) {
+                $passed = null;
+                $passStmt = $pdo->prepare('SELECT pass_percent FROM exams WHERE id = ? AND company_id = ? LIMIT 1');
+                $passStmt->execute([$examId, $companyId]);
+                $passRow = $passStmt->fetch();
+                $passStmt->closeCursor();
+                $passPercent = $passRow && isset($passRow['pass_percent']) ? (int)$passRow['pass_percent'] : 60;
+                if ($passPercent < 0) $passPercent = 0;
+                if ($passPercent > 100) $passPercent = 100;
+                $passed = ($totalScore / $maxScore) >= ($passPercent / 100) ? 1 : 0;
 
-            $update = $pdo->prepare('UPDATE exam_sessions SET total_score = ?, max_score = ?, passed = ?, end_time = NOW(3), status = \'COMPLETED\' WHERE id = ? AND company_id = ?');
-            $update->execute([$totalScore, $maxScore, $passed, $sessionId, $companyId]);
+                $update = $pdo->prepare('UPDATE exam_sessions SET total_score = ?, max_score = ?, passed = ?, end_time = NOW(3), status = \'COMPLETED\' WHERE id = ? AND company_id = ?');
+                $update->execute([$totalScore, $maxScore, $passed, $sessionId, $companyId]);
+            }
+
+            // Flips this attempt (when nothing was gradable above) and any stray duplicate live
+            // attempt for the same candidate to COMPLETED.
+            $done = $pdo->prepare('CALL sp_complete_exam_session(?, ?, ?)');
+            $done->execute([$companyId, $examId, $studentId]);
+            while ($done->nextRowset()) {}
+            $done->closeCursor();
+
+            $pdo->commit();
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
         }
 
         // Certification is on-demand only (an admin triggers it explicitly from a passed result,
@@ -1005,6 +1110,11 @@ if ($method === 'POST') {
         // session as TERMINATED (which already doesn't block a fresh start, same as the 'terminate'
         // action) so the candidate can begin a NEW attempt while the old one stays on record,
         // preserved, for review.
+        //
+        // Staff-only (the Monitoring "Renew" button — ADMIN / SUPER_ADMIN / PROCTOR). This had no role
+        // check at all, so a candidate could "renew" their own COMPLETED attempt and retake the exam
+        // as many times as they liked, or end a classmate's live attempt.
+        $resetActorRole = require_role(['ADMIN', 'PROCTOR'], $payload);
         db_add_column_if_missing($pdo, 'exam_sessions', 'termination_reason', 'VARCHAR(255) NULL AFTER passed');
 
         $sessionStmt = $pdo->prepare("SELECT id, status
@@ -1039,8 +1149,8 @@ if ($method === 'POST') {
 
         audit_log($pdo, [
             'companyId' => $companyId,
-            'actorRole' => 'ADMIN',
-            'actorId' => $payload['actor'] ?? null,
+            'actorRole' => $resetActorRole,
+            'actorId' => get_actor_id($payload) ?? ($payload['actor'] ?? null),
             'action' => 'SESSION_RESET',
             'targetType' => 'exam',
             'targetId' => $examId,

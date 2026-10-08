@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Palette, SlidersHorizontal, LayoutGrid, RotateCcw, Upload, Check, Building2, Image as ImageIcon, Trash2, KeyRound, Loader2 } from 'lucide-react';
 import { useSettings, isValidHex, DEFAULT_SETTINGS } from '../../services/appSettings';
 import { apiPost } from '../../services/api';
@@ -39,6 +39,8 @@ const Field: React.FC<{ label: string; hint?: string; children: React.ReactNode 
 const Toggle: React.FC<{ label: string; checked: boolean; onChange: (v: boolean) => void }> = ({ label, checked, onChange }) => (
   <button
     type="button"
+    role="switch"
+    aria-checked={checked}
     onClick={() => onChange(!checked)}
     className="flex items-center justify-between w-full gap-3 rounded-lg border border-slate-200 px-3.5 py-2.5 text-left hover:border-slate-300 transition-colors"
   >
@@ -57,6 +59,13 @@ export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
   const [hexDraft, setHexDraft] = useState(branding.accent);
   const [savedFlash, setSavedFlash] = useState(false);
   const logoInputRef = useRef<HTMLInputElement>(null);
+
+  // Keep the hex text box in step with the saved accent. It was only seeded on mount, so when the
+  // company's shared settings arrived from the server afterwards (or another control changed the
+  // accent) the box kept showing the stale colour.
+  useEffect(() => {
+    setHexDraft(branding.accent);
+  }, [branding.accent]);
 
   // Self-service password reset. Super admins authenticate against the central LSC auth service,
   // so their password is not managed here — the whole section is hidden for them.
@@ -100,18 +109,28 @@ export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
   };
 
   const onLogoFile = (file: File) => {
+    // `accept` is only a hint to the file picker — "All files" lets anything through.
+    if (!['image/png', 'image/svg+xml', 'image/jpeg'].includes(file.type)) {
+      alert('Logo must be a PNG, SVG or JPEG image.');
+      return;
+    }
     if (file.size > 512 * 1024) {
       alert('Logo must be under 512 KB. Use a small PNG/SVG.');
       return;
     }
     const reader = new FileReader();
-    reader.onload = e => updateBranding({ logoDataUrl: String(e.target?.result || '') });
+    reader.onload = e => { updateBranding({ logoDataUrl: String(e.target?.result || '') }); flash(); };
+    reader.onerror = () => alert('Could not read that file. Please try another image.');
     reader.readAsDataURL(file);
   };
 
-  const num = (v: string, fallback: number) => {
+  // Parse a numeric field and keep it inside its allowed range. The inputs' min/max attributes are
+  // not enforced on typing, so e.g. a 150% pass mark or a negative limit used to be saved as the
+  // company default and pre-filled into every new exam.
+  const num = (v: string, fallback: number, min = 0, max = Number.POSITIVE_INFINITY) => {
     const n = Number(v);
-    return Number.isFinite(n) ? n : fallback;
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
   };
 
   // ADMIN / SUPER_ADMIN configure the workspace; PROCTOR / VIEWER only get the Security section.
@@ -124,7 +143,7 @@ export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
           <h2 className="lsc-title">Settings</h2>
           <p className="lsc-subtitle mt-1">
             {isFullAdmin
-              ? 'Customize branding, exam defaults, and your workspace. Changes apply instantly and are saved on this device.'
+              ? 'Customize branding, exam defaults, and your workspace. Changes apply instantly and are saved to your company workspace, so its other admins see them too.'
               : 'Manage your account security.'}
           </p>
         </div>
@@ -166,6 +185,8 @@ export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
                     key={p.hex}
                     type="button"
                     title={p.name}
+                    aria-label={`Accent colour: ${p.name}`}
+                    aria-pressed={branding.accent.toLowerCase() === p.hex.toLowerCase()}
                     onClick={() => { applyHex(p.hex); flash(); }}
                     className={`h-8 w-8 rounded-full border-2 transition-transform hover:scale-110 ${branding.accent.toLowerCase() === p.hex.toLowerCase() ? 'border-slate-900' : 'border-white shadow'}`}
                     style={{ backgroundColor: p.hex }}
@@ -176,31 +197,39 @@ export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
                     type="color"
                     value={isValidHex(branding.accent) ? branding.accent : '#1a73e8'}
                     onChange={e => { applyHex(e.target.value); flash(); }}
+                    aria-label="Pick a custom accent colour"
                     className="h-8 w-10 rounded border border-slate-200 bg-white cursor-pointer p-0.5"
                   />
                   <input
-                    className="w-28 px-2.5 py-1.5 border border-slate-300 rounded-lg outline-none text-sm font-mono"
+                    className={`w-28 px-2.5 py-1.5 border rounded-lg outline-none text-sm font-mono ${hexDraft !== '' && !isValidHex(hexDraft) ? 'border-rose-300' : 'border-slate-300'}`}
                     value={hexDraft}
                     onChange={e => applyHex(e.target.value)}
                     placeholder="#1a73e8"
+                    aria-label="Accent colour hex code"
+                    aria-invalid={hexDraft !== '' && !isValidHex(hexDraft)}
                   />
                 </div>
               </div>
             </Field>
 
-            <Field label="Logo" hint="Optional. Replaces the initials badge. PNG or SVG, under 512 KB.">
+            <Field label="Logo" hint="Optional. Replaces the initials badge. PNG, SVG or JPEG, under 512 KB.">
               <div className="flex items-center gap-3">
                 <div className="h-12 w-12 rounded-xl overflow-hidden flex items-center justify-center shrink-0 lsc-brand-mark text-sm">
                   {branding.logoDataUrl
                     ? <img src={branding.logoDataUrl} alt="Logo" className="h-full w-full object-contain bg-white" />
                     : (branding.shortName || 'LSC')}
                 </div>
-                <input ref={logoInputRef} type="file" accept="image/png,image/svg+xml,image/jpeg" className="hidden" onChange={e => e.target.files?.[0] && onLogoFile(e.target.files[0])} />
+                <input ref={logoInputRef} type="file" accept="image/png,image/svg+xml,image/jpeg" className="hidden" onChange={e => {
+                  const file = e.target.files?.[0];
+                  // Clear the input so picking the same file again (e.g. after Remove) still fires onChange.
+                  e.target.value = '';
+                  if (file) onLogoFile(file);
+                }} />
                 <button onClick={() => logoInputRef.current?.click()} className="px-3.5 py-2 lsc-button-ghost text-sm inline-flex items-center gap-2">
                   <Upload size={15} /> Upload
                 </button>
                 {branding.logoDataUrl && (
-                  <button onClick={() => updateBranding({ logoDataUrl: null })} className="px-3 py-2 text-sm text-slate-500 hover:text-red-600 inline-flex items-center gap-1.5">
+                  <button onClick={() => { updateBranding({ logoDataUrl: null }); flash(); }} className="px-3 py-2 text-sm text-slate-500 hover:text-red-600 inline-flex items-center gap-1.5">
                     <Trash2 size={15} /> Remove
                   </button>
                 )}
@@ -232,7 +261,7 @@ export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
             </Field>
             <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 flex items-start gap-2.5">
               <Building2 size={16} className="text-slate-400 mt-0.5 shrink-0" />
-              <p className="text-xs text-slate-500">Preferences are stored in this browser. Branding and exam defaults take effect immediately everywhere in the panel.</p>
+              <p className="text-xs text-slate-500">Settings on this page are shared across your company workspace (and cached in this browser). Branding and exam defaults take effect immediately everywhere in the panel.</p>
             </div>
           </div>
         </Section>
@@ -245,7 +274,7 @@ export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
                 <input type="number" min={1} className={inputCls} value={examDefaults.durationMinutes} onChange={e => { updateExamDefaults({ durationMinutes: num(e.target.value, 60) }); flash(); }} />
               </Field>
               <Field label="Pass %">
-                <input type="number" min={0} max={100} className={inputCls} value={examDefaults.passPercent} onChange={e => { updateExamDefaults({ passPercent: num(e.target.value, 40) }); flash(); }} />
+                <input type="number" min={0} max={100} className={inputCls} value={examDefaults.passPercent} onChange={e => { updateExamDefaults({ passPercent: num(e.target.value, 40, 0, 100) }); flash(); }} />
               </Field>
               <Field label="Tab switch limit">
                 <input type="number" min={0} className={inputCls} value={examDefaults.tabSwitchLimit} onChange={e => { updateExamDefaults({ tabSwitchLimit: num(e.target.value, 3) }); flash(); }} />
@@ -283,7 +312,7 @@ export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
                     type="number" min={1} max={60}
                     className={inputCls}
                     value={examDefaults.gazeAwaySeconds}
-                    onChange={e => { updateExamDefaults({ gazeAwaySeconds: num(e.target.value, 9) }); flash(); }}
+                    onChange={e => { updateExamDefaults({ gazeAwaySeconds: num(e.target.value, 9, 0, 60) }); flash(); }}
                   />
                 </div>
                 <div>
@@ -292,7 +321,7 @@ export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
                     type="number" min={1} max={60}
                     className={inputCls}
                     value={examDefaults.audioSeconds}
-                    onChange={e => { updateExamDefaults({ audioSeconds: num(e.target.value, 2) }); flash(); }}
+                    onChange={e => { updateExamDefaults({ audioSeconds: num(e.target.value, 2, 0, 60) }); flash(); }}
                   />
                 </div>
               </div>

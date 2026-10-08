@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertOctagon, Radio, Search, Users, ShieldAlert, TrendingUp, User } from 'lucide-react';
 import { apiGet, apiPost } from '../../services/api';
 import { Pagination, usePagination } from './Pagination';
@@ -36,12 +36,13 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
   const [search, setSearch] = useState('');
   const [selectedStudentId, setSelectedStudentId] = useState<string | null>(null);
   const [selectedExamId, setSelectedExamId] = useState<string | null>(null);
-  const [selectedViolationId, setSelectedViolationId] = useState<number | null>(null);
+  // Drops responses that arrive after the screen was closed.
+  const mountedRef = useRef(true);
 
   const loadAlerts = async () => {
     try {
       const data = await apiGet<{ violations: ViolationFeedItem[] }>('violations.php?limit=150');
-      if (data?.violations) {
+      if (mountedRef.current && data?.violations) {
         setAlerts(data.violations);
       }
     } catch (e) {
@@ -52,7 +53,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
   const loadAccessRequests = async () => {
     try {
       const data = await apiGet<{ requests: AccessRequestRecord[] }>('access_requests.php?limit=150');
-      if (data?.requests) {
+      if (mountedRef.current && data?.requests) {
         setAccessRequests(data.requests);
       }
     } catch (e) {
@@ -61,19 +62,37 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
   };
 
   useEffect(() => {
-    let mounted = true;
+    mountedRef.current = true;
+    let inFlight = false;
     const load = async () => {
-      if (!mounted) return;
-      await loadAlerts();
-      await loadAccessRequests();
+      // Skip a tick while the previous refresh is still running (the violation feed carries base64
+      // snapshots and can be slow), and while the tab is hidden.
+      if (!mountedRef.current || inFlight || document.hidden) return;
+      inFlight = true;
+      try {
+        await loadAlerts();
+        await loadAccessRequests();
+      } finally {
+        inFlight = false;
+      }
     };
-    load();
+    void load();
     const id = window.setInterval(load, 10000);
+    document.addEventListener('visibilitychange', load);
     return () => {
-      mounted = false;
+      mountedRef.current = false;
       window.clearInterval(id);
+      document.removeEventListener('visibilitychange', load);
     };
   }, []);
+
+  // Escape closes the snapshot viewer.
+  useEffect(() => {
+    if (!snapshotView) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setSnapshotView(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [snapshotView]);
 
   // The feed reports INCIDENTS, not raw detector pings. A candidate whose webcam feeds a placeholder
   // image for 19 minutes generates 100+ NO_FACE rows; listing each one buried the events that
@@ -212,7 +231,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
         a.studentId.toLowerCase().includes(term)
       );
     });
-  }, [alertsSorted, search, exams, students, selectedStudentId]);
+  }, [alertsSorted, search, exams, students, selectedStudentId, selectedExamId]);
 
   // Every long list on this screen pages independently — the feed and the risk panels each grow
   // without bound on a busy exam day.
@@ -254,6 +273,9 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
 
   const handleAccessDecision = async (requestId: number, decision: 'GRANTED' | 'REVOKED') => {
     if (requestBusyId !== null) return;
+    // A decision is final in this UI (both buttons lock once the request leaves PENDING), so make a
+    // stray click on Revoke — which sits right next to Grant — recoverable.
+    if (decision === 'REVOKED' && !window.confirm('Revoke this access request? The student will not be allowed to continue with this request.')) return;
     setRequestBusyId(requestId);
     try {
       await apiPost('access_requests.php', {
@@ -287,6 +309,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
           <input
             type="text"
             placeholder="Search student, exam, or type..."
+            aria-label="Search student, exam, or type"
             className="pl-9 pr-4 py-2 border border-slate-200 rounded-lg outline-none w-full lg:w-72 text-sm bg-white"
             value={search}
             onChange={e => setSearch(e.target.value)}
@@ -296,6 +319,7 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
           <select
             value={selectedExamId || 'ALL'}
             onChange={e => setSelectedExamId(e.target.value === 'ALL' ? null : e.target.value)}
+            aria-label="Filter by exam"
             className="px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none bg-white"
           >
             <option value="ALL">All Exams</option>
@@ -618,7 +642,11 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
               );
             })}
             {filtered.length === 0 && (
-              <p className="text-xs text-slate-400 text-center py-6">No security alerts yet.</p>
+              <p className="text-xs text-slate-400 text-center py-6">
+                {alertsSorted.length > 0 && (search.trim() || selectedStudentId || selectedExamId)
+                  ? 'No alerts match the current filters.'
+                  : 'No security alerts yet.'}
+              </p>
             )}
           </div>
           <Pagination state={feedPaging} label="alerts" />
@@ -626,13 +654,20 @@ export const SecurityFeed: React.FC<{ exams: Exam[]; students: Student[] }> = ({
       </div>
 
       {snapshotView && (
-        <div className="fixed inset-0 z-[200] bg-slate-900/50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl shadow-2xl max-w-3xl w-full overflow-hidden">
+        <div className="fixed inset-0 z-[200] bg-slate-900/50 flex items-center justify-center p-4" onClick={() => setSnapshotView(null)}>
+          <div
+            className="bg-white rounded-xl shadow-2xl max-w-3xl w-full overflow-hidden max-h-[92vh] overflow-y-auto"
+            onClick={e => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Violation snapshot"
+          >
             <div className="flex items-center justify-between p-4 border-b border-slate-200">
               <h4 className="font-semibold text-slate-800">Violation Snapshot</h4>
               <button
                 onClick={() => setSnapshotView(null)}
                 className="text-sm text-slate-500 hover:text-slate-800"
+                title="Close (Esc)"
               >
                 Close
               </button>

@@ -3,8 +3,11 @@ import { Question, QuestionType, isManualGraded } from '../types';
 export type LocalGrade = 'correct' | 'incorrect' | 'pending' | 'unanswered';
 
 const norm = (s: any): string => String(s ?? '').trim().toLowerCase();
+// Whitespace-only counts as empty, matching the server grader (it trims NUMERIC/DATE/TIME answers
+// and treats '' as unanswered) — otherwise " " previewed as Number(" ") === 0, i.e. "correct" when
+// the key is 0, while the server recorded it as unanswered.
 const isEmpty = (v: any): boolean =>
-  v === undefined || v === null || v === '' ||
+  v === undefined || v === null || (typeof v === 'string' && v.trim() === '') ||
   (Array.isArray(v) && v.length === 0) ||
   (typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0);
 
@@ -26,15 +29,21 @@ export const gradeLocalAnswer = (q: Question, answer: any): LocalGrade => {
       ok = Number(answer) === q.correctOptionIndex;
       break;
     case QuestionType.MULTI_SELECT: {
-      const picked = [...(answer as number[])].map(Number).sort((a, b) => a - b);
-      const exp = [...(key.correctIndices || [])].map(Number).sort((a, b) => a - b);
+      // Array guard: spreading a non-array saved answer (e.g. an MCQ index left over after the
+      // question's type was edited) threw and crashed the result preview. De-dup like the server.
+      const picked = Array.from(new Set((Array.isArray(answer) ? answer : []).map(Number))).sort((a, b) => a - b);
+      const exp = Array.from(new Set((key.correctIndices || []).map(Number))).sort((a, b) => a - b);
       ok = picked.length === exp.length && picked.every((v, i) => v === exp[i]);
       break;
     }
     case QuestionType.FILL_BLANK: {
       const blanks = key.blanks || [];
-      ok = blanks.length > 0 && blanks.every((b, i) =>
-        b.accepted.map(norm).includes(norm((answer as string[])[i])));
+      const filled = Array.isArray(answer) ? answer : [];
+      // Server parity: an empty blank is never correct, even if '' slipped into an accepted list.
+      ok = blanks.length > 0 && blanks.every((b, i) => {
+        const given = norm(filled[i]);
+        return given !== '' && (b.accepted || []).map(norm).includes(given);
+      });
       break;
     }
     case QuestionType.NUMERIC: {

@@ -60,11 +60,18 @@ def main() -> None:
 
     next_sample_ms = 0.0
     last_pos_ms = 0.0
+    # Counters so a run that analyzed nothing is reported as a failure rather than as a clean
+    # "0 violations found" (recheck_recording.php would otherwise mark it DONE).
+    frames_read = 0
+    sampled = 0
+    analyzed = 0
+    last_error = ""
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+        frames_read += 1
         pos_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
         if pos_ms <= 0:
             pos_ms = last_pos_ms + (1000.0 / 25.0)
@@ -82,6 +89,7 @@ def main() -> None:
         if descriptor:
             payload["enrollDescriptor"] = descriptor
 
+        sampled += 1
         try:
             req = urllib.request.Request(
                 AI_ANALYZE_URL,
@@ -91,8 +99,10 @@ def main() -> None:
             )
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-        except Exception:
+        except Exception as exc:
+            last_error = str(exc)
             continue
+        analyzed += 1
 
         for v in data.get("violations", []) or []:
             vtype = v.get("type")
@@ -112,6 +122,14 @@ def main() -> None:
             })
 
     cap.release()
+
+    if frames_read == 0:
+        print(json.dumps({"error": "no decodable frames in the camera recording"}))
+        return
+    if sampled > 0 and analyzed == 0:
+        detail = f": {last_error}" if last_error else ""
+        print(json.dumps({"error": f"AI analysis service failed for every sampled frame ({sampled}){detail}"}))
+        return
 
     # Second pass: re-seek to each retained violation's exact offset for a clean evidence frame
     # (the sampling pass' frames aren't kept, to avoid holding hundreds of JPEGs in memory).

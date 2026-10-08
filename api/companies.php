@@ -24,6 +24,20 @@ function normalize_company_payload(array $payload): array {
     ];
 }
 
+/**
+ * companies.code is UNIQUE. Without this check a clashing code surfaced as a raw "Duplicate entry"
+ * 500 on the super-admin screen instead of a clear message.
+ */
+function assert_company_code_free(PDO $pdo, string $code, int $exceptId): void {
+    $stmt = $pdo->prepare('SELECT id FROM companies WHERE code = ? AND id <> ? LIMIT 1');
+    $stmt->execute([$code, $exceptId]);
+    $clash = $stmt->fetch();
+    $stmt->closeCursor();
+    if ($clash) {
+        json_response(['error' => "A company with the code '{$code}' already exists. Choose a different code."], 409);
+    }
+}
+
 function company_table_count(PDO $pdo, string $table, int $companyId, string $extraWhere = '', array $extraParams = []): int {
     if (!db_table_exists($pdo, $table)) {
         return 0;
@@ -171,6 +185,7 @@ if ($method === 'POST') {
         if (!in_array($company['status'], ['ACTIVE', 'INACTIVE'], true)) {
             $company['status'] = 'ACTIVE';
         }
+        assert_company_code_free($pdo, $company['code'], 0);
 
         $stmt = $pdo->prepare("INSERT INTO companies (code, name, contact_name, contact_email, status, notes)
                                VALUES (?, ?, ?, ?, ?, ?)");
@@ -223,6 +238,14 @@ if ($method === 'POST') {
         if (!in_array($company['status'], ['ACTIVE', 'INACTIVE'], true)) {
             $company['status'] = 'ACTIVE';
         }
+        $existsStmt = $pdo->prepare('SELECT id FROM companies WHERE id = ? LIMIT 1');
+        $existsStmt->execute([$companyId]);
+        $companyExists = (bool)$existsStmt->fetch();
+        $existsStmt->closeCursor();
+        if (!$companyExists) {
+            json_response(['error' => 'Company not found.'], 404);
+        }
+        assert_company_code_free($pdo, $company['code'], $companyId);
 
         $stmt = $pdo->prepare("UPDATE companies
                                SET code = ?, name = ?, contact_name = ?, contact_email = ?, status = ?, notes = ?

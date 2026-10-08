@@ -191,20 +191,24 @@ export const PermissionGuide: React.FC<PermissionGuideProps> = ({
   const hardwareIssue = denied && (problem === 'no-device' || problem === 'device-busy');
   const insecure = denied && problem === 'insecure';
   const wrongSurface = denied && problem === 'wrong-surface';
+  // The missing/busy device can be the microphone: a mic-only exam used to be told "No Camera
+  // Detected" and sent hunting for a webcam it doesn't even need.
+  const deviceNoun = needsCamera && needsMicrophone ? 'camera or microphone' : needsCamera ? 'camera' : needsMicrophone ? 'microphone' : 'camera';
+  const deviceTitle = needsCamera && needsMicrophone ? 'Camera or Microphone' : needsCamera ? 'Camera' : needsMicrophone ? 'Microphone' : 'Camera';
 
   const failureTitle = wrongSurface
     ? 'Wrong Screen Shared'
     : hardwareIssue
-    ? (problem === 'device-busy' ? 'Your Camera Is In Use' : 'No Camera Detected')
+    ? (problem === 'device-busy' ? `Your ${deviceTitle} Is In Use` : `No ${deviceTitle} Detected`)
     : insecure ? 'Connection Not Secure'
     : 'Permissions Were Blocked';
 
   const failureSubtitle = wrongSurface
     ? 'You shared a window or browser tab. This exam requires your entire screen to be shared.'
     : problem === 'device-busy'
-    ? 'Another app is holding your camera open. Close it, then try again.'
+    ? `Another app is holding your ${deviceNoun} open. Close it, then try again.`
     : problem === 'no-device'
-      ? 'This device has no working camera, or it is unplugged/disabled.'
+      ? `This device has no working ${deviceNoun}, or it is unplugged/disabled.`
       : insecure
         ? 'Your browser only allows camera access over a secure (https) connection.'
         : `Your ${browserLabel[browser]} blocked access. Follow the steps below to re-enable it.`;
@@ -217,14 +221,20 @@ export const PermissionGuide: React.FC<PermissionGuideProps> = ({
 
   return (
     <div className="fixed inset-0 z-[200] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg my-8 border border-slate-200 overflow-hidden">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="pg-permission-title"
+        aria-describedby="pg-permission-desc"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-lg my-8 border border-slate-200 overflow-hidden"
+      >
         {/* Header */}
         <div className="bg-gradient-to-br from-[var(--lsc-primary,#1d4ed8)] to-blue-600 px-6 py-5 text-white text-center">
           <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-white/15 mb-2">
             <ShieldCheck size={26} />
           </div>
-          <h2 className="text-xl font-bold">{denied ? failureTitle : 'Enable Your Devices'}</h2>
-          <p className="text-blue-100 text-sm mt-1">
+          <h2 id="pg-permission-title" className="text-xl font-bold">{denied ? failureTitle : 'Enable Your Devices'}</h2>
+          <p id="pg-permission-desc" className="text-blue-100 text-sm mt-1">
             {denied
               ? failureSubtitle
               : 'This proctored exam needs access to the following. Your feed is used only for monitoring.'}
@@ -260,7 +270,7 @@ export const PermissionGuide: React.FC<PermissionGuideProps> = ({
           <ol className="mt-4 space-y-2 text-sm text-slate-600">
             {!denied ? (
               <>
-                <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">1.</span> Tap <strong>“{busy ? 'Requesting…' : 'Allow & Continue'}”</strong> below.</li>
+                <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">1.</span> Tap <strong>“Allow &amp; Continue”</strong> below.</li>
                 <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">2.</span> When {browserLabel[browser]} shows a popup, choose <strong>Allow</strong>.</li>
                 {needsScreen && (
                   <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">3.</span> For screen sharing, pick <strong>Entire Screen</strong> and press <strong>Share</strong>.</li>
@@ -275,13 +285,13 @@ export const PermissionGuide: React.FC<PermissionGuideProps> = ({
             ) : hardwareIssue ? (
               problem === 'device-busy' ? (
                 <>
-                  <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">1.</span> Close any app using the camera (<strong>Zoom, Teams, Meet, OBS</strong>) — including other browser tabs.</li>
+                  <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">1.</span> Close any app using the {deviceNoun} (<strong>Zoom, Teams, Meet, OBS</strong>) — including other browser tabs.</li>
                   <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">2.</span> Press <strong>Try Again</strong>. If it still fails, reboot and reopen this link.</li>
                 </>
               ) : (
                 <>
-                  <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">1.</span> Check the webcam is <strong>plugged in</strong> and not covered or disabled.</li>
-                  <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">2.</span> If it is built in, make sure no privacy shutter or hardware switch is off.</li>
+                  <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">1.</span> Check the {needsCamera ? 'webcam' : 'microphone'}{needsCamera && needsMicrophone ? ' and microphone are' : ' is'} <strong>plugged in</strong> and not covered, muted or disabled.</li>
+                  <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">2.</span> If it is built in, make sure no privacy shutter, mute key or hardware switch is off.</li>
                   <li className="flex gap-2"><span className="font-bold text-[var(--lsc-primary,#1d4ed8)]">3.</span> Press <strong>Try Again</strong>.</li>
                 </>
               )
@@ -290,6 +300,14 @@ export const PermissionGuide: React.FC<PermissionGuideProps> = ({
             ) : (
               device.isIOS ? (
                 <li className="flex gap-2 items-start"><Lock size={15} className="mt-0.5 shrink-0 text-amber-500" /> iOS remembers your choice. Update it in <strong>Settings → Safari</strong> as shown above, then return and retry.</li>
+              ) : device.isMobile ? (
+                // Android browsers have no address-bar camera icon — the "right of the address bar"
+                // desktop instruction sent phone users looking for something that isn't there.
+                <li className="flex gap-2 items-start"><Lock size={15} className="mt-0.5 shrink-0 text-amber-500" /> Tap the <strong>lock / settings icon</strong> at the left of the address bar, open <strong>Permissions</strong>, allow the camera and microphone, reload the page, then retry.</li>
+              ) : browser === 'firefox' ? (
+                <li className="flex gap-2 items-start"><Lock size={15} className="mt-0.5 shrink-0 text-amber-500" /> Click the <strong>crossed-out camera / microphone icon</strong> at the left of the address bar, clear the block, reload the page, then retry.</li>
+              ) : browser === 'safari' ? (
+                <li className="flex gap-2 items-start"><Lock size={15} className="mt-0.5 shrink-0 text-amber-500" /> Open the <strong>Safari</strong> menu → <strong>Settings for This Website…</strong>, set Camera and Microphone to <strong>Allow</strong>, reload the page, then retry.</li>
               ) : (
                 <li className="flex gap-2 items-start"><Lock size={15} className="mt-0.5 shrink-0 text-amber-500" /> Click the <strong>camera icon</strong> at the right of the address bar, choose <strong>Always allow</strong>, reload the page, then retry.</li>
               )
@@ -298,6 +316,7 @@ export const PermissionGuide: React.FC<PermissionGuideProps> = ({
 
           {/* CTA */}
           <button
+            type="button"
             onClick={onGrant}
             disabled={busy}
             className="mt-5 w-full py-3 bg-[var(--lsc-primary,#1d4ed8)] text-white rounded-lg hover:brightness-110 font-semibold flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed transition"

@@ -244,6 +244,11 @@ _PUBLIC_AI_PATHS = {"/health", "/analyze", "/enroll", "/verify"}
 
 @app.middleware("http")
 async def _only_inference_paths(request: Request, call_next):  # noqa: ANN001
+    # Callers are api/ai_proxy.php (candidate exam token required) and local scripts, all on this
+    # host and without forwarding headers. nginx's old /api/ai/ pass-through adds them, so a request
+    # carrying them came straight from the internet with no token: refuse it.
+    if request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip"):
+        return JSONResponse({"error": "Forbidden."}, status_code=403)
     if request.url.path not in _PUBLIC_AI_PATHS:
         return JSONResponse({"error": "Not found."}, status_code=404)
     return await call_next(request)

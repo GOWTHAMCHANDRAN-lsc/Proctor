@@ -5,6 +5,18 @@
 
 const AI_BASE = '/api/ai_proxy.php';
 
+// api/ai_proxy.php only serves candidates with a signed exam link (same token services/api.ts sends).
+const aiHeaders = (): Record<string, string> => {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  try {
+    const token = typeof window !== 'undefined' ? localStorage.getItem('pg_student_exam_token') : null;
+    if (token) headers['X-Exam-Token'] = token;
+  } catch {
+    // storage unavailable — the proxy will refuse, and the caller treats that as "no result"
+  }
+  return headers;
+};
+
 interface AnalyzeResult {
   faceCount: number;
   lookingAway: boolean;
@@ -60,7 +72,7 @@ async function _post<T>(endpoint: string, body: unknown, timeoutMs = 8000): Prom
   try {
     const res = await fetch(`${AI_BASE}?endpoint=${endpoint}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: aiHeaders(),
       body: JSON.stringify(body),
       signal: controller.signal,
     });

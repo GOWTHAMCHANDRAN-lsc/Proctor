@@ -588,7 +588,11 @@ if ($method === 'POST') {
         // LSC auth service so the server — not the browser — decides the minted token's role/company.
         $loginEmail = strtolower(trim((string)($payload['email'] ?? '')));
         $loginPassword = (string)($payload['password'] ?? '');
-        $systemId = trim((string)($payload['systemId'] ?? $payload['system_id'] ?? '3'));
+        // The LSC auth service hosts several systems; which one the password is checked against is
+        // OUR setting (the same AUTH_SYSTEM_ID new accounts are registered under), never the
+        // browser's. A client-chosen system let a password from any other LSC system — possibly one
+        // where an account can be registered for an email you don't own — sign in here as that email.
+        $systemId = trim((string)($env['AUTH_SYSTEM_ID'] ?? '3'));
         $ip = (string)($_SERVER['REMOTE_ADDR'] ?? '');
         ensure_login_attempts_table($pdo);
         if (login_rate_limited($pdo, $ip, $loginEmail)) {

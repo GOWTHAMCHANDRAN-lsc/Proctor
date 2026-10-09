@@ -419,7 +419,6 @@ const AdminAppInner: React.FC = () => {
   const [isAuthed, setIsAuthed] = useState(initialAuthed);
   const [adminEmail, setAdminEmail] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
-  const [adminSystemId] = useState('3');
   const [adminRole, setAdminRole] = useState<AdminConsoleRole>(initialRole);
   const [adminError, setAdminError] = useState('');
   const [adminLoading, setAdminLoading] = useState(false);
@@ -615,7 +614,6 @@ const AdminAppInner: React.FC = () => {
       action: 'EXTERNAL_LOGIN',
       email,
       password: adminPassword,
-      systemId: adminSystemId.trim() || '3',
     });
 
     if (!res?.ok || !res.token) {

@@ -108,6 +108,7 @@ if ($method === 'POST') {
     if ($examId === '' || $studentId === '') {
         json_response(['error' => 'examId and studentId are required.'], 400);
     }
+    require_candidate_or_staff($examId, $studentId, (int)$companyId);
 
     // The exam's "Collect feedback" switch (exams.feedback_enabled, added by exams.php; absent = on).
     if (db_column_exists($pdo, 'exams', 'feedback_enabled')) {

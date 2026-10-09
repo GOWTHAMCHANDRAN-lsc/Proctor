@@ -117,6 +117,22 @@ function safe_path_segment($value): string {
     return $clean === '' ? 'unknown' : $clean;
 }
 
+// Recording uploads: only real video types are stored or served (a client-chosen "text/html" was
+// served back as a web page on this origin), and each stream is capped so uploads can't fill the disk.
+const RECORDING_ALLOWED_MIME = ['video/webm', 'video/mp4', 'video/x-matroska'];
+const RECORDING_MAX_STREAM_BYTES = 4294967296; // 4 GB per stream
+const RECORDING_MAX_PER_SESSION = 30;
+
+/** The upload's media type reduced to an allowed video type (codec parameters kept). */
+function recording_safe_mime(?string $mime): string {
+    $raw = strtolower(trim((string)$mime));
+    $base = trim(explode(';', $raw, 2)[0]);
+    if (!in_array($base, RECORDING_ALLOWED_MIME, true)) {
+        return 'video/webm';
+    }
+    return preg_match('/^[a-z0-9\/.+\-]+(\s*;\s*codecs="?[a-z0-9.,\s\-]*"?)?$/', $raw) === 1 ? $raw : $base;
+}
+
 function file_ext_from_mime(?string $mime): string {
     $m = strtolower(trim((string)$mime));
     if (strpos($m, 'mp4') !== false) return 'mp4';
@@ -156,7 +172,10 @@ function stream_file_with_range(string $path, string $mime): void {
 
     $length = $size > 0 ? ($end - $start + 1) : 0;
     http_response_code($status);
-    header('Content-Type: ' . $mime);
+    // Stored types are client-supplied; only ever serve a video type, and forbid sniffing.
+    header('Content-Type: ' . recording_safe_mime($mime));
+    header('X-Content-Type-Options: nosniff');
+    header("Content-Security-Policy: default-src 'none'; media-src 'self'; sandbox");
     header('Accept-Ranges: bytes');
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
     header('Pragma: no-cache');
@@ -437,6 +456,15 @@ if ($method === 'POST') {
         if ($examId === '' || $studentId === '') {
             json_response(['error' => 'examId and studentId are required.'], 400);
         }
+        require_candidate_or_staff($examId, $studentId, (int)$companyId);
+        // Only during a live attempt, and a bounded number per attempt.
+        $live = db_scalar_int($pdo, "SELECT COUNT(*) FROM exam_sessions WHERE company_id = ? AND exam_id = ? AND student_id = ? AND status = 'IN_PROGRESS'", [$companyId, $examId, $studentId]);
+        if ($live === 0) {
+            json_response(['error' => 'NO_ACTIVE_SESSION', 'message' => 'There is no exam in progress to record.'], 409);
+        }
+        if ($sessionId !== null && db_scalar_int($pdo, 'SELECT COUNT(*) FROM recording_sessions WHERE session_id = ? AND company_id = ?', [$sessionId, $companyId]) >= RECORDING_MAX_PER_SESSION) {
+            json_response(['error' => 'RECORDING_LIMIT', 'message' => 'Too many recordings for this attempt.'], 429);
+        }
 
         $stmt = $pdo->prepare("INSERT INTO recording_sessions (company_id, exam_id, student_id, session_id, status, started_at)
                                VALUES (?, ?, ?, ?, 'RECORDING', NOW(3))");
@@ -463,7 +491,7 @@ if ($method === 'POST') {
         }
         $recordingId = isset($_POST['recordingId']) ? (int)$_POST['recordingId'] : (int)($payload['recordingId'] ?? 0);
         $streamType = strtolower(trim((string)($_POST['streamType'] ?? ($payload['streamType'] ?? ''))));
-        $mimeType = trim((string)($_POST['mimeType'] ?? ($payload['mimeType'] ?? 'video/webm')));
+        $mimeType = recording_safe_mime((string)($_POST['mimeType'] ?? ($payload['mimeType'] ?? 'video/webm')));
         if ($recordingId <= 0 || !in_array($streamType, ['camera', 'screen', 'combined'], true)) {
             json_response(['error' => 'recordingId and valid streamType are required.'], 400);
         }
@@ -480,6 +508,12 @@ if ($method === 'POST') {
         $rsStmt->closeCursor();
         if (!$session) {
             json_response(['error' => 'RECORDING_NOT_FOUND'], 404);
+        }
+        // Only that candidate (or staff) may add to their recording — ids are sequential.
+        require_candidate_or_staff((string)$session['exam_id'], (string)$session['student_id'], (int)$companyId);
+        $existingBytes = db_scalar_int($pdo, 'SELECT COALESCE(SUM(size_bytes), 0) FROM recording_streams WHERE recording_session_id = ? AND stream_type = ?', [$recordingId, $streamType]);
+        if ($existingBytes + (int)($_FILES['chunk']['size'] ?? 0) > RECORDING_MAX_STREAM_BYTES) {
+            json_response(['error' => 'RECORDING_TOO_LARGE', 'message' => 'This recording has reached its size limit.'], 413);
         }
 
         $ext = file_ext_from_mime($mimeType);
@@ -536,6 +570,14 @@ if ($method === 'POST') {
         if ($recordingId <= 0) {
             json_response(['error' => 'recordingId is required.'], 400);
         }
+        $ownStmt = $pdo->prepare('SELECT exam_id, student_id FROM recording_sessions WHERE id = ? AND company_id = ? LIMIT 1');
+        $ownStmt->execute([$recordingId, $companyId]);
+        $ownRow = $ownStmt->fetch();
+        $ownStmt->closeCursor();
+        if (!$ownRow) {
+            json_response(['error' => 'RECORDING_NOT_FOUND'], 404);
+        }
+        require_candidate_or_staff((string)$ownRow['exam_id'], (string)$ownRow['student_id'], (int)$companyId);
 
         $stmt = $pdo->prepare("UPDATE recording_sessions
                                SET status = ?, ended_at = NOW(3), duration_sec = ?

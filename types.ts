@@ -89,6 +89,11 @@ export interface Question {
   answerKey?: AnswerKey | null;
   // Column/bucket/item data for MATCHING, ORDERING, DRAG_DROP.
   matchOptions?: MatchOptions | null;
+  /**
+   * Candidate view only (exam.candidateView): the number of blanks in a FILL_BLANK question. The
+   * candidate's copy carries no answerKey, so this replaces answerKey.blanks.length.
+   */
+  blankCount?: number;
   marks: number;
   /**
    * Marks deducted when this question is answered but wrong (auto-graded types only).
@@ -123,6 +128,15 @@ export interface NotificationConfig {
 
 export interface Exam {
   id: string;
+  /**
+   * True on the candidate's copy when the server sent the key-free view (api/_bootstrap.php
+   * exam_candidate_question_view): no correctOptionIndex / answerKey, and MATCHING / ORDERING /
+   * DRAG_DROP lists in a per-candidate order. Answers then go back with answerSpace "candidate-v1"
+   * and the result comes from the server.
+   */
+  candidateView?: boolean;
+  /** Candidate's copy before Start: the questions are withheld until the attempt is running. */
+  questionsLocked?: boolean;
   title: string;
   durationMinutes: number;
   startTime: number; // Timestamp in ms
@@ -711,6 +725,18 @@ export interface WhatsAppStatus {
 }
 
 /** POST api/whatsapp.php {action:'SEND_EXAM_NOTICE'} result. */
+/** What the server tells a candidate after submitting (sessions.php candidate_result_summary). */
+export interface CandidateResult {
+  score: number;
+  maxScore: number;
+  passed: boolean;
+  passPercent: number;
+  /** Answered questions waiting for manual marking. */
+  pending: number;
+  /** Per served question: never the correct answer, only how this candidate's answer was marked. */
+  grades: Record<string, 'correct' | 'incorrect' | 'pending' | 'unanswered'>;
+}
+
 export interface WhatsAppSendSummary {
   sent: number;
   failed: number;

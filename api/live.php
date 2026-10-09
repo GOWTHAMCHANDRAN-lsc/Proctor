@@ -213,6 +213,7 @@ if ($method === 'POST') {
         if ($sessionId <= 0 || $examId === '' || $studentId === '') {
             json_response(['ok' => false, 'error' => 'sessionId, examId and studentId are required.'], 400);
         }
+        require_candidate_or_staff($examId, $studentId, (int)$companyId);
 
         // The session must belong to this company AND to the exam/candidate the push claims to be
         // (defence in depth). Session ids are sequential, so checking the company alone let any
@@ -319,6 +320,16 @@ if ($method === 'POST') {
         if ($schemaReady) {
             $sessionId = isset($payload['sessionId']) && is_numeric($payload['sessionId']) ? (int)$payload['sessionId'] : 0;
             if ($sessionId > 0) {
+                // Only that candidate (or staff) may take their tile off the wall — session ids are
+                // sequential, so this used to let anyone blank the whole wall.
+                $own = $pdo->prepare('SELECT exam_id, student_id FROM exam_sessions WHERE id = ? AND company_id = ? LIMIT 1');
+                $own->execute([$sessionId, $companyId]);
+                $ownRow = $own->fetch();
+                $own->closeCursor();
+                if (!$ownRow) {
+                    json_response(['ok' => true]);
+                }
+                require_candidate_or_staff((string)$ownRow['exam_id'], (string)$ownRow['student_id'], (int)$companyId);
                 $del = $pdo->prepare("DELETE FROM live_proctor_frames WHERE session_id = ? AND company_id = ?");
                 $del->execute([$sessionId, $companyId]);
             }

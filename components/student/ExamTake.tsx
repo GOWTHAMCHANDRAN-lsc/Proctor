@@ -179,6 +179,11 @@ interface ExamTakeProps {
   exam: Exam;
   student: Student;
   sessionId?: number;
+  // From the server's start/reconnect response: seconds since this attempt began, and the
+  // violations already recorded for it. The clock and counters otherwise live only in this
+  // browser's storage, so clearing it used to restart the clock and zero the counters.
+  serverElapsedSeconds?: number;
+  serverViolationCounts?: Record<string, number>;
   onFinish: (data: {
     answers: Record<string, string | number>;
     violations: ViolationLog[];
@@ -196,7 +201,12 @@ interface ExamTakeProps {
   }) => void;
 }
 
-export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, onFinish }) => {
+// Seconds of paused-clock credit (exam blocked) a resumed attempt may carry beyond the server's
+// elapsed time. Kept below the server's answer grace (sessions.php SESSION_ANSWER_GRACE_MINUTES = 20)
+// so the page always submits while the server still accepts answers.
+const RESUME_PAUSE_ALLOWANCE_SECONDS = 15 * 60;
+
+export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, serverElapsedSeconds = 0, serverViolationCounts, onFinish }) => {
   // --- LOGIC SECTION ---
 
   const seedFromString = (value: string) => {
@@ -293,7 +303,10 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   // Values are per-type: number (option index), number[] (multi-select/ordering),
   // string (text/numeric/date/time), or a Record map (matching/drag-drop).
   const [answers, setAnswers] = useState<Record<string, any>>({});
-  const [timeLeft, setTimeLeft] = useState(() => Math.max(0, Math.round((Number(exam.durationMinutes) || 0) * 60)));
+  const examDurationSeconds = Math.max(0, Math.round((Number(exam.durationMinutes) || 0) * 60));
+  const safeServerElapsed = Math.max(0, Math.floor(Number(serverElapsedSeconds) || 0));
+  // A reconnect continues the attempt's own clock (server time), not a fresh full duration.
+  const [timeLeft, setTimeLeft] = useState(() => Math.max(0, examDurationSeconds - safeServerElapsed));
   const [violations, setViolations] = useState<ViolationLog[]>([]);
   const [questionTimes, setQuestionTimes] = useState<Record<string, number>>({});
   const questionTimerRef = useRef<number>(Date.now());
@@ -2574,7 +2587,10 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     setCurrentQuestionIdx(nextQuestionIdx);
     setMinSectionIdx(nextMinSectionIdx);
     if (typeof payload.timeLeft === 'number') {
-      setTimeLeft(Math.max(0, payload.timeLeft - elapsed));
+      // The saved value lives in this browser and could be edited; the server's elapsed time bounds
+      // it (plus a pause allowance for time the exam was blocked).
+      const ceiling = Math.max(0, examDurationSeconds - safeServerElapsed + RESUME_PAUSE_ALLOWANCE_SECONDS);
+      setTimeLeft(Math.max(0, Math.min(examDurationSeconds, ceiling, payload.timeLeft - elapsed)));
     }
     if (typeof payload.sectionTimeLeft === 'number') {
       const nextSectionTime = Math.max(0, payload.sectionTimeLeft - elapsed);
@@ -2684,6 +2700,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
         answers: answersRef.current,
         questionIds,
         questionTimes: questionTimesRef.current,
+        // Structured answers are in the candidate view's order; the server maps them back.
+        ...(exam.candidateView ? { answerSpace: 'candidate-v1' } : {}),
       }).catch(() => {});
     };
     const interval = window.setInterval(saveToServer, 20000);
@@ -2927,6 +2945,30 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
     IDENTITY_CHANGE: ['camera'],
     SUSPICIOUS_BEHAVIOR: ['camera'],
   };
+
+  // Reconnect: start the violation counters from what the server already recorded for this attempt
+  // (whichever is higher), so clearing browser storage no longer resets them to zero.
+  useEffect(() => {
+    if (!serverViolationCounts) return;
+    const categoryTotals: Partial<Record<ViolationCategory, number>> = {};
+    (Object.keys(violationTypeCountsRef.current) as ViolationLog['type'][]).forEach(type => {
+      const fromServer = Math.max(0, Math.floor(Number(serverViolationCounts[type]) || 0));
+      if (fromServer > violationTypeCountsRef.current[type]) {
+        violationTypeCountsRef.current[type] = fromServer;
+      }
+      (violationCategoriesByType[type] || []).forEach(category => {
+        categoryTotals[category] = (categoryTotals[category] || 0) + fromServer;
+      });
+    });
+    (Object.keys(categoryTotals) as ViolationCategory[]).forEach(category => {
+      if ((categoryTotals[category] || 0) > violationCategoryCountsRef.current[category]) {
+        violationCategoryCountsRef.current[category] = categoryTotals[category] || 0;
+      }
+    });
+    setTabSwitchCount(violationCategoryCountsRef.current.tabSwitch);
+    // Mount only: the server snapshot is taken once, at start/reconnect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const buildViolationSummary = (trigger?: { category?: ViolationCategory; type?: ViolationLog['type'] }) => ({
     total: Object.values(violationTypeCountsRef.current).reduce<number>((sum, val) => sum + Number(val), 0),
@@ -3264,6 +3306,9 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
   const orderingInitial = useMemo(() => {
     if (!currentQ) return [];
     const n = currentQ.matchOptions?.items?.length || 0;
+    // Candidate view: the server already sent the items in a per-candidate order that is never the
+    // answer (and this copy has no answer key to check against), so start from that order.
+    if (exam.candidateView) return rangeArr(n);
     const shuffled = seededShuffle(rangeArr(n), currentQ.id + ':o');
     // Never START on the correct order. An untouched ORDERING question stores no answer (it is
     // graded as unanswered), so when the seeded shuffle happened to land on the answer key — 50% of
@@ -3432,11 +3477,12 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, on
 
     // Fill in the blank(s).
     if (q.type === QuestionType.FILL_BLANK) {
-      const blanks = q.answerKey?.blanks || [];
+      // The candidate view carries only the blank count (no accepted answers).
+      const blankCount = q.blankCount ?? q.answerKey?.blanks?.length ?? 0;
       const arr: string[] = Array.isArray(val) ? val : [];
       return (
         <div className="space-y-3">
-          {blanks.map((_, i) => (
+          {Array.from({ length: blankCount }).map((_, i) => (
             <div key={i} className="flex items-center gap-3">
               <span className="text-sm text-slate-500 w-16 shrink-0">Blank {i + 1}</span>
               <input

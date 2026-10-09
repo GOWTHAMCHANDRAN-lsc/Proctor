@@ -1,6 +1,6 @@
 ﻿import React, { useState, useEffect, useRef } from 'react';
-import { Exam, Student, QuestionType, ViolationLog, Question } from '../../types';
-import { gradeLocalAnswer, formatLocalAnswer } from '../../services/gradeClient';
+import { Exam, Student, QuestionType, ViolationLog, Question, CandidateResult, isManualGraded } from '../../types';
+import { formatCandidateAnswer } from '../../services/gradeClient';
 import { CheckCircle, CheckCircle2, XCircle, Clock, Award, Send, Star, AlertTriangle, Loader2 } from 'lucide-react';
 import { apiPost } from '../../services/api';
 
@@ -11,6 +11,10 @@ interface ExamResultProps {
   violations: ViolationLog[];
   questions?: Question[]; // The specific subset taken
   sessionId?: number;
+  // The server's verdict (sessions.php 'complete'): score and, per question, only whether this
+  // candidate's answer was right. Null/undefined until confirmed, or when the exam hides results.
+  // The candidate's copy of the exam carries no answer keys, so nothing is graded in the browser.
+  result?: CandidateResult | null;
   // True while the final submission is still on its way to the server (first try or a retry).
   submitting?: boolean;
   // False when the final submission couldn't be confirmed by the server (e.g. a dropped network
@@ -46,9 +50,10 @@ const StarRating = ({ label, value, onChange, disabled }: { label: string; value
   </div>
 );
 
-export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, questions, sessionId, submitting = false, submissionSynced = true, resubmitting = false, onRetrySubmission }) => {
+export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, questions, sessionId, result, submitting = false, submissionSynced = true, resubmitting = false, onRetrySubmission }) => {
   const questionsToGrade = questions || exam.questions;
-  const showResults = exam.showResults ?? false;
+  // Scores are shown only when the exam allows it AND the server has returned them.
+  const showResults = (exam.showResults ?? false) && !!result;
   // Per-exam switch (exam editor → Candidate Feedback); exams saved before it existed ask for feedback.
   const feedbackEnabled = exam.feedbackEnabled !== false;
   const feedbackRef = useRef<HTMLDivElement>(null);
@@ -64,40 +69,26 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
     return () => window.clearTimeout(t);
   }, [feedbackEnabled]);
 
-  // Calculate Score
-  let score = 0;
-  let maxScore = 0;
+  // Everything below comes from the server's result; nothing is graded in the browser.
+  const gradeOf = (q: Question) => result?.grades?.[q.id] ?? 'unanswered';
   let correctCount = 0;
   let incorrectCount = 0;
   let pendingCount = 0;
-
   questionsToGrade.forEach(q => {
-    maxScore += q.marks;
-    const grade = gradeLocalAnswer(q, answers[q.id]);
-    if (grade === 'pending') {
-      // Free-text questions are graded manually; treated as 0 for the immediate auto-calc.
-      pendingCount += 1;
-    } else if (grade === 'correct') {
-      score += q.marks;
-      correctCount += 1;
-    } else {
-      // 'incorrect' (answered but wrong) may carry a penalty; 'unanswered' never does.
-      if (grade === 'incorrect' && q.negativeMarks) {
-        score -= q.negativeMarks;
-      }
-      incorrectCount += 1;
-    }
+    const grade = gradeOf(q);
+    if (grade === 'correct') correctCount += 1;
+    else if (grade === 'pending') pendingCount += 1;
+    // 'incorrect' and 'unanswered' (matches the per-question badges below).
+    else incorrectCount += 1;
   });
-
+  const score = result?.score ?? 0;
+  const maxScore = result?.maxScore ?? 0;
   const percentage = maxScore > 0 ? Math.round((score / maxScore) * 100) : 0;
-  const passPercent = Math.max(0, Math.min(100, exam.passPercent ?? 60));
-  // Same rule as the server (sessions.php 'complete': totalScore / maxScore >= passPercent / 100) on
-  // the UNROUNDED ratio. Comparing the rounded percentage showed e.g. 39.6% as PASSED against a
-  // 40% pass mark while the recorded result was FAIL.
-  const passed = maxScore > 0 ? score / maxScore >= passPercent / 100 : percentage >= passPercent;
+  const passPercent = Math.max(0, Math.min(100, result?.passPercent ?? exam.passPercent ?? 60));
+  const passed = result?.passed ?? false;
   // Manually-graded answers count as 0 until an examiner marks them, so a below-the-mark score is
   // only provisional while any are outstanding — don't announce "Failed" yet.
-  const verdictPending = !passed && pendingCount > 0;
+  const verdictPending = !passed && (result?.pending ?? pendingCount) > 0;
   const [rating, setRating] = useState(5);
   const [clarityRating, setClarityRating] = useState(5);
   const [platformRating, setPlatformRating] = useState(5);
@@ -343,17 +334,17 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
             <div className="space-y-6">
               {questionsToGrade.map((q, idx) => {
                 const userAnswer = answers[q.id];
-                const grade = gradeLocalAnswer(q, userAnswer);
-                const isText = grade === 'pending';
+                const grade = gradeOf(q);
+                const isText = isManualGraded(q.type);
                 const isCorrect = grade === 'correct';
-                // Option-based types keep the rich choice list; everything else uses a text summary.
+                // Option-based types keep the choice list; everything else uses a text summary.
                 const isOptionType = q.type === QuestionType.MCQ || q.type === QuestionType.TRUE_FALSE || q.type === QuestionType.YES_NO;
 
                 // Determine Marks Awarded and Status
                 let marksAwarded: string | number = 0;
                 let statusBadge = null;
 
-                if (isText) {
+                if (grade === 'pending') {
                     marksAwarded = "Pending";
                     statusBadge = <span className="text-xs font-bold px-2 py-0.5 rounded bg-blue-100 text-blue-700 border border-blue-200">MANUAL GRADING</span>;
                 } else if (isCorrect) {
@@ -371,10 +362,10 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
                 }
 
                 return (
-                  <div key={q.id} className={`border rounded-xl p-4 sm:p-6 transition-all ${isCorrect || isText ? 'bg-white border-slate-200 hover:border-slate-300' : 'bg-orange-50/50 border-orange-200'}`}>
+                  <div key={q.id} className={`border rounded-xl p-4 sm:p-6 transition-all ${isCorrect || grade === 'pending' ? 'bg-white border-slate-200 hover:border-slate-300' : 'bg-orange-50/50 border-orange-200'}`}>
                     <div className="flex gap-3 sm:gap-4">
                       <div className="flex-shrink-0 mt-1">
-                        {isText ? (
+                        {grade === 'pending' ? (
                           <div className="w-8 h-8 rounded-full bg-blue-100 text-blue-600 flex items-center justify-center" title="Pending Grading">
                              <Clock size={16} />
                           </div>
@@ -404,9 +395,10 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
                              </div>
                            </div>
                          </div>
-                         
+
                          <p className="text-slate-800 mb-5 leading-relaxed whitespace-pre-wrap">{q.text}</p>
-                         
+
+                         {/* Only the candidate's OWN answer is shown — never the correct one. */}
                          {isText ? (
                            <div className="bg-blue-50/50 p-4 rounded-lg border border-blue-100">
                              <h5 className="text-xs font-semibold text-blue-800 uppercase mb-2 flex items-center gap-1">
@@ -418,51 +410,34 @@ export const ExamResult: React.FC<ExamResultProps> = ({ exam, student, answers, 
                            <div className="space-y-2">
                              {q.options?.map((opt, i) => {
                                const selected = userAnswer === i;
-                               const correct = q.correctOptionIndex === i;
-
-                               let containerStyle = "border-slate-200 bg-slate-50 text-slate-600";
-                               let icon = null;
-
-                               if (correct) {
-                                  containerStyle = "border-teal-200 bg-teal-50 text-teal-900 font-medium ring-1 ring-teal-200";
-                                  icon = <CheckCircle size={16} className="text-teal-600" />;
-                               } else if (selected && !correct) {
-                                  containerStyle = "border-orange-200 bg-orange-50 text-orange-900 ring-1 ring-orange-200";
-                                  icon = <XCircle size={16} className="text-orange-600" />;
-                               }
-
+                               const containerStyle = !selected
+                                 ? 'border-slate-200 bg-slate-50 text-slate-600'
+                                 : isCorrect
+                                   ? 'border-teal-200 bg-teal-50 text-teal-900 font-medium ring-1 ring-teal-200'
+                                   : 'border-orange-200 bg-orange-50 text-orange-900 ring-1 ring-orange-200';
                                return (
                                  <div key={i} className={`px-4 py-3 rounded-lg border text-sm flex justify-between items-center ${containerStyle}`}>
                                    <div className="flex items-center gap-3">
-                                      <span className={`w-6 h-6 rounded-full border flex items-center justify-center text-xs font-mono ${correct || selected ? 'border-transparent bg-white/50' : 'border-slate-300 bg-white'}`}>
+                                      <span className={`w-6 h-6 rounded-full border flex items-center justify-center text-xs font-mono ${selected ? 'border-transparent bg-white/50' : 'border-slate-300 bg-white'}`}>
                                         {String.fromCharCode(65+i)}
                                       </span>
                                       <span>{opt}</span>
                                    </div>
-                                   <div className="flex items-center gap-2">
-                                      {selected && <span className="text-[10px] uppercase font-bold tracking-widest opacity-60">Your Answer</span>}
-                                      {icon}
-                                   </div>
+                                   {selected && (
+                                     <div className="flex items-center gap-2">
+                                       <span className="text-[10px] uppercase font-bold tracking-widest opacity-60">Your Answer</span>
+                                       {isCorrect ? <CheckCircle size={16} className="text-teal-600" /> : <XCircle size={16} className="text-orange-600" />}
+                                     </div>
+                                   )}
                                  </div>
                                )
                              })}
                            </div>
                          ) : (
-                           (() => {
-                             const { yours, correct } = formatLocalAnswer(q, userAnswer);
-                             return (
-                               <div className="grid gap-2 sm:grid-cols-2">
-                                 <div className={`p-4 rounded-lg border ${isCorrect ? 'bg-teal-50/60 border-teal-200' : 'bg-orange-50/60 border-orange-200'}`}>
-                                   <h5 className="text-xs font-semibold uppercase mb-2 text-slate-500">Your Answer</h5>
-                                   <p className="text-slate-800 text-sm whitespace-pre-wrap">{yours || 'No answer provided.'}</p>
-                                 </div>
-                                 <div className="p-4 rounded-lg border bg-slate-50 border-slate-200">
-                                   <h5 className="text-xs font-semibold uppercase mb-2 text-slate-500">Correct Answer</h5>
-                                   <p className="text-slate-800 text-sm whitespace-pre-wrap">{correct || '—'}</p>
-                                 </div>
-                               </div>
-                             );
-                           })()
+                           <div className={`p-4 rounded-lg border ${isCorrect ? 'bg-teal-50/60 border-teal-200' : 'bg-orange-50/60 border-orange-200'}`}>
+                             <h5 className="text-xs font-semibold uppercase mb-2 text-slate-500">Your Answer</h5>
+                             <p className="text-slate-800 text-sm whitespace-pre-wrap">{formatCandidateAnswer(q, userAnswer) || 'No answer provided.'}</p>
+                           </div>
                          )}
                       </div>
                     </div>

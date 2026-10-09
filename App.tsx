@@ -21,7 +21,7 @@ import { SettingsProvider, useSettings } from './services/appSettings';
 import { ExamTake } from './components/student/ExamTake';
 import { ExamResult } from './components/student/ExamResult';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { UserRole, Exam, Student, ViolationLog, Question, ExamSession } from './types';
+import { UserRole, Exam, Student, ViolationLog, Question, ExamSession, CandidateResult } from './types';
 import { MOCK_EXAMS, MOCK_STUDENTS, MOCK_SESSIONS } from './services/mockStore';
 import { ArrowRight, KeyRound, AlertCircle } from 'lucide-react';
 import { apiGet, apiPost, resetAuthExpiryGuard, getApiErrorMessage, ApiError } from './services/api';
@@ -949,6 +949,10 @@ const StudentApp: React.FC = () => {
   // The first 'complete' call (with its retries) is still in flight — the results screen holds back
   // "Your exam is completed / you can close this window" until the server has confirmed it.
   const [submittingSession, setSubmittingSession] = useState(false);
+  // The server's verdict for the results screen (score + per-question right/wrong, never answers).
+  const [examServerResult, setExamServerResult] = useState<CandidateResult | null>(null);
+  // From the start/reconnect response: how far into the attempt we are, and violations on record.
+  const [sessionResume, setSessionResume] = useState<{ elapsedSeconds: number; violationCounts: Record<string, number> } | null>(null);
   const [resubmittingSession, setResubmittingSession] = useState(false);
   const pendingCompletePayloadRef = useRef<Record<string, unknown> | null>(null);
 
@@ -1229,7 +1233,7 @@ const StudentApp: React.FC = () => {
         ? await getGeoLocation()
         : { label: 'Not collected (unproctored exam)', lat: null, lng: null, accuracy: null };
       const macAddress = await getMacAddress();
-      const start = await apiPost<{ ok: boolean; sessionId?: number | null; attempt?: number; reconnect?: boolean; remaining?: number }>('sessions.php', {
+      const start = await apiPost<{ ok: boolean; sessionId?: number | null; attempt?: number; reconnect?: boolean; remaining?: number; elapsedSeconds?: number; violationCounts?: Record<string, number> }>('sessions.php', {
         action: 'start',
         examId: exam.id,
         studentId: student.id,
@@ -1242,10 +1246,35 @@ const StudentApp: React.FC = () => {
         deviceMetadata,
         macAddress
       });
+      // The server sends the questions only once the attempt is running (questionsLocked before
+      // Start), so fetch the exam again now. A couple of quick retries cover a dropped request;
+      // starting again later is a reconnect, not a new attempt.
+      let examToRun = exam;
+      if (exam.questionsLocked) {
+        let fresh: Exam | null = null;
+        for (let attempt = 0; attempt < 3 && !fresh; attempt += 1) {
+          try {
+            const data = await apiGet<{ exams: Exam[] }>('exams.php');
+            fresh = (data?.exams || []).find(e => e.id === exam.id && !e.questionsLocked) || null;
+          } catch (err) {
+            console.error('Failed to load exam questions:', err);
+          }
+          if (!fresh && attempt < 2) await new Promise(resolve => setTimeout(resolve, 1200));
+        }
+        if (!fresh) {
+          throw new Error('Your exam has started but its questions could not be loaded. Check your connection and click Start Test again — your attempt and time continue.');
+        }
+        examToRun = fresh;
+      }
       setSessionId(start?.sessionId ?? null);
-      setActiveExam(exam);
+      setSessionResume({
+        elapsedSeconds: Math.max(0, Number(start?.elapsedSeconds) || 0),
+        violationCounts: start?.violationCounts && typeof start.violationCounts === 'object' ? start.violationCounts : {},
+      });
+      setActiveExam(examToRun);
       setCurrentStudent(student);
       setExamResults(null);
+      setExamServerResult(null);
       setAccessRequestContext(null);
       setPreStartContext(null);
       window.history.replaceState({}, document.title, window.location.pathname);
@@ -1374,6 +1403,7 @@ const StudentApp: React.FC = () => {
           answers: data.answers,
           questionIds: data.questions.map(q => q.id),
           questionTimes: data.questionTimes || {},
+          ...(activeExam.candidateView ? { answerSpace: 'candidate-v1' } : {}),
         });
         if (!synced) {
           console.error('Failed to terminate session after retries — the abandoned-session sweep will reconcile it later.');
@@ -1403,7 +1433,9 @@ const StudentApp: React.FC = () => {
           studentId: currentStudent.id,
           answers: data.answers,
           questionIds: data.questions.map(q => q.id),
-          questionTimes: data.questionTimes || {}
+          questionTimes: data.questionTimes || {},
+          // Structured answers are in the candidate view's order; the server maps them back.
+          ...(activeExam.candidateView ? { answerSpace: 'candidate-v1' } : {}),
         };
         setSubmittingSession(true);
         const synced = await postSessionCompleteWithRetry(completePayload).finally(() => setSubmittingSession(false));
@@ -1424,7 +1456,9 @@ const StudentApp: React.FC = () => {
   const postSessionCompleteWithRetry = async (payload: Record<string, unknown>, attempts = 4): Promise<boolean> => {
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {
-        await apiPost('sessions.php', payload);
+        const res = await apiPost<{ ok?: boolean; result?: CandidateResult | null }>('sessions.php', payload);
+        // The results screen shows only what the server graded (the candidate's copy has no keys).
+        if (payload.action === 'complete') setExamServerResult(res?.result ?? null);
         return true;
       } catch (e) {
         console.error(`Failed to complete session (attempt ${attempt}/${attempts}):`, e);
@@ -1512,6 +1546,7 @@ const StudentApp: React.FC = () => {
            violations={examResults.violations}
            questions={examResults.questions}
            sessionId={sessionId ?? undefined}
+           result={examServerResult}
            submitting={submittingSession}
            submissionSynced={submissionSynced}
            resubmitting={resubmittingSession}
@@ -1526,6 +1561,8 @@ const StudentApp: React.FC = () => {
         exam={activeExam}
         student={currentStudent}
         sessionId={sessionId ?? undefined}
+        serverElapsedSeconds={sessionResume?.elapsedSeconds}
+        serverViolationCounts={sessionResume?.violationCounts}
         onFinish={handleExamFinish}
       />
       </ErrorBoundary>

@@ -226,6 +226,19 @@ if ($method === 'POST') {
             $blockStmt->closeCursor();
 
             if (!$block) {
+                // An attempt that ended without being submitted (abandoned-attempt sweep, etc.) also
+                // needs approval before a new attempt (sessions.php start) — let the candidate ask.
+                $endedStmt = $pdo->prepare("SELECT status, start_time FROM exam_sessions
+                                            WHERE company_id = ? AND exam_id = ? AND student_id = ?
+                                            ORDER BY start_time DESC, id DESC LIMIT 1");
+                $endedStmt->execute([$companyId, $examId, $studentId]);
+                $ended = $endedStmt->fetch();
+                $endedStmt->closeCursor();
+                if ($ended && ($ended['status'] ?? '') === 'TERMINATED') {
+                    $block = ['id' => 0, 'created_at' => $ended['start_time']];
+                }
+            }
+            if (!$block) {
                 json_response(['error' => 'NOT_BLOCKED', 'message' => 'No blocked attempt found for this exam.'], 400);
             }
         }

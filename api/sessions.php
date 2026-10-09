@@ -46,8 +46,11 @@ function recompute_session_score_from_stored_answers(PDO $pdo, int $sessionId): 
  * (violation block) and 'save_progress' (periodic autosave) so attended questions are ALWAYS
  * scored — even when the candidate never reaches a clean submit. Idempotent via ON DUPLICATE KEY,
  * so repeated autosaves and a final submit converge on the same graded rows.
+ * $questionIds must be the SERVER's list (exam_served_question_ids()), never the browser's.
+ * $candidateView: the answers use the candidate view's order (exam_candidate_question_view()) and
+ * are mapped back to the stored order for $studentId before grading/storing.
  */
-function grade_and_store_answers(PDO $pdo, $companyId, string $examId, int $sessionId, $answers, $questionIds, $questionTimes): array {
+function grade_and_store_answers(PDO $pdo, $companyId, string $examId, int $sessionId, $answers, $questionIds, $questionTimes, string $studentId = '', bool $candidateView = false): array {
     if (!is_array($answers) || !is_array($questionIds)) {
         return [0, 0, 0];
     }
@@ -59,7 +62,7 @@ function grade_and_store_answers(PDO $pdo, $companyId, string $examId, int $sess
     }
 
     $placeholders = implode(',', array_fill(0, count($questionIds), '?'));
-    $qStmt = $pdo->prepare("SELECT q.id, q.type, q.correct_option_index, q.answer_key_json, q.marks, q.negative_marks, q.word_limit
+    $qStmt = $pdo->prepare("SELECT q.id, q.type, q.correct_option_index, q.answer_key_json, q.match_options_json, q.marks, q.negative_marks, q.word_limit
                             FROM exam_questions eq
                             JOIN questions q ON q.id = eq.question_id
                             WHERE eq.exam_id = ? AND q.id IN ($placeholders)");
@@ -107,6 +110,15 @@ function grade_and_store_answers(PDO $pdo, $companyId, string $examId, int $sess
             }
         } elseif (in_array($upperType, ['MULTI_SELECT', 'FILL_BLANK', 'ORDERING', 'MATCHING', 'DRAG_DROP'], true)) {
             // Structured (array / map) responses.
+            if ($candidateView && $studentId !== '' && is_array($answerValue) && in_array($upperType, ['ORDERING', 'MATCHING', 'DRAG_DROP'], true)) {
+                $match = json_decode((string)($q['match_options_json'] ?? ''), true);
+                $key = json_decode((string)($q['answer_key_json'] ?? ''), true);
+                $perm = exam_candidate_question_permutation($upperType, is_array($match) ? $match : null, is_array($key) ? $key : null, $examId, $studentId, (string)$qid);
+                $answerValue = exam_candidate_answer_to_stored($upperType, $answerValue, $perm);
+                if (is_array($answerValue) && $upperType !== 'ORDERING') {
+                    ksort($answerValue);
+                }
+            }
             if (is_array($answerValue) && count($answerValue) > 0) {
                 $answerJsonVal = $answerValue;
                 $answerJson = json_encode($answerValue);
@@ -155,6 +167,167 @@ function grade_and_store_answers(PDO $pdo, $companyId, string $examId, int $sess
     }
 
     return [$totalScore, $maxScore, $answeredCount];
+}
+
+/**
+ * What a candidate may see after submitting: score, pass/fail and, per served question, only
+ * correct / incorrect / pending (manual marking) / unanswered — never the correct answers. Null when
+ * the exam doesn't show results to candidates.
+ */
+function candidate_result_summary(PDO $pdo, string $examId, int $sessionId, array $servedIds): ?array {
+    $stmt = $pdo->prepare('SELECT e.show_results, e.pass_percent, s.total_score, s.max_score, s.passed
+                             FROM exam_sessions s JOIN exams e ON e.id = s.exam_id
+                            WHERE s.id = ? AND s.exam_id = ? LIMIT 1');
+    $stmt->execute([$sessionId, $examId]);
+    $row = $stmt->fetch();
+    $stmt->closeCursor();
+    if (!$row || empty($row['show_results'])) {
+        return null;
+    }
+    $answerStmt = $pdo->prepare('SELECT sa.question_id, sa.answer_text, sa.answer_option_index, sa.answer_json, sa.is_correct, q.type
+                                   FROM session_answers sa JOIN questions q ON q.id = sa.question_id
+                                  WHERE sa.session_id = ?');
+    $answerStmt->execute([$sessionId]);
+    $byId = [];
+    foreach ($answerStmt->fetchAll() as $a) {
+        $byId[(string)$a['question_id']] = $a;
+    }
+    $answerStmt->closeCursor();
+    $grades = [];
+    $pending = 0;
+    foreach ($servedIds as $qid) {
+        $a = $byId[$qid] ?? null;
+        $answered = $a !== null && (
+            ($a['answer_text'] !== null && $a['answer_text'] !== '')
+            || $a['answer_option_index'] !== null
+            || ($a['answer_json'] !== null && $a['answer_json'] !== '' && $a['answer_json'] !== '[]' && $a['answer_json'] !== '{}')
+        );
+        if (!$answered) {
+            $grades[$qid] = 'unanswered';
+        } elseif (is_manual_question_type((string)$a['type'])) {
+            $grades[$qid] = 'pending';
+            $pending++;
+        } else {
+            $grades[$qid] = (int)$a['is_correct'] === 1 ? 'correct' : 'incorrect';
+        }
+    }
+    return [
+        'score' => $row['total_score'] !== null ? (float)$row['total_score'] : 0.0,
+        'maxScore' => $row['max_score'] !== null ? (int)$row['max_score'] : 0,
+        'passed' => (int)($row['passed'] ?? 0) === 1,
+        'passPercent' => max(0, min(100, (int)($row['pass_percent'] ?? 60))),
+        'pending' => $pending,
+        'grades' => (object)$grades,
+    ];
+}
+
+/** Minutes after an attempt's own duration in which its answers are still accepted (clock pauses, retries). */
+const SESSION_ANSWER_GRACE_MINUTES = 20;
+
+/**
+ * True once an attempt is past start + duration + grace. The exam clock runs in the browser, so
+ * without this a candidate could reset it (clear site data and reload) or keep a tab open and
+ * submit hours later. Answers arriving after this are ignored; the last autosave stands.
+ */
+function session_answers_closed(PDO $pdo, int $sessionId): bool {
+    $stmt = $pdo->prepare('SELECT DATE_ADD(s.start_time, INTERVAL (COALESCE(e.duration_minutes, 0) + ?) MINUTE) < NOW(3) AS closed
+                             FROM exam_sessions s JOIN exams e ON e.id = s.exam_id
+                            WHERE s.id = ? LIMIT 1');
+    $stmt->execute([SESSION_ANSWER_GRACE_MINUTES, $sessionId]);
+    $closed = $stmt->fetchColumn();
+    $stmt->closeCursor();
+    return (int)$closed === 1;
+}
+
+/** [score, maxScore] of the already-stored answers, over the served questions only. */
+function stored_score_for_served(PDO $pdo, int $sessionId, array $servedIds): array {
+    if (count($servedIds) === 0) {
+        return [0, 0];
+    }
+    $ph = implode(',', array_fill(0, count($servedIds), '?'));
+    $stmt = $pdo->prepare("SELECT q.id, q.marks, sa.awarded_marks
+                             FROM questions q
+                             LEFT JOIN session_answers sa ON sa.question_id = q.id AND sa.session_id = ?
+                            WHERE q.id IN ($ph)");
+    $stmt->execute(array_merge([$sessionId], $servedIds));
+    $score = 0.0;
+    $max = 0;
+    foreach ($stmt->fetchAll() as $r) {
+        $max += (int)$r['marks'];
+        $score += $r['awarded_marks'] !== null ? (float)$r['awarded_marks'] : 0;
+    }
+    $stmt->closeCursor();
+    return [$score, $max];
+}
+
+/**
+ * The violation category whose recorded count has reached the exam's limit, or null. Mirrors
+ * ExamTake.tsx (violationCategoriesByType + categoryLimits): the page ends the attempt itself at the
+ * limit, so this only catches a page that was stopped from doing so. Retried uploads of the same
+ * violation are counted once (same type + timestamp). Exams without auto-terminate, or unproctored,
+ * never breach.
+ */
+function session_violation_limit_breach(PDO $pdo, string $examId, int $sessionId): ?string {
+    try {
+        $stmt = $pdo->prepare('SELECT proctoring_mode, auto_terminate, tab_switch_limit, violation_limits_json FROM exams WHERE id = ? LIMIT 1');
+        $stmt->execute([$examId]);
+        $exam = $stmt->fetch();
+        $stmt->closeCursor();
+    } catch (Throwable $e) {
+        return null; // older schema without the switches: keep the previous behaviour
+    }
+    if (!$exam || strtoupper((string)($exam['proctoring_mode'] ?? 'PROCTORED')) === 'UNPROCTORED' || (int)($exam['auto_terminate'] ?? 1) !== 1) {
+        return null;
+    }
+    $raw = json_decode((string)($exam['violation_limits_json'] ?? ''), true);
+    $limits = [
+        'camera' => max(0, (int)($raw['camera'] ?? 0)),
+        'microphone' => max(0, (int)($raw['microphone'] ?? 0)),
+        'fullscreen' => max(0, (int)($raw['fullscreen'] ?? 0)),
+        'copyPaste' => max(0, (int)($raw['copyPaste'] ?? 0)),
+        'tabSwitch' => max(0, (int)($exam['tab_switch_limit'] ?? 0)),
+    ];
+    $categoryOf = [
+        'TAB_SWITCH' => 'tabSwitch', 'NO_FACE' => 'camera', 'MULTIPLE_FACES' => 'camera', 'GAZE_AWAY' => 'camera',
+        'AUDIO_DETECTED' => 'microphone', 'FULLSCREEN_EXIT' => 'fullscreen', 'COPY_PASTE' => 'copyPaste',
+        'PHONE_DETECTED' => 'camera', 'ANOMALY_OBJECT' => 'camera', 'IDENTITY_CHANGE' => 'camera', 'SUSPICIOUS_BEHAVIOR' => 'camera',
+    ];
+    $counts = [];
+    try {
+        $stmt = $pdo->prepare('SELECT type, COUNT(DISTINCT occurred_at) AS n FROM violation_logs WHERE session_id = ? GROUP BY type');
+        $stmt->execute([$sessionId]);
+        foreach ($stmt->fetchAll() as $r) {
+            $category = $categoryOf[(string)$r['type']] ?? null;
+            if ($category !== null) {
+                $counts[$category] = ($counts[$category] ?? 0) + (int)$r['n'];
+            }
+        }
+        $stmt->closeCursor();
+    } catch (Throwable $e) {
+        return null;
+    }
+    foreach ($limits as $category => $limit) {
+        if ($limit > 0 && ($counts[$category] ?? 0) >= $limit) {
+            return $category;
+        }
+    }
+    return null;
+}
+
+/** Violation counts by type already recorded for an attempt (restored on reconnect). */
+function session_violation_counts(PDO $pdo, int $sessionId): array {
+    try {
+        $stmt = $pdo->prepare('SELECT type, COUNT(*) AS n FROM violation_logs WHERE session_id = ? GROUP BY type');
+        $stmt->execute([$sessionId]);
+        $out = [];
+        foreach ($stmt->fetchAll() as $r) {
+            $out[(string)$r['type']] = (int)$r['n'];
+        }
+        $stmt->closeCursor();
+        return $out;
+    } catch (Throwable $e) {
+        return [];
+    }
 }
 
 function normalize_summary_for_log($summary): ?array {
@@ -370,6 +543,11 @@ if ($method === 'POST') {
         json_response(['error' => 'examId and studentId are required.'], 400);
     }
 
+    // Everything a candidate's page does to an attempt must come with that candidate's own token.
+    if (in_array($action, ['location', 'save_progress', 'terminate', 'complete'], true)) {
+        require_candidate_or_staff((string)$examId, (string)$studentId, (int)$companyId);
+    }
+
     if ($action === 'reset_mac') {
         require_role(['ADMIN', 'SUPER_ADMIN'], $payload);
         $adminId = get_actor_id($payload);
@@ -434,6 +612,31 @@ if ($method === 'POST') {
         $studentCheck->execute([$studentId, $companyId]);
         if (!$studentCheck->fetch()) {
             json_response(['error' => 'STUDENT_NOT_FOUND'], 404);
+        }
+
+        // An exam with an assignment list (students or batches) is only for those students — a link
+        // kept by someone who was removed from it no longer opens it. Exams with no list stay open to
+        // the company's students, as before.
+        try {
+            $assignStmt = $pdo->prepare('SELECT
+                    (SELECT COUNT(*) FROM exam_assignments WHERE exam_id = ?) AS direct_total,
+                    (SELECT COUNT(*) FROM exam_batch_assignments WHERE exam_id = ?) AS batch_total,
+                    (SELECT COUNT(*) FROM exam_assignments WHERE exam_id = ? AND student_id = ?) AS direct_me,
+                    (SELECT COUNT(*) FROM exam_batch_assignments eba JOIN student_batches sb ON sb.batch_id = eba.batch_id
+                      WHERE eba.exam_id = ? AND sb.student_id = ?) AS batch_me');
+            $assignStmt->execute([$examId, $examId, $examId, $studentId, $examId, $studentId]);
+            $assign = $assignStmt->fetch();
+            $assignStmt->closeCursor();
+            if ($assign && ((int)$assign['direct_total'] + (int)$assign['batch_total']) > 0
+                && ((int)$assign['direct_me'] + (int)$assign['batch_me']) === 0) {
+                $log = $pdo->prepare('CALL sp_log_access(?, ?, ?, ?, ?, ?)');
+                $log->execute([$companyId, $examId, $studentId, 'START', 'DENY', 'Student is not assigned to this exam.']);
+                while ($log->nextRowset()) {}
+                $log->closeCursor();
+                json_response(['error' => 'NOT_ASSIGNED', 'message' => 'You are not assigned to this exam. Please contact your administrator.'], 403);
+            }
+        } catch (PDOException $e) {
+            // Assignment tables missing on an old database: keep the previous (open) behaviour.
         }
 
         $completedCheck = $pdo->prepare("SELECT id, end_time
@@ -522,6 +725,48 @@ if ($method === 'POST') {
             // Backward compatibility for deployments that have not added request tables yet.
         }
 
+        // An attempt that ENDED without being submitted (the abandoned-attempt sweep, or any other
+        // termination) needs the same approval as a violation block before a new attempt: an admin
+        // Renew (RESET) or a granted reattempt request made after that attempt began. Otherwise a
+        // candidate could read the paper, walk away, and come back for a fresh attempt.
+        $lastStmt = $pdo->prepare("SELECT id, status, start_time FROM exam_sessions
+                                   WHERE company_id = ? AND exam_id = ? AND student_id = ?
+                                   ORDER BY start_time DESC, id DESC LIMIT 1");
+        $lastStmt->execute([$companyId, $examId, $studentId]);
+        $lastSession = $lastStmt->fetch();
+        $lastStmt->closeCursor();
+        if ($lastSession && ($lastSession['status'] ?? '') === 'TERMINATED') {
+            $renewed = db_scalar_int($pdo, "SELECT COUNT(*) FROM exam_access_logs
+                                             WHERE company_id = ? AND exam_id = ? AND student_id = ?
+                                               AND action = 'RESET' AND status = 'OK' AND created_at >= ?",
+                [$companyId, $examId, $studentId, $lastSession['start_time']]) > 0;
+            $requestStatus = null;
+            try {
+                $reqStmt = $pdo->prepare("SELECT status FROM exam_access_requests
+                                          WHERE company_id = ? AND exam_id = ? AND student_id = ?
+                                            AND request_type = 'REATTEMPT' AND requested_at >= ?
+                                          ORDER BY requested_at DESC LIMIT 1");
+                $reqStmt->execute([$companyId, $examId, $studentId, $lastSession['start_time']]);
+                $requestStatus = $reqStmt->fetchColumn() ?: null;
+                $reqStmt->closeCursor();
+            } catch (Throwable $e) {
+                $requestStatus = null;
+            }
+            if (!$renewed && $requestStatus !== 'GRANTED') {
+                $errorCode = $requestStatus === 'PENDING' ? 'ACCESS_REQUEST_PENDING' : ($requestStatus === 'REVOKED' ? 'ACCESS_REQUEST_REVOKED' : 'ACCESS_REQUEST_REQUIRED');
+                $message = $requestStatus === 'PENDING'
+                    ? 'Your access request is pending admin review.'
+                    : ($requestStatus === 'REVOKED'
+                        ? 'Your access request was revoked by admin.'
+                        : 'Your previous attempt has ended. Request admin approval to reattempt.');
+                $log = $pdo->prepare('CALL sp_log_access(?, ?, ?, ?, ?, ?)');
+                $log->execute([$companyId, $examId, $studentId, 'START', 'DENY', $message]);
+                while ($log->nextRowset()) {}
+                $log->closeCursor();
+                json_response(['error' => $errorCode, 'message' => $message, 'requestStatus' => $requestStatus], 409);
+            }
+        }
+
         $check = $pdo->prepare("SELECT id, status, ip_address, device_fingerprint, start_time
                                 FROM exam_sessions
                                 WHERE company_id = ? AND exam_id = ? AND student_id = ? AND status = 'IN_PROGRESS'
@@ -551,7 +796,9 @@ if ($method === 'POST') {
                 $log->closeCursor();
             }
 
-            if ($deviceFingerprint && $existingDevice && $deviceFingerprint !== $existingDevice) {
+            // A reconnect that sends NO fingerprint counts as a different device (leaving it out used
+            // to skip this check entirely).
+            if ($existingDevice && $deviceFingerprint !== $existingDevice) {
                 $requestStmt = $pdo->prepare("SELECT id, status
                                               FROM exam_access_requests
                                               WHERE company_id = ?
@@ -578,7 +825,8 @@ if ($method === 'POST') {
                             ? 'Your device change request is pending super admin approval.'
                             : 'This exam is already bound to another device. Request access with a reason to continue.',
                         'requestStatus' => $deviceRequest['status'] ?? null,
-                        'previousDeviceFingerprint' => $existingDevice,
+                        // A label for the screen, not the bound value itself (which could be replayed).
+                        'previousDeviceFingerprint' => substr(hash('sha256', (string)$existingDevice), 0, 12),
                         'newDeviceFingerprint' => $deviceFingerprint,
                         'sessionId' => $existingId ? (int)$existingId : null,
                     ], 409);
@@ -670,12 +918,18 @@ if ($method === 'POST') {
                     'deviceChanged' => ($deviceFingerprint && $existingDevice && $deviceFingerprint !== $existingDevice)
                 ]
             ]);
+            // The page's clock and violation counters live in the browser (localStorage). Clearing
+            // site data used to restart both; the server's own elapsed time and recorded violations
+            // let the page resume from the truth.
+            $elapsed = db_scalar_int($pdo, 'SELECT GREATEST(0, TIMESTAMPDIFF(SECOND, start_time, NOW(3))) FROM exam_sessions WHERE id = ?', [(int)$existingId]);
             json_response([
                 'ok' => true,
                 'reconnect' => true,
                 'remaining' => $remaining,
                 'sessionId' => $existingId ? (int)$existingId : null,
                 'attempt' => $attemptNumber,
+                'elapsedSeconds' => $elapsed,
+                'violationCounts' => (object)session_violation_counts($pdo, (int)$existingId),
             ]);
         }
 
@@ -790,7 +1044,7 @@ if ($method === 'POST') {
             'metadata' => ['attempt' => $attemptNumber]
         ]);
 
-        json_response(['ok' => true, 'sessionId' => $sessionId, 'attempt' => $attemptNumber]);
+        json_response(['ok' => true, 'sessionId' => $sessionId, 'attempt' => $attemptNumber, 'elapsedSeconds' => 0, 'violationCounts' => new stdClass()]);
     }
 
     if ($action === 'location') {
@@ -892,9 +1146,15 @@ if ($method === 'POST') {
             }
 
             $sessionId = (int)$session['id'];
+            if (session_answers_closed($pdo, $sessionId)) {
+                // Past the attempt's time: the last in-time autosave stands.
+                $pdo->rollBack();
+                json_response(['ok' => true, 'saved' => false, 'reason' => 'TIME_UP']);
+            }
             [$totalScore, $maxScore, $answeredCount] = grade_and_store_answers(
                 $pdo, $companyId, (string)$examId, $sessionId,
-                $payload['answers'] ?? null, $payload['questionIds'] ?? null, $payload['questionTimes'] ?? null
+                $payload['answers'] ?? null, exam_served_question_ids($pdo, (string)$examId, $sessionId), $payload['questionTimes'] ?? null,
+                (string)$studentId, ($payload['answerSpace'] ?? '') === 'candidate-v1'
             );
             if ($maxScore > 0) {
                 $update = $pdo->prepare('UPDATE exam_sessions SET total_score = ?, max_score = ? WHERE id = ? AND company_id = ?');
@@ -936,10 +1196,16 @@ if ($method === 'POST') {
             // Grade whatever the candidate attended before being blocked, so the terminated attempt
             // shows the real score of answered questions (not a blank row). A terminated attempt is
             // still a FAIL regardless of that score — passed = 0.
-            [$termScore, $termMax] = grade_and_store_answers(
-                $pdo, $companyId, (string)$examId, $sessionId,
-                $payload['answers'] ?? null, $payload['questionIds'] ?? null, $payload['questionTimes'] ?? null
-            );
+            $servedIds = exam_served_question_ids($pdo, (string)$examId, $sessionId);
+            if (session_answers_closed($pdo, $sessionId)) {
+                [$termScore, $termMax] = stored_score_for_served($pdo, $sessionId, $servedIds);
+            } else {
+                [$termScore, $termMax] = grade_and_store_answers(
+                    $pdo, $companyId, (string)$examId, $sessionId,
+                    $payload['answers'] ?? null, $servedIds, $payload['questionTimes'] ?? null,
+                    (string)$studentId, ($payload['answerSpace'] ?? '') === 'candidate-v1'
+                );
+            }
             $reasonStore = mb_substr($reason, 0, 255);
             if ($termMax > 0) {
                 $update = $pdo->prepare("UPDATE exam_sessions
@@ -992,13 +1258,9 @@ if ($method === 'POST') {
 
     if ($action === 'complete') {
         $answers = $payload['answers'] ?? null;
-        $questionIds = $payload['questionIds'] ?? null;
         $questionTimes = $payload['questionTimes'] ?? null;
-        if (!is_array($questionIds) && isset($payload['questions']) && is_array($payload['questions'])) {
-            $questionIds = array_map(function ($q) {
-                return is_array($q) ? ($q['id'] ?? null) : null;
-            }, $payload['questions']);
-        }
+        // The browser also sends questionIds; they are deliberately ignored (see exam_served_question_ids()).
+        $candidateView = ($payload['answerSpace'] ?? '') === 'candidate-v1';
 
         // Only a LIVE attempt can be submitted. This used to complete-then-regrade whatever the latest
         // session was, so a 'complete' arriving for an attempt that had already ended rewrote it:
@@ -1028,7 +1290,8 @@ if ($method === 'POST') {
             if ($sessionStatus === 'COMPLETED') {
                 // Already submitted (e.g. a retry whose first request landed but whose response was lost).
                 $pdo->rollBack();
-                json_response(['ok' => true, 'alreadyCompleted' => true]);
+                json_response(['ok' => true, 'alreadyCompleted' => true,
+                    'result' => candidate_result_summary($pdo, (string)$examId, $sessionId, exam_served_question_ids($pdo, (string)$examId, $sessionId))]);
             }
             if ($sessionStatus !== 'IN_PROGRESS') {
                 $pdo->rollBack();
@@ -1038,9 +1301,41 @@ if ($method === 'POST') {
                 ], 409);
             }
 
-            [$totalScore, $maxScore, $answeredCount] = grade_and_store_answers(
-                $pdo, $companyId, (string)$examId, $sessionId, $answers, $questionIds, $questionTimes
-            );
+            $servedIds = exam_served_question_ids($pdo, (string)$examId, $sessionId);
+            if (session_answers_closed($pdo, $sessionId)) {
+                // Submitted after the attempt's time (plus grace): grade what was autosaved in time.
+                [$totalScore, $maxScore] = stored_score_for_served($pdo, $sessionId, $servedIds);
+            } else {
+                [$totalScore, $maxScore, $answeredCount] = grade_and_store_answers(
+                    $pdo, $companyId, (string)$examId, $sessionId, $answers, $servedIds, $questionTimes,
+                    (string)$studentId, $candidateView
+                );
+            }
+
+            // A page that was stopped from ending the attempt at a violation limit can't turn it into a
+            // completed (possibly passing) result: the attempt is ended as a violation block instead.
+            $breach = session_violation_limit_breach($pdo, (string)$examId, $sessionId);
+            if ($breach !== null) {
+                db_add_column_if_missing($pdo, 'exam_sessions', 'termination_reason', 'VARCHAR(255) NULL AFTER passed');
+                $reason = "Violation limit reached ({$breach}) — submission recorded as terminated.";
+                $term = $pdo->prepare("UPDATE exam_sessions SET status = 'TERMINATED', end_time = NOW(3), passed = 0,
+                                              total_score = ?, max_score = ?, termination_reason = ?
+                                        WHERE id = ? AND company_id = ?");
+                $term->execute([$totalScore, $maxScore, $reason, $sessionId, $companyId]);
+                $term->closeCursor();
+                $log = $pdo->prepare('CALL sp_log_access(?, ?, ?, ?, ?, ?)');
+                $log->execute([$companyId, $examId, $studentId, 'VIOLATION_BLOCK', 'DENY', $reason]);
+                while ($log->nextRowset()) {}
+                $log->closeCursor();
+                $pdo->commit();
+                finalize_stuck_recordings($pdo, $companyId, (string)$examId, (string)$studentId, 'COMPLETED');
+                audit_log($pdo, [
+                    'companyId' => $companyId, 'actorRole' => 'SYSTEM', 'actorId' => $studentId,
+                    'action' => 'SESSION_TERMINATE', 'targetType' => 'exam', 'targetId' => $examId,
+                    'message' => $reason, 'metadata' => ['sessionId' => $sessionId, 'category' => $breach],
+                ]);
+                json_response(['ok' => true, 'terminated' => true, 'result' => null]);
+            }
 
             if ($maxScore > 0) {
                 $passed = null;
@@ -1096,7 +1391,7 @@ if ($method === 'POST') {
             'metadata' => ['score' => $totalScore ?? null, 'maxScore' => $maxScore ?? null]
         ]);
 
-        respond_then_continue(['ok' => true]);
+        respond_then_continue(['ok' => true, 'result' => candidate_result_summary($pdo, (string)$examId, $sessionId, $servedIds)]);
         exit;
     }
 

@@ -483,8 +483,10 @@ db_add_column_if_missing($pdo, 'questions', 'word_limit', 'INT NULL AFTER marks'
 /**
  * @param bool $includeBankInfo Staff responses tag Question Bank questions with bankId/bankName (the
  *   editor shows them read-only). The candidate's token response leaves them out.
+ * @param ?string $candidateStudentId Set for the candidate's own token response: questions then go
+ *   out as exam_candidate_question_view() (no answer keys, per-candidate list order).
  */
-function build_exam_response(array $row, PDO $pdo, int $companyId, bool $includeBankInfo = true): array {
+function build_exam_response(array $row, PDO $pdo, int $companyId, bool $includeBankInfo = true, ?string $candidateStudentId = null): array {
     $examId = $row['id'];
     $violationLimitsRaw = db_column_exists($pdo, 'exams', 'violation_limits_json')
         ? ($row['violation_limits_json'] ?? null)
@@ -525,6 +527,11 @@ function build_exam_response(array $row, PDO $pdo, int $companyId, bool $include
         return $bankLinks ? apply_question_bank_link($mapped, $bankLinks) : $mapped;
     };
 
+    $candidateView = $candidateStudentId !== null && PG_CANDIDATE_SAFE_VIEW;
+    if ($candidateView) {
+        $serializeForStaff = $serialize;
+        $serialize = static fn(array $q): array => exam_candidate_question_view($serializeForStaff($q), (string)$examId, (string)$candidateStudentId);
+    }
     $mappedQuestions = array_map($serialize, $questions);
     $sections = [];
     foreach ($secRows as $sec) {
@@ -543,6 +550,9 @@ function build_exam_response(array $row, PDO $pdo, int $companyId, bool $include
     }
     return [
         'id' => $examId,
+        // True when the questions are the candidate view: the page then sends answers back with
+        // answerSpace "candidate-v1" and takes its result from the server.
+        'candidateView' => $candidateView,
         'title' => $row['title'],
         'durationMinutes' => (int)$row['duration_minutes'],
         'startTime' => datetime_to_ms($row['start_time']),
@@ -601,12 +611,27 @@ if ($method === 'GET') {
         if (!$row) {
             json_response(['error' => 'Exam not found.'], 404);
         }
-        $studentExam = build_exam_response($row, $pdo, $tokenCompanyId, false);
+        $studentExam = build_exam_response($row, $pdo, $tokenCompanyId, false, (string)$examTokenClaims['sid']);
         // The candidate's page never uses the roster, and handing every candidate the student ids of
         // everyone else assigned to the exam let them address classmates' attempts directly through
         // the (unauthenticated) session/violation endpoints, which are keyed on examId + studentId.
         $studentExam['assignedStudentIds'] = [];
         $studentExam['assignedBatchIds'] = [];
+        // The paper itself only once the attempt is running: before Start (or after the exam) the
+        // candidate gets the exam's details but no questions — they used to be able to read the
+        // whole paper, every section pool included, days before the exam opened. The page fetches
+        // the exam again right after a successful start.
+        if (PG_CANDIDATE_SAFE_VIEW) {
+            $liveAttempt = db_scalar_int($pdo, "SELECT COUNT(*) FROM exam_sessions WHERE company_id = ? AND exam_id = ? AND student_id = ? AND status = 'IN_PROGRESS'",
+                [$tokenCompanyId, $tokenExamId, (string)$examTokenClaims['sid']]) > 0;
+            if (!$liveAttempt) {
+                $studentExam['questions'] = [];
+                foreach ($studentExam['sections'] as $i => $section) {
+                    $studentExam['sections'][$i]['questions'] = [];
+                }
+                $studentExam['questionsLocked'] = true;
+            }
+        }
         json_response(['exams' => [$studentExam]]);
     }
 

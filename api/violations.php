@@ -232,6 +232,8 @@ if ($method === 'POST') {
     if (!$examId || !$studentId || count($violations) === 0) {
         json_response(['error' => 'examId, studentId, and violations are required.'], 400);
     }
+    // Only the candidate (their own exam token) or staff may write violations for this attempt.
+    require_candidate_or_staff((string)$examId, (string)$studentId, (int)$companyId);
     if (!db_table_exists($pdo, 'violation_logs') || !db_table_exists($pdo, 'exam_sessions')) {
         json_response(['error' => 'Violation storage is unavailable on this database.'], 503);
     }

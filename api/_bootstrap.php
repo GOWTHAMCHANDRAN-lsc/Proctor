@@ -288,6 +288,29 @@ function exam_token_enforced(): bool {
 }
 
 /**
+ * Candidate write endpoints (session submit/autosave/terminate, violations, recordings, live wall,
+ * feedback): unless the caller is signed-in staff, the request must carry the candidate's OWN signed
+ * exam token (X-Exam-Token, sent on every student request by services/api.ts) for exactly this
+ * exam, student and company. Without it, anyone who learned a classmate's student id could end,
+ * zero or overwrite their attempt.
+ */
+function require_candidate_or_staff(string $examId, string $studentId, int $companyId): void {
+    if (current_session_claims() !== null) {
+        return; // verified staff session token
+    }
+    $claims = current_exam_token_claims();
+    if ($claims === null
+        || (string)($claims['eid'] ?? '') !== $examId
+        || (string)($claims['sid'] ?? '') !== $studentId
+        || (int)($claims['cid'] ?? 0) !== $companyId) {
+        json_response([
+            'error' => 'INVALID_ACCESS_TOKEN',
+            'message' => 'This request does not match your exam link. Please reopen the link from your invitation.',
+        ], 403);
+    }
+}
+
+/**
  * Signs a staff-only-generated media URL (recording playback file / live proctor frame) so it can be
  * fetched via a plain <video>/<img> src — the browser sends no custom headers on those requests, so
  * require_staff() can't gate them directly. Instead, the URL is only ever minted by an already
@@ -886,6 +909,233 @@ function ensure_marks_decimal_schema(PDO $pdo): void {
 function is_manual_question_type(string $type): bool {
     $t = strtoupper($type);
     return $t === 'SHORT_TEXT' || $t === 'LONG_TEXT' || $t === 'TEXT';
+}
+
+// ---------------------------------------------------------------------------------------------
+// Candidate exam integrity: which questions count, and what a candidate's browser may see.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Serve candidates the key-free question view (exam_candidate_question_view) and accept their
+ * structured answers in that view's order. Flipped on only once the frontend that understands it is
+ * deployed: an older page would render fill-in-the-blank questions without blanks and grade its
+ * result screen without keys.
+ */
+const PG_CANDIDATE_SAFE_VIEW = true;
+
+/*
+ * Exact port of ExamTake.tsx seedFromString / mulberry32 / shuffleWithSeed (32-bit integer maths
+ * emulated on PHP's 64-bit ints). The candidate's page draws its questions with these, seeded by the
+ * server-assigned session id, so the server can recompute the very same draw — see
+ * exam_served_question_ids(). Keep the two in lock-step.
+ */
+function pg_imul32(int $a, int $b): int {
+    $a &= 0xFFFFFFFF;
+    $b &= 0xFFFFFFFF;
+    $lo = ($a & 0xFFFF) * $b;
+    $hi = (($a >> 16) * $b) & 0xFFFFFFFF;
+    return ($lo + (($hi << 16) & 0xFFFFFFFF)) & 0xFFFFFFFF;
+}
+function pg_seed_from_string(string $value): int {
+    $hash = 2166136261;
+    $units = unpack('n*', (string)mb_convert_encoding($value, 'UTF-16BE', 'UTF-8')) ?: [];
+    foreach ($units as $unit) {
+        $hash = ($hash ^ $unit) & 0xFFFFFFFF;
+        $hash = pg_imul32($hash, 16777619);
+    }
+    return $hash;
+}
+function pg_mulberry32(int $seed): Closure {
+    $t = ($seed + 0x6D2B79F5) & 0xFFFFFFFF;
+    return static function () use (&$t): float {
+        $t = pg_imul32($t ^ ($t >> 15), $t | 1);
+        $t = ($t ^ (($t + pg_imul32($t ^ ($t >> 7), $t | 61)) & 0xFFFFFFFF)) & 0xFFFFFFFF;
+        return (($t ^ ($t >> 14)) & 0xFFFFFFFF) / 4294967296;
+    };
+}
+function pg_shuffle_with_seed(array $items, int $seed): array {
+    $items = array_values($items);
+    $rng = pg_mulberry32($seed);
+    for ($i = count($items) - 1; $i > 0; $i--) {
+        $j = (int)floor($rng() * ($i + 1));
+        [$items[$i], $items[$j]] = [$items[$j], $items[$i]];
+    }
+    return $items;
+}
+
+/**
+ * The questions this attempt was served, in order — the server's own copy of the draw ExamTake.tsx
+ * makes (sections ordered by display order; each section's questions shuffled with seed
+ * "<sessionId>|<sectionId>" when its shuffle is on, then cut to its question limit; without sections
+ * the exam's questions with seed "<sessionId>|GLOBAL" and the exam's question count). Grading uses
+ * THIS list, never the question ids the browser sends: those let a candidate drop the questions they
+ * got wrong from the marks total and score 100%.
+ */
+function exam_served_question_ids(PDO $pdo, string $examId, int $sessionId): array {
+    $sections = [];
+    try {
+        $secStmt = $pdo->prepare('SELECT id, question_limit, shuffle_questions FROM exam_sections WHERE exam_id = ? ORDER BY display_order ASC');
+        $secStmt->execute([$examId]);
+        $sections = $secStmt->fetchAll();
+        $secStmt->closeCursor();
+    } catch (Throwable $e) {
+        $sections = []; // no sections table yet = no sections
+    }
+    $served = [];
+    if (count($sections) > 0) {
+        $qStmt = $pdo->prepare('SELECT q.id FROM exam_section_questions esq JOIN questions q ON q.id = esq.question_id
+                                 WHERE esq.section_id = ? ORDER BY esq.display_order ASC');
+        foreach ($sections as $sec) {
+            $qStmt->execute([(string)$sec['id']]);
+            $ids = array_map(static fn($r) => (string)$r['id'], $qStmt->fetchAll());
+            $qStmt->closeCursor();
+            if ((bool)$sec['shuffle_questions']) {
+                $ids = pg_shuffle_with_seed($ids, pg_seed_from_string($sessionId . '|' . (string)$sec['id']));
+            }
+            $limit = (int)($sec['question_limit'] ?? 0);
+            if ($limit > 0 && $limit < count($ids)) {
+                $ids = array_slice($ids, 0, $limit);
+            }
+            array_push($served, ...$ids);
+        }
+        return array_values(array_unique($served));
+    }
+    $examStmt = $pdo->prepare('SELECT shuffle_questions, question_count FROM exams WHERE id = ? LIMIT 1');
+    $examStmt->execute([$examId]);
+    $exam = $examStmt->fetch();
+    $examStmt->closeCursor();
+    if (!$exam) {
+        return [];
+    }
+    $qStmt = $pdo->prepare('SELECT q.id FROM exam_questions eq JOIN questions q ON q.id = eq.question_id
+                             WHERE eq.exam_id = ? ORDER BY eq.display_order ASC');
+    $qStmt->execute([$examId]);
+    $ids = array_map(static fn($r) => (string)$r['id'], $qStmt->fetchAll());
+    $qStmt->closeCursor();
+    if ((bool)$exam['shuffle_questions']) {
+        $ids = pg_shuffle_with_seed($ids, pg_seed_from_string($sessionId . '|GLOBAL'));
+    }
+    $count = $exam['question_count'] !== null ? (int)$exam['question_count'] : 0;
+    if ($count > 0 && $count < count($ids)) {
+        $ids = array_slice($ids, 0, $count);
+    }
+    return array_values(array_unique($ids));
+}
+
+/**
+ * A per-candidate permutation of 0..n-1 (unpredictable without SESSION_SECRET, stable for the same
+ * exam/student/question): the candidate is shown list[perm[0]], list[perm[1]], ... For matching and
+ * ordering questions the stored list order IS the answer, so it is never sent in that order.
+ */
+function exam_candidate_permutation(string $examId, string $studentId, string $questionId, int $n): array {
+    $perm = range(0, max(0, $n - 1));
+    if ($n < 2) {
+        return $n === 1 ? [0] : [];
+    }
+    $secret = (string)pg_env('SESSION_SECRET', '');
+    $stream = '';
+    $pos = 0;
+    $counter = 0;
+    $next = static function () use (&$stream, &$pos, &$counter, $secret, $examId, $studentId, $questionId): int {
+        if ($pos + 4 > strlen($stream)) {
+            $stream = hash_hmac('sha256', "candidate-perm|{$examId}|{$studentId}|{$questionId}|" . $counter++, $secret, true);
+            $pos = 0;
+        }
+        $v = unpack('N', substr($stream, $pos, 4))[1];
+        $pos += 4;
+        return $v;
+    };
+    for ($i = $n - 1; $i > 0; $i--) {
+        $j = $next() % ($i + 1);
+        [$perm[$i], $perm[$j]] = [$perm[$j], $perm[$i]];
+    }
+    return $perm;
+}
+
+/** The permutation used for this question's candidate view (shared by the view and the grader). */
+function exam_candidate_question_permutation(string $type, ?array $match, ?array $key, string $examId, string $studentId, string $questionId): ?array {
+    $type = strtoupper($type);
+    $list = $type === 'MATCHING' ? ($match['right'] ?? null) : (in_array($type, ['ORDERING', 'DRAG_DROP'], true) ? ($match['items'] ?? null) : null);
+    if (!is_array($list)) {
+        return null;
+    }
+    $n = count($list);
+    $perm = exam_candidate_permutation($examId, $studentId, $questionId, $n);
+    if ($n >= 2) {
+        // Never serve the answer itself as the starting order: for matching that is the identity
+        // (right item i pairs with left item i), for ordering the key's order.
+        $answerOrder = $type === 'MATCHING' ? range(0, $n - 1)
+            : ($type === 'ORDERING' && is_array($key['order'] ?? null) && count($key['order']) === $n ? array_map('intval', $key['order']) : null);
+        if ($answerOrder !== null && $perm === $answerOrder) {
+            $perm = array_merge(array_slice($perm, 1), [$perm[0]]);
+        }
+    }
+    return $perm;
+}
+
+/**
+ * What a candidate's browser receives for one question: no correctOptionIndex / answerKey at all,
+ * fill-in-the-blank reduced to its blank count, and the order-revealing lists of matching / ordering
+ * / drag-and-drop questions in a per-candidate order (answers come back in that order and are mapped
+ * back by exam_candidate_answer_to_stored()).
+ */
+function exam_candidate_question_view(array $q, string $examId, string $studentId): array {
+    $type = strtoupper((string)($q['type'] ?? ''));
+    $key = is_array($q['answerKey'] ?? null) ? $q['answerKey'] : null;
+    $match = is_array($q['matchOptions'] ?? null) ? $q['matchOptions'] : null;
+    if ($type === 'FILL_BLANK') {
+        $q['blankCount'] = is_array($key['blanks'] ?? null) ? count($key['blanks']) : 0;
+    }
+    $perm = exam_candidate_question_permutation($type, $match, $key, $examId, $studentId, (string)$q['id']);
+    if ($perm !== null) {
+        $field = $type === 'MATCHING' ? 'right' : 'items';
+        $original = array_values($match[$field]);
+        $match[$field] = array_map(static fn(int $i) => $original[$i], $perm);
+        $q['matchOptions'] = $match;
+    }
+    unset($q['correctOptionIndex'], $q['answerKey']);
+    return $q;
+}
+
+/**
+ * Map a candidate's structured answer from their view's order back to the stored order (what the
+ * grader, the stored answer and the admin screens use). Entries that don't fit the list are dropped.
+ */
+function exam_candidate_answer_to_stored(string $type, $answer, ?array $perm) {
+    if ($perm === null || !is_array($answer)) {
+        return $answer;
+    }
+    $type = strtoupper($type);
+    $n = count($perm);
+    $map = static fn($v): ?int => (is_numeric($v) && (int)$v >= 0 && (int)$v < $n) ? $perm[(int)$v] : null;
+    if ($type === 'MATCHING') {
+        // {leftIndex: rightIndex-in-view}
+        $out = [];
+        foreach ($answer as $left => $right) {
+            $mapped = $map($right);
+            if ($mapped !== null) $out[$left] = $mapped;
+        }
+        return $out;
+    }
+    if ($type === 'ORDERING') {
+        // [itemIndex-in-view, ...] in the candidate's chosen order
+        $out = [];
+        foreach (array_values($answer) as $v) {
+            $mapped = $map($v);
+            if ($mapped !== null) $out[] = $mapped;
+        }
+        return $out;
+    }
+    if ($type === 'DRAG_DROP') {
+        // {itemIndex-in-view: bucketIndex}
+        $out = [];
+        foreach ($answer as $item => $bucket) {
+            $mapped = $map($item);
+            if ($mapped !== null) $out[$mapped] = $bucket;
+        }
+        return $out;
+    }
+    return $answer;
 }
 
 /**

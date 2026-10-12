@@ -70,9 +70,9 @@ Proctoring: PROCTORED        (or UNPROCTORED)
 Camera: ON
 Show Alerts: YES
 Throw Out On Violations: NO
-Batch: Batch_7                (existing batch, or a new name + attach students.csv: Full Name, Email, Registration ID)
+Batch: Batch_7                (existing batch, or a new name + attach students.csv: Full Name, Email, Registration ID, Mobile — Email or Mobile may be left blank)
 Notes: optional text for the approver`;
-const CSV_SAMPLE = 'Full Name,Email,Registration ID\nAsha Rao,asha.rao@example.com,REG-1001\nBilal Khan,bilal.khan@example.com,REG-1002\n';
+const CSV_SAMPLE = 'Full Name,Email,Registration ID,Mobile\nAsha Rao,asha.rao@example.com,REG-1001,+91 98765 43210\nBilal Khan,bilal.khan@example.com,REG-1002,\nChitra Nair,,REG-1003,+91 98765 43211\n';
 
 // ---------------------------------------------------------------------------------------------
 // Small building blocks
@@ -220,13 +220,13 @@ const downloadText = (filename: string, content: string, type = 'text/csv') => {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
 
-/** "Full Name, Email, Registration ID" rows (header optional) → students. */
+/** "Full Name, Email, Registration ID, Mobile" rows (header optional; Email and Mobile may be blank) → students. */
 const parseStudentsCsv = (text: string): ExamRequestStudent[] => {
   const rows = text.split(/\r\n|\r|\n/).map(l => l.trim()).filter(Boolean).map(l => parseCsvLine(l.includes('\t') && !l.includes(',') ? l.replace(/\t/g, ',') : l));
-  if (rows.length > 0 && rows[0].some(c => /e-?mail/i.test(c)) && !rows[0].some(c => c.includes('@'))) rows.shift();
+  if (rows.length > 0 && rows[0].some(c => /e-?mail|full\s*name|registration/i.test(c)) && !rows[0].some(c => c.includes('@'))) rows.shift();
   return rows
-    .map(c => ({ fullName: (c[0] || '').trim(), email: (c[1] || '').trim().toLowerCase(), registrationId: (c[2] || '').trim() }))
-    .filter(s => s.fullName || s.email || s.registrationId);
+    .map(c => ({ fullName: (c[0] || '').trim(), email: (c[1] || '').trim().toLowerCase(), registrationId: (c[2] || '').trim(), mobile: (c[3] || '').replace(/^'/, '').trim() }))
+    .filter(s => s.fullName || s.email || s.registrationId || s.mobile);
 };
 
 const looksLikeEmail = (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
@@ -256,7 +256,7 @@ const StudentsEditor: React.FC<{
   };
   const remove = (index: number) => onChange(students.filter((_, i) => i !== index));
   const addRow = () => {
-    onChange([...students, { fullName: '', email: '', registrationId: '' }]);
+    onChange([...students, { fullName: '', email: '', registrationId: '', mobile: '' }]);
     paging.setPage(Math.floor(students.length / paging.pageSize));
   };
   const addPasted = () => {
@@ -289,7 +289,7 @@ const StudentsEditor: React.FC<{
           <textarea
             className={`${inputCls} font-mono text-xs min-h-[90px]`}
             aria-label="Paste students as CSV"
-            placeholder={'Full Name,Email,Registration ID\nAsha Rao,asha@example.com,REG-1'}
+            placeholder={'Full Name,Email,Registration ID,Mobile\nAsha Rao,asha@example.com,REG-1,+91 98765 43210\nBilal Khan,,REG-2,9876543211'}
             value={pasteText}
             onChange={e => setPasteText(e.target.value)}
           />
@@ -308,15 +308,17 @@ const StudentsEditor: React.FC<{
               <tr>
                 <th className="px-3 py-2 w-10">#</th>
                 <th className="px-3 py-2">Full name</th>
-                <th className="px-3 py-2">Email</th>
+                <th className="px-3 py-2">Email <span className="font-normal normal-case text-slate-400">(optional)</span></th>
                 <th className="px-3 py-2">Registration ID</th>
+                <th className="px-3 py-2">Mobile <span className="font-normal normal-case text-slate-400">(optional)</span></th>
                 {!readOnly && <th className="px-3 py-2 w-10"><span className="sr-only">Remove</span></th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {paging.pageItems.map((s, i) => {
                 const index = paging.page * paging.pageSize + i;
-                const badEmail = !looksLikeEmail(s.email);
+                // Blank is allowed: the student is then invited on WhatsApp (needs a mobile).
+                const badEmail = s.email !== '' && !looksLikeEmail(s.email);
                 return (
                   <tr key={index}>
                     <td className="px-3 py-1.5 text-xs text-slate-400 lsc-tabular">{index + 1}</td>
@@ -325,6 +327,7 @@ const StudentsEditor: React.FC<{
                         <td className="px-3 py-2 text-slate-700">{s.fullName || '—'}</td>
                         <td className="px-3 py-2 text-slate-700 break-all">{s.email || '—'}</td>
                         <td className="px-3 py-2 text-slate-700">{s.registrationId || '—'}</td>
+                        <td className="px-3 py-2 text-slate-700 whitespace-nowrap">{s.mobile || '—'}</td>
                       </>
                     ) : (
                       <>
@@ -336,6 +339,9 @@ const StudentsEditor: React.FC<{
                         </td>
                         <td className="px-2 py-1.5 min-w-[130px]">
                           <input className={`${inputCls} py-1.5 ${!s.registrationId.trim() ? 'border-rose-300' : ''}`} aria-label={`Student ${index + 1} registration ID`} value={s.registrationId} onChange={e => update(index, { registrationId: e.target.value })} />
+                        </td>
+                        <td className="px-2 py-1.5 min-w-[140px]">
+                          <input className={`${inputCls} py-1.5`} type="tel" inputMode="tel" aria-label={`Student ${index + 1} mobile`} value={s.mobile || ''} onChange={e => update(index, { mobile: e.target.value })} />
                         </td>
                         <td className="px-2 py-1.5">
                           <button type="button" onClick={() => remove(index)} aria-label={`Remove student ${index + 1}`} className="p-1.5 text-slate-400 hover:text-rose-600">

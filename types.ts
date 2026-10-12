@@ -222,8 +222,11 @@ export type ExamRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'INVALID';
 
 export interface ExamRequestStudent {
   fullName: string;
+  /** '' = no email on file (the student is then invited on WhatsApp, if they have a mobile). */
   email: string;
   registrationId: string;
+  /** Optional WhatsApp number as typed; the server validates and normalises it. */
+  mobile?: string;
 }
 
 /** The exam an employee asked for by email (editable by the super admin before approval). */
@@ -738,6 +741,32 @@ export interface WhatsAppStatus {
     /** Why it can't be sent as it stands; empty when fine. */
     problems: string[];
   }[];
+}
+
+/** A background send of invitations or reminders (api/notify_jobs.php). */
+export interface NotifyJob {
+  id: number;
+  examId: string;
+  kind: 'INVITE' | 'REMINDER';
+  /** QUEUED · RUNNING · PAUSED (waiting, e.g. for the mail server's hourly limit) · DONE · CANCELLED */
+  status: 'QUEUED' | 'RUNNING' | 'PAUSED' | 'DONE' | 'CANCELLED';
+  total: number;
+  useEmail: boolean;
+  useWhatsApp: boolean;
+  /** noEmail = students with no email address on file (not part of the email total). */
+  email: { sent: number; failed: number; pending: number; noEmail: number };
+  whatsapp: { sent: number; failed: number; pending: number; noMobile: number };
+  /** Students reached on at least one channel. */
+  reached: number;
+  /** Students with no contact detail for any channel this send uses. */
+  unreachable: number;
+  failures: { name: string; email: string; channel: 'EMAIL' | 'WHATSAPP'; error: string }[];
+  note: string | null;
+  pausedUntil: number | null;
+  createdAt: number | null;
+  finishedAt: number | null;
+  emailLimitPerHour: number;
+  emailEtaSeconds: number;
 }
 
 /** One version of a WhatsApp message text made in Settings → WhatsApp (api/whatsapp_templates.php). */

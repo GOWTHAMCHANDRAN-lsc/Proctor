@@ -755,6 +755,47 @@ function ensure_student_company_scoped_uniqueness(PDO $pdo): void {
     }
 }
 
+/**
+ * students.email used to be NOT NULL, so a student who only has a mobile number (reached on
+ * WhatsApp) could not be uploaded at all. Makes the column nullable: NULL = no email on file. The
+ * (company_id, email) unique key keeps working, because MySQL allows any number of NULLs in it,
+ * whereas '' would collide for the second email-less student of a company. Called by the code
+ * that saves students; returns false when the column could not be changed, and callers then keep
+ * asking for an email.
+ */
+function ensure_student_email_optional(PDO $pdo): bool {
+    static $ready = null;
+    if ($ready !== null) {
+        return $ready;
+    }
+    try {
+        $stmt = $pdo->query("SELECT IS_NULLABLE AS is_nullable, COLUMN_TYPE AS column_type, CHARACTER_SET_NAME AS charset_name, COLLATION_NAME AS collation_name
+                               FROM information_schema.COLUMNS
+                              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'students' AND COLUMN_NAME = 'email' LIMIT 1");
+        $col = $stmt ? $stmt->fetch() : false;
+        if ($stmt) $stmt->closeCursor();
+        if (!$col) {
+            return $ready = false;
+        }
+        if (strtoupper((string)$col['is_nullable']) === 'YES') {
+            return $ready = true;
+        }
+        if ($pdo->inTransaction()) {
+            // ALTER TABLE would commit the caller's transaction; leave it for the next request.
+            return false;
+        }
+        // Same type, character set and collation as now; only NOT NULL is dropped.
+        $type = preg_match('/^varchar\(\d+\)$/i', (string)$col['column_type']) === 1 ? (string)$col['column_type'] : 'varchar(255)';
+        $charset = preg_match('/^[A-Za-z0-9_]+$/', (string)$col['charset_name']) === 1 ? ' CHARACTER SET ' . $col['charset_name'] : '';
+        $collation = preg_match('/^[A-Za-z0-9_]+$/', (string)$col['collation_name']) === 1 ? ' COLLATE ' . $col['collation_name'] : '';
+        $pdo->exec("ALTER TABLE students MODIFY email {$type}{$charset}{$collation} NULL DEFAULT NULL");
+        return $ready = true;
+    } catch (Throwable $e) {
+        error_log('[students] could not make email optional: ' . $e->getMessage());
+        return $ready = false;
+    }
+}
+
 function get_student_batches(PDO $pdo, string $studentId): array {
     $stmt = $pdo->prepare("SELECT b.id, b.name
                            FROM student_batches sb

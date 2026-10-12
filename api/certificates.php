@@ -267,7 +267,7 @@ function maybe_issue_certificate(PDO $pdo, array $env, int $companyId, int $sess
         $payload = [
             'verificationId' => $verificationId,
             'studentName' => $student['full_name'],
-            'studentEmail' => $student['email'],
+            'studentEmail' => (string)($student['email'] ?? ''),
             'examTitle' => $exam['title'],
             'companyId' => $companyId,
         ];
@@ -364,7 +364,7 @@ if ($method === 'GET') {
             'sessionId' => (int)$row['session_id'],
             'studentId' => $row['student_id'],
             'studentName' => $row['student_name'],
-            'studentEmail' => $row['student_email'],
+            'studentEmail' => (string)($row['student_email'] ?? ''),
             'examId' => $row['exam_id'],
             'examTitle' => $row['exam_title'],
             'verificationId' => $row['verification_id'],

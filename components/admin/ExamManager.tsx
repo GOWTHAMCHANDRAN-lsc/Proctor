@@ -1,7 +1,9 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Batch, Exam, ExamMailKind, Question, QuestionType, Student, NotificationTemplate, UserRole, CompanyDirectoryRecord } from '../../types';
 import { Plus, Trash2, Save, FileSpreadsheet, Upload, Download, CheckCircle, AlertCircle, Share2, Calendar, Clock, XCircle, FileWarning, Users, Search, Lock, Mail, Send, Loader2, Shuffle, Bell, ListOrdered, Eye, Copy, Monitor, Tablet, Smartphone, Pencil, Award, Library, Camera, Mic, Maximize, ShieldCheck, ShieldOff, Info, MessageCircle } from 'lucide-react';
-import type { DeviceType, ProctoringMode, QuestionBank, QuestionBankDetail, WhatsAppSendSummary, WhatsAppStatus } from '../../types';
+import type { DeviceType, NotifyJob, ProctoringMode, QuestionBank, QuestionBankDetail, WhatsAppStatus } from '../../types';
+import { SendProgressDialog } from './SendProgressDialog';
+import type { SendRequest } from './SendProgressDialog';
 import { ExamTake } from '../student/ExamTake';
 import { ApiError, apiGet, apiPost, getApiErrorMessage } from '../../services/api';
 import { Pagination, usePagination } from './Pagination';
@@ -291,6 +293,17 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   const [waStatus, setWaStatus] = useState<WhatsAppStatus | null>(null);
   // Which channels the next invitation/reminder goes out on (the Email / WhatsApp checkboxes).
   const [sendChannels, setSendChannels] = useState<{ email: boolean; whatsapp: boolean }>({ email: true, whatsapp: true });
+  // Sends run in the background (api/notify_jobs.php). sendDialog = the one being confirmed or
+  // watched; activeSends = those still running for this company, by exam (shown on the cards).
+  const [sendDialog, setSendDialog] = useState<{ request?: SendRequest; autoStart?: boolean; jobId?: number; examTitle: string } | null>(null);
+  const [activeSends, setActiveSends] = useState<Record<string, NotifyJob>>({});
+  // In-app message for the send flow (replaces alert()).
+  const [sendNotice, setSendNotice] = useState<string | null>(null);
+  // Students already counted as invited per job, so a retry doesn't subtract them twice.
+  const countedReachedRef = useRef<Record<number, number>>({});
+  // A background send that finished while its window was closed: acknowledged in a corner notice.
+  const [finishedSend, setFinishedSend] = useState<NotifyJob | null>(null);
+  const watchedSendIdsRef = useRef<Set<number>>(new Set());
   // Student ids (of the exam being sent) that have a mobile number; null while loading.
   const [waCoverage, setWaCoverage] = useState<{ examId: string; ids: Set<string> } | null>(null);
   // Per-exam Mail Composer: pick the audience (e.g. only students who never attempted), edit the
@@ -1477,25 +1490,87 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     setWaCoverage({ examId: exam.id, ids: withMobile });
   };
 
-  // Send the WhatsApp message to these students, in small chunks so no single request runs long.
-  // Counts (and the ids it reached) are summed across chunks.
-  const sendWhatsAppNotices = async (exam: Exam, studentIds: string[], kind: ExamMailKind): Promise<WhatsAppSendSummary> => {
-    const total: WhatsAppSendSummary = { sent: 0, failed: 0, skippedNoMobile: 0, skippedDisabled: 0, failures: [], sentIds: [] };
-    for (let i = 0; i < studentIds.length; i += 25) {
-      const res = await apiPost<WhatsAppSendSummary>('whatsapp.php', withCompany({
-        action: 'SEND_EXAM_NOTICE',
-        examId: exam.id,
-        kind,
-        studentIds: studentIds.slice(i, i + 25),
-      }));
-      total.sent += res?.sent || 0;
-      total.failed += res?.failed || 0;
-      total.skippedNoMobile += res?.skippedNoMobile || 0;
-      total.skippedDisabled += res?.skippedDisabled || 0;
-      total.failures.push(...(res?.failures || []));
-      total.sentIds!.push(...(res?.sentIds || []));
+  // Sends still in progress for this company (they continue when this page is closed).
+  const loadActiveSends = useCallback(async () => {
+    try {
+      const res = await apiGet<{ jobs: NotifyJob[] }>('notify_jobs.php');
+      const byExam: Record<string, NotifyJob> = {};
+      // Newest first from the server; keep the newest per exam.
+      (res?.jobs || []).forEach(job => { if (!byExam[job.examId]) byExam[job.examId] = job; });
+      setActiveSends(byExam);
+      // Anything we were watching that is no longer in progress has finished: say so.
+      const stillActive = new Set((res?.jobs || []).map(job => job.id));
+      const ended = Array.from(watchedSendIdsRef.current).filter(id => !stillActive.has(id));
+      (res?.jobs || []).forEach(job => watchedSendIdsRef.current.add(job.id));
+      for (const id of ended) {
+        watchedSendIdsRef.current.delete(id);
+        try {
+          const done = await apiGet<{ job: NotifyJob }>(`notify_jobs.php?id=${id}`);
+          if (done?.job) {
+            handleSendFinishedRef.current?.(done.job);
+            setFinishedSend(done.job);
+          }
+        } catch {
+          // not critical: the result is also in Communications → Delivery Logs
+        }
+      }
+    } catch (e) {
+      console.error('Could not load the sends in progress:', e);
     }
-    return total;
+  }, []);
+
+  useEffect(() => { void loadActiveSends(); }, [loadActiveSends]);
+  const hasActiveSends = Object.keys(activeSends).length > 0;
+  useEffect(() => {
+    if (!hasActiveSends || sendDialog) return; // the open dialog polls its own send
+    const id = window.setInterval(() => { void loadActiveSends(); }, 15000);
+    return () => window.clearInterval(id);
+  }, [hasActiveSends, sendDialog, loadActiveSends]);
+
+  // Queue a send and open its progress dialog. `confirmed` = the caller already asked "send to N?".
+  const startSend = (exam: Exam, targets: ExamRecipient[], kind: ExamMailKind, channels: { email: boolean; whatsapp: boolean }, override?: { subject?: string; message?: string }, confirmed = false) => {
+    setSendDialog({
+      examTitle: exam.title,
+      autoStart: confirmed,
+      request: {
+        examId: exam.id,
+        examTitle: exam.title,
+        kind,
+        studentIds: targets.map(t => t.id),
+        channels,
+        ...(override?.subject !== undefined ? { subject: override.subject } : {}),
+        ...(override?.message !== undefined ? { message: override.message } : {}),
+      },
+    });
+  };
+
+  // A send reached its end (or was stopped): invitations that went out no longer count as "to invite".
+  const handleSendFinishedRef = useRef<((job: NotifyJob) => void) | null>(null);
+  const handleSendFinished = (job: NotifyJob) => {
+    watchedSendIdsRef.current.delete(job.id);
+    if (job.kind === 'INVITE') {
+      const already = countedReachedRef.current[job.id] || 0;
+      const delta = Math.max(0, job.reached - already);
+      countedReachedRef.current[job.id] = job.reached;
+      if (delta > 0) {
+        onUpdateExams(prev => prev.map(e => e.id === job.examId
+          ? { ...e, pendingInviteCount: Math.max(0, (e.pendingInviteCount ?? 0) - delta) }
+          : e));
+      }
+    }
+    void loadActiveSends();
+  };
+  handleSendFinishedRef.current = (job: NotifyJob) => {
+    // Same bookkeeping, without re-triggering the list refresh that called us.
+    if (job.kind !== 'INVITE') return;
+    const already = countedReachedRef.current[job.id] || 0;
+    const delta = Math.max(0, job.reached - already);
+    countedReachedRef.current[job.id] = job.reached;
+    if (delta > 0) {
+      onUpdateExams(prev => prev.map(e => e.id === job.examId
+        ? { ...e, pendingInviteCount: Math.max(0, (e.pendingInviteCount ?? 0) - delta) }
+        : e));
+    }
   };
 
   // Email / WhatsApp checkboxes ("N of M recipients have a mobile number") — shared by the invitation
@@ -1504,6 +1579,8 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     const waReady = waReadyFor(kind);
     const coverage = waCoverage && waCoverage.examId === exam.id ? waCoverage.ids : null;
     const withMobile = coverage ? targets.filter(t => coverage.has(t.id)).length : null;
+    // Students can be on file without an email address; say so only when some are.
+    const withEmail = targets.filter(t => (t.email || '').trim() !== '').length;
     return (
       <div className="space-y-1.5">
         <p className="text-xs font-medium text-slate-500">Send by</p>
@@ -1515,6 +1592,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
           />
           <Mail size={14} className="text-slate-500 shrink-0" aria-hidden="true" />
           Email
+          {withEmail < targets.length && (
+            <span className="text-slate-500">({withEmail} of {targets.length} recipient{targets.length === 1 ? ' has' : 's have'} an email address)</span>
+          )}
         </label>
         <label className={`flex items-start gap-2 text-sm text-slate-700 select-none ${waReady ? 'cursor-pointer' : 'opacity-60'}`}>
           <input
@@ -1617,16 +1697,22 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   // The card's one-click "Notify" invitation blast. Reminders (and any targeted send) go through the
   // Mail Composer instead, which is where the audience and the copy are chosen.
   const handleSendEmail = async (exam: Exam) => {
+    // Invitations already going out for this exam? Show that send instead of starting another.
+    const running = activeSends[exam.id];
+    if (running && running.kind === 'INVITE') {
+      setSendDialog({ jobId: running.id, examTitle: exam.title });
+      return;
+    }
     setEmailSendingId(exam.id);
     setSendingMode('notify');
 
     let recipients: ExamRecipient[] = [];
     try {
-      // Invitations need signed links, so mint them up front.
-      recipients = await resolveRecipients(exam, true);
+      // The server builds each student's link when it sends, so no tokens are needed here.
+      recipients = await resolveRecipients(exam, false);
     } catch (e: any) {
       console.error(e);
-      alert(apiErrorMessage(e, 'Failed to load the recipient list for this exam.'));
+      setSendNotice(apiErrorMessage(e, 'Failed to load the recipient list for this exam.'));
       return;
     } finally {
       setEmailSendingId(null);
@@ -1634,7 +1720,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     }
 
     if (recipients.length === 0) {
-      alert('No recipients found for this exam. Assign students or batches first.');
+      setSendNotice('No recipients found for this exam. Assign students or batches first.');
       return;
     }
 
@@ -1642,9 +1728,8 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
 
     // Mixed roster — students were added after the exam went out. Re-mailing everyone would push a
     // duplicate invitation at candidates who may already be sitting the exam, so make it a choice.
-    const waInvites = waReadyFor('INVITE');
     setSendChannels({ email: true, whatsapp: true });
-    if (waInvites) {
+    if (waReadyFor('INVITE')) {
       void loadWaCoverage(exam, recipients);
     }
 
@@ -1657,110 +1742,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     // it easy to re-mail a whole roster that may already be sitting the exam.
     const confirmText = pending.length === 0
       ? `All ${recipients.length} assigned students have already been sent a link. Resend the same invitation to all of them?`
-      : `Are you sure you want to send exam invitations to ${recipients.length} students?`;
-    if (waInvites) {
-      // Same question, in the in-app dialog so the Email / WhatsApp checkboxes can sit next to the send button.
-      setInviteScopeTarget({ exam, recipients, pending, confirmText });
-      return;
-    }
-    if (!confirm(confirmText)) return;
-    await dispatchEmails(exam, recipients, false, undefined, { email: true, whatsapp: false });
-  };
-
-  const dispatchEmails = async (
-    exam: Exam,
-    targetStudents: ExamRecipient[],
-    reminder: boolean,
-    override?: { subject?: string; message?: string },
-    // Which channels to use (the Email / WhatsApp checkboxes; caller checked WhatsApp readiness).
-    channels: { email: boolean; whatsapp: boolean } = { email: true, whatsapp: false },
-  ) => {
-    setEmailSendingId(exam.id);
-    setSendingMode(reminder ? 'reminder' : 'notify');
-
-    try {
-        const lines: string[] = [];
-        // Students who got their link by email or WhatsApp (an invitation counts as sent if EITHER did).
-        const reachedIds = new Set<string>();
-
-        if (channels.email) {
-          const messages = targetStudents.map(student => {
-            // Reminder emails carry the exam details only — no access link/token.
-            // The token is minted+signed server-side (resolveRecipients); we never build it here.
-            let link = '';
-            if (!reminder && (student.code || student.token)) {
-              link = examLinkFor(student);
-            }
-
-            const { subject, body } = buildExamEmailContent(exam, student.fullName, link, reminder, override);
-
-            // Normalise the address — emails typed in ALL CAPS or Mixed Case go to the
-            // same mailbox, so send to the correctly-formatted lowercase address.
-            // Instructions are linked in the body (instructionsBlock), not attached — see above.
-            return { to: student.email.trim().toLowerCase(), subject, body };
-          });
-
-          // withCompany: notify.php scopes SMTP + delivery logs by company, like every other write here;
-          // without it a super admin's send was rejected ("companyId is required") or logged under
-          // whichever company the top bar happened to hold.
-          try {
-            const result = await apiPost<{ sent: number; failed?: { to: string; error: string }[] }>('notify.php', withCompany({ messages }));
-            // Addresses that bounced stay uninvited so the next send retries them.
-            const failedTo = new Set((result.failed || []).map(f => (f.to || '').trim().toLowerCase()));
-            targetStudents
-              .filter(s => !failedTo.has(s.email.trim().toLowerCase()))
-              .forEach(s => reachedIds.add(s.id));
-            lines.push(result.failed && result.failed.length > 0
-              ? `Email: ${result.sent} sent, ${result.failed.length} failed.`
-              : `Email: sent to ${result.sent} student${result.sent === 1 ? '' : 's'}.`);
-          } catch (err) {
-            console.error('Email send failed:', err);
-            lines.push(`Email: ${apiErrorMessage(err, 'the emails could not be sent.')}`);
-          }
-        }
-
-        // WhatsApp goes to every selected student with a mobile number, whatever happened to the email.
-        // A WhatsApp problem is reported in the same summary but never undoes the email side.
-        if (channels.whatsapp && targetStudents.length > 0) {
-          try {
-            const wa = await sendWhatsAppNotices(exam, targetStudents.map(s => s.id), reminder ? 'REMINDER' : 'INVITE');
-            (wa.sentIds || []).forEach(id => reachedIds.add(id));
-            const parts = [`${wa.sent} sent`];
-            if (wa.failed > 0) parts.push(`${wa.failed} failed`);
-            if (wa.skippedNoMobile > 0) parts.push(`${wa.skippedNoMobile} without a mobile number`);
-            if (wa.skippedDisabled > 0) parts.push(`${wa.skippedDisabled} skipped (WhatsApp not configured)`);
-            let waLine = `WhatsApp: ${parts.join(', ')}.`;
-            if (wa.failures.length > 0) {
-              waLine += ` First error: ${wa.failures[0].error}`;
-            }
-            lines.push(waLine);
-          } catch (err) {
-            console.error('WhatsApp send failed:', err);
-            lines.push(`WhatsApp: ${apiErrorMessage(err, 'the WhatsApp messages could not be sent.')}`);
-          }
-        }
-
-        // Record who actually received a link, so they aren't counted as "to invite" any more.
-        if (!reminder && reachedIds.size > 0) {
-          const deliveredIds = Array.from(reachedIds);
-          try {
-            await apiPost('exams.php', withCompany({ action: 'MARK_INVITED', examId: exam.id, studentIds: deliveredIds }));
-            onUpdateExams(prev => prev.map(e => e.id === exam.id
-              ? { ...e, pendingInviteCount: Math.max(0, (e.pendingInviteCount ?? 0) - deliveredIds.length) }
-              : e));
-          } catch (err) {
-            console.error('Invitations were sent but could not be recorded:', err);
-          }
-        }
-
-        alert(`${reminder ? 'Reminders' : 'Invitations'} for ${targetStudents.length} student${targetStudents.length === 1 ? '' : 's'}:\n${lines.join('\n')}`);
-    } catch (e) {
-        console.error(e);
-        alert("Failed to send. Please try again.");
-    } finally {
-        setEmailSendingId(null);
-        setSendingMode(null);
-    }
+      : `Send exam invitations to ${recipients.length} student${recipients.length === 1 ? '' : 's'}?`;
+    // Always the in-app dialog: it carries the Email / WhatsApp checkboxes and the send button.
+    setInviteScopeTarget({ exam, recipients, pending, confirmText });
   };
 
   // --- Mail Composer ---
@@ -1881,48 +1865,36 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     }
   };
 
-  const sendFromComposer = async () => {
+  const sendFromComposer = () => {
     const composer = mailComposer;
     if (!composer) return;
+    const fail = (text: string) => setMailComposer(prev => (prev ? { ...prev, error: text } : prev));
 
     const targets = filterByAudience(composer.recipients, composer.audience);
     if (targets.length === 0) {
-      alert('No students match the selected audience, so there is nothing to send.');
+      fail('No students match the selected audience, so there is nothing to send.');
       return;
     }
     if (composer.subject.trim() === '' || composer.message.trim() === '') {
-      alert('Please provide both a subject and a message before sending.');
+      fail('Please provide both a subject and a message before sending.');
       return;
     }
-
-    const kindLabel = composer.kind === 'REMINDER' ? 'reminder' : 'invitation';
     const channels = channelsFor(composer.kind);
     if (!channels.email && !channels.whatsapp) {
-      alert('Tick Email, WhatsApp or both.');
+      fail('Tick Email, WhatsApp or both.');
       return;
     }
-    const via = channels.email && channels.whatsapp ? 'by email and WhatsApp' : channels.email ? 'by email' : 'on WhatsApp';
-    if (!confirm(`Send this ${kindLabel} ${via} to ${targets.length} student${targets.length === 1 ? '' : 's'}?`)) return;
-
-    // Only invitations carry an access link, so only they need signed tokens — and only for the
-    // filtered audience, not the whole roster.
-    let sendTargets = targets;
-    if (composer.kind === 'INVITE') {
-      setMailComposer(prev => (prev ? { ...prev, saving: true, error: null } : prev));
-      try {
-        sendTargets = await mintAccessTokens(composer.exam, targets);
-      } catch (e: any) {
-        console.error(e);
-        setMailComposer(prev => (prev ? { ...prev, saving: false, error: apiErrorMessage(e, 'Could not generate secure exam links. Nothing was sent.') } : prev));
-        return;
-      }
+    const running = activeSends[composer.exam.id];
+    if (running && running.kind === composer.kind) {
+      setMailComposer(null);
+      setSendDialog({ jobId: running.id, examTitle: composer.exam.title });
+      return;
     }
 
+    // The progress dialog asks "send to N?" and then shows the send as it runs. The server renders
+    // each email from this subject/message (and builds each invitation's link), so nothing is minted here.
     setMailComposer(null);
-    await dispatchEmails(composer.exam, sendTargets, composer.kind === 'REMINDER', {
-      subject: composer.subject,
-      message: composer.message,
-    }, channels);
+    startSend(composer.exam, targets, composer.kind, channels, { subject: composer.subject, message: composer.message });
   };
 
   // --- Link Generation & Export ---
@@ -2028,7 +2000,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       }
 
       if (cols.length < 3) {
-        errors.push(`Row ${idx + 1}: expected 3 columns (Full Name, Email, Registration ID).`);
+        errors.push(`Row ${idx + 1}: expected 3 columns (Full Name, Email, Registration ID). Leave the Email cell empty for a student without one.`);
         return;
       }
 
@@ -2036,8 +2008,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       const email = cols[1]?.trim() || '';
       const registrationId = cols[2]?.trim() || '';
 
-      if (!fullName || !email || !registrationId) {
-        errors.push(`Row ${idx + 1}: missing full name, email, or registration ID.`);
+      // Email may be blank; name and registration ID identify the student.
+      if (!fullName || !registrationId) {
+        errors.push(`Row ${idx + 1}: missing full name or registration ID.`);
         return;
       }
 
@@ -2221,13 +2194,17 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
          if (!cleanLine || (idx === 0 && (cleanLine.toLowerCase().includes('email') || cleanLine.toLowerCase().includes('id')))) return;
          
          // Try to find by Email OR Registration ID
-         const student = students.find(s => s.email === cleanLine || s.registrationId === cleanLine);
+         // (a student without an email has '' there, which must never match)
+         const student = students.find(s => (!!s.email && s.email === cleanLine) || s.registrationId === cleanLine);
          if (student) {
             foundIds.push(student.id);
          } else {
             // Also try comma separated?
             const parts = cleanLine.split(',');
-            const match = students.find(s => parts.some(p => p.trim() === s.email || p.trim() === s.registrationId));
+            const match = students.find(s => parts.some(p => {
+              const value = p.trim();
+              return value !== '' && (value === s.email || value === s.registrationId);
+            }));
             if (match) {
                 foundIds.push(match.id);
             } else {
@@ -2261,7 +2238,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
 
       const existingMap = new Map<string, Student>();
       students.forEach(s => {
-        existingMap.set(s.email.toLowerCase(), s);
+        if (s.email) existingMap.set(s.email.toLowerCase(), s);
         existingMap.set(s.registrationId.toLowerCase(), s);
       });
 
@@ -2274,7 +2251,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         if (seen.has(key)) return;
         seen.add(key);
 
-        const byEmail = existingMap.get(row.email.toLowerCase());
+        const byEmail = row.email ? existingMap.get(row.email.toLowerCase()) : undefined;
         const byReg = existingMap.get(row.registrationId.toLowerCase());
         const existing = byEmail || byReg;
         if (existing) {
@@ -4274,6 +4251,49 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   return (
     <div className="space-y-6">
       {renderMailComposer()}
+      {sendDialog && (
+        <SendProgressDialog
+          key={sendDialog.jobId ?? `new-${sendDialog.request?.examId}-${sendDialog.request?.kind}`}
+          request={sendDialog.request}
+          autoStart={sendDialog.autoStart}
+          jobId={sendDialog.jobId}
+          examTitle={sendDialog.examTitle}
+          withCompany={withCompany}
+          onFinished={handleSendFinished}
+          onClose={() => { setSendDialog(null); void loadActiveSends(); }}
+        />
+      )}
+      {finishedSend && !sendDialog && (
+        <div role="status" className="fixed bottom-5 right-5 z-[55] w-[min(92vw,360px)] rounded-xl bg-white shadow-xl border border-slate-200 p-4 space-y-2">
+          <p className="text-sm font-medium text-slate-900 flex items-center gap-2">
+            {finishedSend.email.failed + finishedSend.whatsapp.failed === 0
+              ? <CheckCircle size={16} className="text-teal-600 shrink-0" />
+              : <AlertCircle size={16} className="text-amber-500 shrink-0" />}
+            {finishedSend.kind === 'REMINDER' ? 'Reminders' : 'Invitations'} {finishedSend.status === 'CANCELLED' ? 'stopped' : 'finished'}
+          </p>
+          <p className="text-xs text-slate-600">
+            {exams.find(e => e.id === finishedSend.examId)?.title || 'Exam'}
+            {finishedSend.useEmail ? ` · Email ${finishedSend.email.sent} sent${finishedSend.email.failed ? `, ${finishedSend.email.failed} failed` : ''}` : ''}
+            {finishedSend.useWhatsApp ? ` · WhatsApp ${finishedSend.whatsapp.sent} sent${finishedSend.whatsapp.failed ? `, ${finishedSend.whatsapp.failed} failed` : ''}` : ''}
+          </p>
+          <div className="flex justify-end gap-2">
+            <button type="button" onClick={() => setFinishedSend(null)} className="px-3 py-1.5 rounded-lg text-xs text-slate-500 hover:bg-slate-100">Dismiss</button>
+            <button type="button" onClick={() => { const job = finishedSend; setFinishedSend(null); setSendDialog({ jobId: job.id, examTitle: exams.find(e => e.id === job.examId)?.title || '' }); }} className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-medium hover:bg-slate-800">View details</button>
+          </div>
+        </div>
+      )}
+      {sendNotice && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/40 p-4" role="alertdialog" aria-modal="true" aria-describedby="send-notice-text">
+          <div className="w-full max-w-sm rounded-2xl bg-white shadow-xl border border-slate-200 p-5 space-y-4">
+            <p id="send-notice-text" className="text-sm text-slate-700 flex items-start gap-2">
+              <AlertCircle size={18} className="text-amber-500 shrink-0 mt-0.5" /> {sendNotice}
+            </p>
+            <div className="flex justify-end">
+              <button type="button" autoFocus onClick={() => setSendNotice(null)} className="px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium hover:bg-slate-800">OK</button>
+            </div>
+          </div>
+        </div>
+      )}
       {inviteScopeTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4">
           <div className="w-full max-w-md rounded-2xl bg-white shadow-xl border border-slate-200">
@@ -4298,7 +4318,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                   onClick={() => {
                     const target = inviteScopeTarget;
                     setInviteScopeTarget(null);
-                    dispatchEmails(target.exam, target.recipients, false, undefined, channelsFor('INVITE'));
+                    startSend(target.exam, target.recipients, 'INVITE', channelsFor('INVITE'), undefined, true);
                   }}
                   disabled={noChannelFor('INVITE')}
                   className="w-full px-4 py-2.5 rounded-lg bg-blue-600 text-white font-medium hover:bg-blue-700 disabled:opacity-50"
@@ -4311,7 +4331,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                     onClick={() => {
                       const target = inviteScopeTarget;
                       setInviteScopeTarget(null);
-                      dispatchEmails(target.exam, target.pending, false, undefined, channelsFor('INVITE'));
+                      startSend(target.exam, target.pending, 'INVITE', channelsFor('INVITE'), undefined, true);
                     }}
                     disabled={noChannelFor('INVITE')}
                     className="w-full px-4 py-2.5 rounded-lg bg-blue-600 text-white font-medium hover:bg-blue-700 disabled:opacity-50"
@@ -4322,7 +4342,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                     onClick={() => {
                       const target = inviteScopeTarget;
                       setInviteScopeTarget(null);
-                      dispatchEmails(target.exam, target.recipients, false, undefined, channelsFor('INVITE'));
+                      startSend(target.exam, target.recipients, 'INVITE', channelsFor('INVITE'), undefined, true);
                     }}
                     disabled={noChannelFor('INVITE')}
                     className="w-full px-4 py-2.5 rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-50"
@@ -4557,12 +4577,19 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                   disabled={!!emailSendingId}
                   className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/80 text-[11px] sm:text-xs font-medium text-slate-600 hover:text-blue-600 hover:bg-white disabled:opacity-50 shadow-xs"
                 >
-                  {emailSendingId === exam.id && sendingMode === 'notify' ? <Loader2 size={12} className="animate-spin"/> : <Mail size={12} />}
-                  Notify
+                  {(emailSendingId === exam.id && sendingMode === 'notify') || activeSends[exam.id]?.kind === 'INVITE' ? <Loader2 size={12} className="animate-spin"/> : <Mail size={12} />}
+                  {activeSends[exam.id]?.kind === 'INVITE'
+                    ? `Sending ${activeSends[exam.id].reached}/${activeSends[exam.id].total}`
+                    : 'Notify'}
                 </button>
                 <button
                   onClick={e => {
                     e.stopPropagation();
+                    // A reminder already going out for this exam: show its progress.
+                    if (activeSends[exam.id]?.kind === 'REMINDER') {
+                      setSendDialog({ jobId: activeSends[exam.id].id, examTitle: exam.title });
+                      return;
+                    }
                     // Opens the composer pre-set to chase the students who never attempted, with the
                     // subject/message editable per exam before anything goes out.
                     openMailComposer(exam, 'REMINDER');
@@ -4570,8 +4597,10 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                   disabled={!!emailSendingId}
                   className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/80 text-[11px] sm:text-xs font-medium text-slate-600 hover:text-amber-600 hover:bg-white disabled:opacity-50 shadow-xs"
                 >
-                  {emailSendingId === exam.id && sendingMode === 'reminder' ? <Loader2 size={12} className="animate-spin"/> : <Bell size={12} />}
-                  Reminder
+                  {activeSends[exam.id]?.kind === 'REMINDER' ? <Loader2 size={12} className="animate-spin"/> : <Bell size={12} />}
+                  {activeSends[exam.id]?.kind === 'REMINDER'
+                    ? `Sending ${activeSends[exam.id].reached}/${activeSends[exam.id].total}`
+                    : 'Reminder'}
                 </button>
                 <button
                   onClick={e => {

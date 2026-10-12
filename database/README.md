@@ -4,7 +4,7 @@ MySQL 8 (InnoDB, utf8mb4). Database name: `proctorguard`.
 
 | File | Contents |
 |------|----------|
-| `schema.sql` | Structure of all 41 tables, dumped from production (no rows, no `DEFINER`, no `AUTO_INCREMENT` counters). |
+| `schema.sql` | Structure of all 49 tables, dumped from production (no rows, no `DEFINER`, no `AUTO_INCREMENT` counters). |
 | `routines.sql` | The 37 stored procedures the API calls (`sp_log_access`, `sp_add_delivery_log`, `sp_reset_mac_binding`, ...). |
 
 The root-level `schema.sql` / `proctorguard.sql` are older snapshots and are missing newer tables; use this folder.

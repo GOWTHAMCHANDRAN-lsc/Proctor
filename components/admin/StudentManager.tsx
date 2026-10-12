@@ -346,11 +346,12 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
     const fullName = newStudent.fullName.trim();
     const email = newStudent.email.trim();
     const registrationId = newStudent.registrationId.trim();
-    if (!fullName || !email || !registrationId) {
-      alert('Full name, email, and registration ID are required.');
+    // Email is optional: a student with only a mobile number is reached on WhatsApp.
+    if (!fullName || !registrationId) {
+      alert('Full name and registration ID are required.');
       return;
     }
-    if (!isValidEmail(email)) {
+    if (email && !isValidEmail(email)) {
       alert(`"${email}" is not a valid email address.`);
       return;
     }
@@ -364,7 +365,8 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
     // compare the same way here.
     const emailKey = email.toLowerCase();
     const regKey = registrationId.toLowerCase();
-    const existingMatch = students.find(s => (s.registrationId || '').toLowerCase() === regKey || (s.email || '').toLowerCase() === emailKey);
+    // A blank email matches nobody (several students may have none).
+    const existingMatch = students.find(s => (s.registrationId || '').toLowerCase() === regKey || (emailKey !== '' && (s.email || '').toLowerCase() === emailKey));
     if (existingMatch && existingMatch.batches.some(b => b.id === selectedBatch.id)) {
       alert('This student is already in this batch.');
       return;
@@ -546,9 +548,10 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
   };
 
   const downloadTemplate = () => {
-    // Mobile is optional (used for WhatsApp notifications); 3-column files without it still work.
+    // Email and Mobile are both optional (Mobile is used for WhatsApp); a cell can be left blank and
+    // files without either column still work.
     const headers = 'Full Name,Registration ID,Email,Mobile\n';
-    const sample = 'John Doe,REG2024003,john.doe@example.com,+91 98765 43210\nJane Smith,REG2024004,jane.smith@example.com,';
+    const sample = 'John Doe,REG2024003,john.doe@example.com,+91 98765 43210\nJane Smith,REG2024004,jane.smith@example.com,\nRavi Kumar,REG2024005,,+91 98765 43211';
     const csvContent = `data:text/csv;charset=utf-8,${headers}${sample}`;
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
@@ -590,7 +593,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
     name: ['full name', 'fullname', 'name', 'student name'],
     regId: ['registration id', 'registrationid', 'reg id', 'reg no', 'registration no', 'id', 'student id'],
     email: ['email', 'email address', 'e-mail'],
-    // Optional 4th column.
+    // Optional column.
     mobile: ['mobile', 'phone', 'whatsapp', 'mobile number', 'phone number', 'whatsapp number', 'mobile no', 'phone no'],
   };
 
@@ -609,18 +612,18 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
 
     const headerLine = lines[0]?.trim();
     if (!headerLine) {
-      errors.push({ row: 1, message: 'Missing header row. Use Full Name,Registration ID,Email.' });
+      errors.push({ row: 1, message: 'Missing header row. Use Full Name,Registration ID,Email,Mobile.' });
       return { newStudents, errors };
     }
 
     const headerCols = parseCsvLine(headerLine);
     const nameIdx = findHeaderIndex(headerCols, HEADER_ALIASES.name);
     const regIdIdx = findHeaderIndex(headerCols, HEADER_ALIASES.regId);
-    const emailIdx = findHeaderIndex(headerCols, HEADER_ALIASES.email);
+    const emailIdx = findHeaderIndex(headerCols, HEADER_ALIASES.email); // -1 = no Email column
     const mobileIdx = findHeaderIndex(headerCols, HEADER_ALIASES.mobile); // -1 = no Mobile column
 
-    if (nameIdx === -1 || regIdIdx === -1 || emailIdx === -1) {
-      errors.push({ row: 1, message: 'Missing columns. Use headers: Full Name,Registration ID,Email.' });
+    if (nameIdx === -1 || regIdIdx === -1) {
+      errors.push({ row: 1, message: 'Missing columns. The first row must name the columns: Full Name,Registration ID (Email and Mobile are optional).' });
       return { newStudents, errors };
     }
 
@@ -631,13 +634,15 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
       const cols = parseCsvLine(line).map(value => value.replace(/^"|"$/g, '').trim());
       const name = cols[nameIdx] ?? '';
       const regId = cols[regIdIdx] ?? '';
-      const email = cols[emailIdx] ?? '';
+      // A blank email is fine (the student is reached on WhatsApp or given the link by hand); on an
+      // existing student it leaves the address already on file untouched.
+      const email = emailIdx === -1 ? '' : (cols[emailIdx] ?? '');
 
-      if (!name || !regId || !email) {
-        errors.push({ row: i + 1, message: 'Empty fields detected.' });
+      if (!name || !regId) {
+        errors.push({ row: i + 1, message: 'Full name or registration ID is missing.' });
         continue;
       }
-      if (!isValidEmail(email)) {
+      if (email && !isValidEmail(email)) {
         errors.push({ row: i + 1, message: `Invalid email format: ${email}` });
         continue;
       }
@@ -650,12 +655,12 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
       }
       const regKey = regId.toLowerCase();
       const emailKey = email.toLowerCase();
-      if (seenRegIds.has(regKey) || seenEmails.has(emailKey)) {
-        errors.push({ row: i + 1, message: `Duplicate ID or Email inside file: ${regId} / ${email}` });
+      if (seenRegIds.has(regKey) || (emailKey !== '' && seenEmails.has(emailKey))) {
+        errors.push({ row: i + 1, message: `Duplicate ID or Email inside file: ${regId}${email ? ` / ${email}` : ''}` });
         continue;
       }
       seenRegIds.add(regKey);
-      seenEmails.add(emailKey);
+      if (emailKey !== '') seenEmails.add(emailKey);
 
       newStudents.push({
         id: Math.random().toString(36).slice(2, 11),
@@ -720,12 +725,17 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
             const combinedErrors = [...errors, ...serverErrors];
             setCsvErrors(combinedErrors);
 
+            // Saved fine, but nothing can be sent to them until an email or mobile is added.
+            const noContact = saved.filter(s => !(s.email || '').trim() && !(s.mobile || '').trim()).length;
+            const noContactNote = noContact > 0
+              ? ` ${noContact} of them ${noContact === 1 ? 'has' : 'have'} no email or mobile number, so ${noContact === 1 ? 'that student' : 'those students'} cannot be sent an invitation until one is added.`
+              : '';
             if (saved.length > 0 && combinedErrors.length === 0) {
               setUploadStatus('SUCCESS');
-              setUploadMsg(`Saved ${saved.length} students into batch ${selectedBatch.name}.`);
+              setUploadMsg(`Saved ${saved.length} student${saved.length === 1 ? '' : 's'} into batch ${selectedBatch.name}.${noContactNote}`);
             } else if (saved.length > 0) {
               setUploadStatus('PARTIAL');
-              setUploadMsg(`Saved ${saved.length} students into batch ${selectedBatch.name}. ${combinedErrors.length} rows were skipped.`);
+              setUploadMsg(`Saved ${saved.length} student${saved.length === 1 ? '' : 's'} into batch ${selectedBatch.name}. ${combinedErrors.length} row${combinedErrors.length === 1 ? ' was' : 's were'} skipped.${noContactNote}`);
             } else {
               setUploadStatus('ERROR');
               setUploadMsg('No students were added. Please check the error log below.');
@@ -971,7 +981,9 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
               />
             </div>
             <div>
-              <label htmlFor="new-student-email" className="block text-xs font-semibold text-slate-500 uppercase mb-1">Email Address</label>
+              <label htmlFor="new-student-email" className="block text-xs font-semibold text-slate-500 uppercase mb-1">
+                Email Address <span className="normal-case font-normal text-slate-400">(optional)</span>
+              </label>
               <input
                 id="new-student-email"
                 type="email"
@@ -1065,7 +1077,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
                   {dragActive ? 'Drop file here' : 'Upload Student Data'}
                 </h4>
                 <p className="text-slate-500 text-sm max-w-[220px] mx-auto leading-relaxed">
-                  Select a batch first, then upload CSV with student name, registration ID, email and (optionally) mobile.
+                  Select a batch first, then upload CSV with student name and registration ID. Email and mobile are optional.
                 </p>
                 <div className="mt-6 flex items-center gap-2 text-xs font-medium text-slate-400 bg-slate-100 px-3 py-1 rounded-full group-hover:bg-blue-50 group-hover:text-blue-500 transition-colors">
                   <FileSpreadsheet size={12} />
@@ -1205,7 +1217,7 @@ export const StudentManager: React.FC<StudentManagerProps> = ({ students: propSt
                           )}
                         </div>
                       </td>
-                      <td className="px-6 py-4 text-sm text-slate-500">{student.email}</td>
+                      <td className="px-6 py-4 text-sm text-slate-500">{student.email || <span className="text-slate-300">—</span>}</td>
                       <td className="px-6 py-4 text-sm text-slate-500 whitespace-nowrap font-mono">
                         {student.mobile ? formatMobile(student.mobile) : <span className="text-slate-300 font-sans">—</span>}
                       </td>

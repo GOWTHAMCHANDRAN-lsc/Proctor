@@ -193,7 +193,7 @@ function humanize_student_error(Throwable $e, string $registrationId, string $em
         return "Failed to save student {$registrationId}.";
     }
     if (stripos($message, 'Duplicate entry') !== false) {
-        return "Duplicate student record for {$registrationId} / {$email}.";
+        return "Duplicate student record for {$registrationId}" . ($email !== '' ? " / {$email}" : '') . '.';
     }
     return $message;
 }
@@ -216,6 +216,8 @@ try {
     $GLOBALS['pg_students_mobile_ready'] = false;
 }
 $mobileReady = (bool)$GLOBALS['pg_students_mobile_ready'];
+// students.email is optional (NULL = none on file); only looked up when students are being saved.
+$emailOptional = ($_SERVER['REQUEST_METHOD'] ?? '') === 'POST' ? ensure_student_email_optional($pdo) : true;
 $mobileCountryCode = substr((string)preg_replace('/\D+/', '', (string)pg_env('WHATSAPP_COUNTRY_CODE', '91')), 0, 4) ?: '91';
 
 $enrollReady = false;
@@ -389,7 +391,7 @@ if ($method === 'POST') {
     foreach ($items as $item) {
         if (!is_array($item)) {
             // A scalar row used to fatal on the array accesses below and 500 the whole upload.
-            $errors[] = 'Invalid student row (expected an object with fullName/email/registrationId).';
+            $errors[] = 'Invalid student row (expected an object with fullName/registrationId and an optional email).';
             continue;
         }
         $fullName = trim((string)($item['fullName'] ?? ''));
@@ -409,14 +411,20 @@ if ($method === 'POST') {
             continue;
         }
 
-        if ($fullName === '' || $email === '' || $registrationId === '') {
-            $errors[] = 'Missing fields for student (fullName/email/registrationId required).';
+        // Email is optional: a student with only a mobile number is reached on WhatsApp, and one with
+        // neither can still be given their exam link by hand. Name and registration ID identify them.
+        if ($fullName === '' || $registrationId === '') {
+            $errors[] = 'Missing fields for student' . ($registrationId !== '' ? " {$registrationId}" : ($fullName !== '' ? " {$fullName}" : '')) . ' (full name and registration ID are required).';
+            continue;
+        }
+        if ($email === '' && !$emailOptional) {
+            $errors[] = "Row skipped for {$registrationId}: an email address is required.";
             continue;
         }
         // Same validator notify.php applies at send time: an address that passed the old "contains @"
         // check but not this one (spaces, missing domain, "a@b@c") was stored, then every invitation
         // to it failed with "Invalid recipient email address" long after the upload looked fine.
-        if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
+        if ($email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
             $errors[] = "Invalid email format: {$email}";
             continue;
         }
@@ -471,10 +479,14 @@ if ($method === 'POST') {
             $byReg = $byRegStmt->fetch();
             $byRegStmt->closeCursor();
 
-            $byEmailStmt = $pdo->prepare("SELECT id, email, registration_id FROM students WHERE company_id = ? AND email = ? LIMIT 1");
-            $byEmailStmt->execute([$companyId, $email]);
-            $byEmail = $byEmailStmt->fetch();
-            $byEmailStmt->closeCursor();
+            // A row without an email is matched by registration ID alone.
+            $byEmail = false;
+            if ($email !== '') {
+                $byEmailStmt = $pdo->prepare("SELECT id, email, registration_id FROM students WHERE company_id = ? AND email = ? LIMIT 1");
+                $byEmailStmt->execute([$companyId, $email]);
+                $byEmail = $byEmailStmt->fetch();
+                $byEmailStmt->closeCursor();
+            }
 
             if ($byReg && $byEmail && $byReg['id'] !== $byEmail['id']) {
                 $errors[] = "Row skipped for {$registrationId} / {$email}: registration ID belongs to one existing student and this email belongs to a different one. Fix the mismatch and re-upload this row.";
@@ -485,17 +497,20 @@ if ($method === 'POST') {
 
             if ($existing) {
                 $studentId = (string)$existing['id'];
-                if ($mobileProvided) {
-                    $update = $pdo->prepare("UPDATE students
-                                             SET full_name = ?, email = ?, registration_id = ?, mobile = ?
-                                             WHERE id = ? AND company_id = ?");
-                    $update->execute([$fullName, $email, $registrationId, $mobile, $studentId, $companyId]);
-                } else {
-                    $update = $pdo->prepare("UPDATE students
-                                             SET full_name = ?, email = ?, registration_id = ?
-                                             WHERE id = ? AND company_id = ?");
-                    $update->execute([$fullName, $email, $registrationId, $studentId, $companyId]);
+                // A blank email never erases the address already on file (re-uploading a list without
+                // emails must not wipe them); a blank mobile cell clears it only when the column was sent.
+                $sets = ['full_name = ?', 'registration_id = ?'];
+                $params = [$fullName, $registrationId];
+                if ($email !== '') {
+                    $sets[] = 'email = ?';
+                    $params[] = $email;
                 }
+                if ($mobileProvided) {
+                    $sets[] = 'mobile = ?';
+                    $params[] = $mobile;
+                }
+                $update = $pdo->prepare('UPDATE students SET ' . implode(', ', $sets) . ' WHERE id = ? AND company_id = ?');
+                $update->execute(array_merge($params, [$studentId, $companyId]));
                 $update->closeCursor();
 
                 // Adds the enrollment rather than moving the student — this is what lets the
@@ -533,11 +548,11 @@ if ($method === 'POST') {
             if ($mobileReady) {
                 $insert = $pdo->prepare("INSERT INTO students (id, company_id, full_name, email, registration_id, mobile)
                                          VALUES (?, ?, ?, ?, ?, ?)");
-                $insert->execute([$studentId, $companyId, $fullName, $email, $registrationId, $mobile]);
+                $insert->execute([$studentId, $companyId, $fullName, $email !== '' ? $email : null, $registrationId, $mobile]);
             } else {
                 $insert = $pdo->prepare("INSERT INTO students (id, company_id, full_name, email, registration_id)
                                          VALUES (?, ?, ?, ?, ?)");
-                $insert->execute([$studentId, $companyId, $fullName, $email, $registrationId]);
+                $insert->execute([$studentId, $companyId, $fullName, $email !== '' ? $email : null, $registrationId]);
             }
             $insert->closeCursor();
 

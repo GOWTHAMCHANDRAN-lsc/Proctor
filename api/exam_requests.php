@@ -254,7 +254,10 @@ function er_normalize_details(array $in): array {
     return $d;
 }
 
-/** Coerce a student list into ExamRequestStudent[] (trimmed, email lowercased). */
+/**
+ * Coerce a student list into ExamRequestStudent[] (trimmed, email lowercased). Email and mobile are
+ * both optional ('' = none): a student with only a mobile number is invited on WhatsApp.
+ */
 function er_normalize_students(array $in): array {
     $out = [];
     foreach ($in as $row) {
@@ -263,8 +266,9 @@ function er_normalize_students(array $in): array {
             'fullName' => er_clip(trim((string)($row['fullName'] ?? '')), 300),
             'email' => er_clip(strtolower(trim((string)($row['email'] ?? ''))), 300),
             'registrationId' => er_clip(trim((string)($row['registrationId'] ?? '')), 200),
+            'mobile' => er_clip(trim(is_scalar($row['mobile'] ?? '') ? (string)($row['mobile'] ?? '') : ''), 40),
         ];
-        if ($s['fullName'] === '' && $s['email'] === '' && $s['registrationId'] === '') continue;
+        if ($s['fullName'] === '' && $s['email'] === '' && $s['registrationId'] === '' && $s['mobile'] === '') continue;
         $out[] = $s;
     }
     return $out;
@@ -554,7 +558,9 @@ function er_parse_switch(string $raw): ?bool {
 }
 
 /**
- * students.csv (Full Name, Email, Registration ID; header optional; UTF-8 or Windows-1252).
+ * students.csv (Full Name, Email, Registration ID, Mobile; UTF-8 or Windows-1252). Email and
+ * Mobile are optional — a blank cell, or no such column at all when the file has a header row. A
+ * file without a header is read by position: name, email, registration ID, mobile.
  * Every row is kept — invalid ones too — so validation can point at them and the super admin can
  * fix or remove them on the approval screen. Exact email duplicates are dropped (first one wins).
  * Returns [students, errors].
@@ -588,34 +594,50 @@ function er_parse_students_csv(string $bytes): array {
         return [[], ['The students CSV is empty.']];
     }
 
-    $cols = ['name' => 0, 'email' => 1, 'reg' => 2];
+    $cols = ['name' => 0, 'email' => 1, 'reg' => 2, 'mobile' => 3];
     $first = $rows[0];
-    $looksLikeHeader = false;
-    foreach ($first as $cell) {
-        if (strpos($cell, '@') !== false) { $looksLikeHeader = false; break; }
-        if (preg_match('/e-?mail/i', $cell)) $looksLikeHeader = true;
-    }
-    if ($looksLikeHeader) {
-        $found = [];
-        foreach ($first as $idx => $cell) {
-            $k = (string)preg_replace('/[^a-z]/', '', strtolower($cell));
-            if (!isset($found['email']) && in_array($k, ['email', 'emailaddress', 'mail', 'emailid', 'studentemail'], true)) $found['email'] = $idx;
-            elseif (!isset($found['name']) && in_array($k, ['fullname', 'name', 'studentname', 'candidatename', 'candidate', 'student'], true)) $found['name'] = $idx;
-            elseif (!isset($found['reg']) && in_array($k, ['registrationid', 'registration', 'regid', 'regno', 'registrationno', 'registrationnumber', 'rollno', 'rollnumber', 'studentid', 'id', 'employeeid', 'empid'], true)) $found['reg'] = $idx;
+    $headerNames = [
+        'email' => ['email', 'emailaddress', 'mail', 'emailid', 'studentemail'],
+        'name' => ['fullname', 'name', 'studentname', 'candidatename', 'candidate', 'student'],
+        'reg' => ['registrationid', 'registration', 'regid', 'regno', 'registrationno', 'registrationnumber', 'rollno', 'rollnumber', 'studentid', 'id', 'employeeid', 'empid'],
+        'mobile' => ['mobile', 'mobilenumber', 'mobileno', 'phone', 'phonenumber', 'phoneno', 'whatsapp', 'whatsappnumber', 'whatsappno', 'contactnumber', 'contactno'],
+    ];
+    $found = [];
+    $hasAddress = false;
+    $mentionsEmail = false;
+    foreach ($first as $idx => $cell) {
+        if (strpos($cell, '@') !== false) $hasAddress = true;
+        if (preg_match('/e-?mail/i', $cell)) $mentionsEmail = true;
+        $k = (string)preg_replace('/[^a-z]/', '', strtolower($cell));
+        foreach ($headerNames as $col => $names) {
+            if (!isset($found[$col]) && in_array($k, $names, true)) {
+                $found[$col] = $idx;
+                break;
+            }
         }
-        if (isset($found['email'])) {
+    }
+    // A header row: no address in it, and it names the email column or at least two known columns
+    // (so a file with no Email column at all — Full Name, Registration ID, Mobile — is understood).
+    if (!$hasAddress && ($mentionsEmail || count($found) >= 2)) {
+        if (count($found) >= 2) {
+            // Columns the header doesn't have are simply absent (-1), never guessed by position.
+            $cols = array_merge(['name' => -1, 'email' => -1, 'reg' => -1, 'mobile' => -1], $found);
+        } elseif (isset($found['email'])) {
             $cols = array_merge($cols, $found);
         }
         array_shift($rows);
     }
+    $cell = static fn(array $cells, int $idx): string => $idx >= 0 ? (string)($cells[$idx] ?? '') : '';
 
     $students = [];
     $seen = [];
     foreach ($rows as $cells) {
         $s = [
-            'fullName' => er_clip((string)($cells[$cols['name']] ?? ''), 300),
-            'email' => er_clip(strtolower((string)($cells[$cols['email']] ?? '')), 300),
-            'registrationId' => er_clip((string)($cells[$cols['reg']] ?? ''), 200),
+            'fullName' => er_clip($cell($cells, $cols['name']), 300),
+            'email' => er_clip(strtolower($cell($cells, $cols['email'])), 300),
+            'registrationId' => er_clip($cell($cells, $cols['reg']), 200),
+            // Spreadsheet exports guard "+91…" with a leading apostrophe.
+            'mobile' => er_clip(ltrim($cell($cells, $cols['mobile']), "'"), 40),
         ];
         $key = $s['email'] !== '' ? 'e:' . $s['email'] : 'r:' . implode('|', $s);
         if (isset($seen[$key])) continue;
@@ -817,7 +839,9 @@ function er_existing_student_maps(PDO $pdo, int $companyId, array $students): ar
             $stmt = $pdo->prepare("SELECT id, email, registration_id FROM students WHERE company_id = ? AND {$col} IN ($ph)");
             $stmt->execute(array_merge([$companyId], $chunk));
             foreach ($stmt->fetchAll() as $row) {
-                $byEmail[mb_strtolower((string)$row['email'], 'UTF-8')] = (string)$row['id'];
+                if (trim((string)$row['email']) !== '') {
+                    $byEmail[mb_strtolower((string)$row['email'], 'UTF-8')] = (string)$row['id'];
+                }
                 $byReg[mb_strtolower((string)$row['registration_id'], 'UTF-8')] = (string)$row['id'];
             }
             $stmt->closeCursor();
@@ -920,12 +944,12 @@ function er_validate(PDO $pdo, ?int $companyId, array $details, array $students,
             // A name that isn't a batch yet: approval creates it with this request's CSV students.
             $meta['newBatch'] = true;
         } else {
-            $errors[] = "Batch \"{$d['batchName']}\" does not exist in {$companyName}. To create it, attach a students CSV (Full Name, Email, Registration ID) — those students become the new batch.";
+            $errors[] = "Batch \"{$d['batchName']}\" does not exist in {$companyName}. To create it, attach a students CSV (Full Name, Registration ID, and Email and/or Mobile) — those students become the new batch.";
         }
     }
 
     if (count($students) === 0 && $d['batchName'] === null) {
-        $errors[] = 'Students are required: name a Batch or attach a students CSV (Full Name, Email, Registration ID).';
+        $errors[] = 'Students are required: name a Batch or attach a students CSV (Full Name, Registration ID, and Email and/or Mobile).';
     } elseif (count($students) === 0 && $meta['batchId'] !== null && $meta['batchMembers'] === 0) {
         $errors[] = "Batch \"{$d['batchName']}\" has no students.";
     }
@@ -938,20 +962,30 @@ function er_validate(PDO $pdo, ?int $companyId, array $details, array $students,
     $seenEmail = [];
     $seenReg = [];
     $valid = [];
+    // Email is optional (a student can be reached on WhatsApp, or handed the link); it is only still
+    // required on a database whose students.email column could not be made optional.
+    $emailOptional = count($students) > 0 ? ensure_student_email_optional($pdo) : true;
+    $mobileCc = substr((string)preg_replace('/\D+/', '', (string)pg_env('WHATSAPP_COUNTRY_CODE', '91')), 0, 4) ?: '91';
     foreach ($students as $i => $s) {
         $label = 'Student ' . ($i + 1) . ($s['email'] !== '' ? " ({$s['email']})" : ($s['fullName'] !== '' ? " ({$s['fullName']})" : ''));
         $problems = [];
         if ($s['fullName'] === '') $problems[] = 'full name is missing';
-        if ($s['email'] === '') $problems[] = 'email is missing';
-        elseif (filter_var($s['email'], FILTER_VALIDATE_EMAIL) === false) $problems[] = 'email is not valid';
+        if ($s['email'] === '') {
+            if (!$emailOptional) $problems[] = 'email is missing';
+        } elseif (filter_var($s['email'], FILTER_VALIDATE_EMAIL) === false) {
+            $problems[] = 'email is not valid';
+        }
         if ($s['registrationId'] === '') $problems[] = 'registration ID is missing';
+        if (($s['mobile'] ?? '') !== '' && normalize_mobile((string)$s['mobile'], $mobileCc) === null) $problems[] = 'mobile number is not valid (use 10 digits or + and the country code)';
         if (mb_strlen($s['fullName'], 'UTF-8') > 255 || mb_strlen($s['email'], 'UTF-8') > 255) $problems[] = 'name/email longer than 255 characters';
         if (mb_strlen($s['registrationId'], 'UTF-8') > 128) $problems[] = 'registration ID longer than 128 characters';
         $emailKey = mb_strtolower($s['email'], 'UTF-8');
         $regKey = mb_strtolower($s['registrationId'], 'UTF-8');
         if ($s['email'] !== '' && isset($seenEmail[$emailKey])) $problems[] = 'email appears more than once';
-        if ($s['registrationId'] !== '' && isset($seenReg[$regKey]) && $seenReg[$regKey] !== $emailKey) $problems[] = 'registration ID is used for two different emails';
-        $seenEmail[$emailKey] = true;
+        if ($regKey !== '' && isset($seenReg[$regKey]) && ($emailKey === '' || $seenReg[$regKey] !== $emailKey)) {
+            $problems[] = ($emailKey === '' || $seenReg[$regKey] === '') ? 'registration ID appears more than once' : 'registration ID is used for two different emails';
+        }
+        if ($emailKey !== '') $seenEmail[$emailKey] = true;
         if ($regKey !== '') $seenReg[$regKey] = $emailKey;
         if ($problems) {
             $studentErrors[] = $label . ': ' . implode(', ', $problems) . '.';
@@ -962,7 +996,7 @@ function er_validate(PDO $pdo, ?int $companyId, array $details, array $students,
     if (count($valid) > 0) {
         [$byEmail, $byReg] = er_existing_student_maps($pdo, $companyId, $valid);
         foreach ($valid as $s) {
-            $e = $byEmail[mb_strtolower($s['email'], 'UTF-8')] ?? null;
+            $e = $s['email'] !== '' ? ($byEmail[mb_strtolower($s['email'], 'UTF-8')] ?? null) : null;
             $r = $byReg[mb_strtolower($s['registrationId'], 'UTF-8')] ?? null;
             if ($e !== null && $r !== null && $e !== $r) {
                 $studentErrors[] = "Student {$s['email']}: registration ID {$s['registrationId']} belongs to a different existing student in {$companyName}.";
@@ -1230,9 +1264,16 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
             }
 
             $emailValid = filter_var($email, FILTER_VALIDATE_EMAIL) !== false;
+            // Shown in the failures list for a student with no email on file.
+            $who = $email !== '' ? $email : (trim((string)$row['full_name']) !== '' ? trim((string)$row['full_name']) : $studentId);
             if ($useEmail && !$emailValid) {
-                add_delivery_log($pdo, $studentCompany, 'EMAIL', $email, $subject, $html, 'FAILED', 'Invalid recipient email address.');
-                $result['failures'][] = ['email' => $email, 'error' => 'Invalid recipient email address.'];
+                if ($email !== '') {
+                    add_delivery_log($pdo, $studentCompany, 'EMAIL', $email, $subject, $html, 'FAILED', 'Invalid recipient email address.');
+                    $result['failures'][] = ['email' => $email, 'error' => 'Invalid recipient email address.'];
+                } elseif (!$useWhatsApp) {
+                    // No email on file and WhatsApp is not being used: nothing can reach this student.
+                    $result['failures'][] = ['email' => $who, 'error' => 'No email address on file.'];
+                }
                 if (!$useWhatsApp) continue;
             }
 
@@ -1289,10 +1330,13 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
                             $result['whatsappSent']++;
                         } elseif (($wa['reason'] ?? '') === 'NO_MOBILE') {
                             $result['whatsappNoMobile']++;
+                            if ($email === '') {
+                                $result['failures'][] = ['email' => $who, 'error' => 'No email address or mobile number on file.'];
+                            }
                         } elseif ($wa['status'] === 'FAILED') {
                             $result['whatsappFailed']++;
-                            if (!$useEmail) {
-                                $result['failures'][] = ['email' => $email, 'error' => 'WhatsApp: ' . (string)($wa['error'] ?? 'send failed')];
+                            if (!$useEmail || $email === '') {
+                                $result['failures'][] = ['email' => $who, 'error' => 'WhatsApp: ' . (string)($wa['error'] ?? 'send failed')];
                             }
                         }
                     } catch (Throwable $e) {
@@ -1366,29 +1410,60 @@ function er_notify_approved(PDO $pdo, array $env, array $request, string $examId
 // Approval: create the exam from a validated request
 // ---------------------------------------------------------------------------------------------
 
-/** students.php upsert rules (match by registration id, then email, within the company). Returns [id, created]. */
+/**
+ * students.php upsert rules (match by registration id, then email, within the company). Email and
+ * mobile are optional: a blank one never erases what is already on file. Returns [id, created].
+ */
 function er_upsert_student(PDO $pdo, int $companyId, array $s): array {
+    $email = (string)($s['email'] ?? '');
     $byReg = $pdo->prepare('SELECT id FROM students WHERE company_id = ? AND registration_id = ? LIMIT 1');
     $byReg->execute([$companyId, $s['registrationId']]);
     $regId = $byReg->fetchColumn();
     $byReg->closeCursor();
-    $byEmail = $pdo->prepare('SELECT id FROM students WHERE company_id = ? AND email = ? LIMIT 1');
-    $byEmail->execute([$companyId, $s['email']]);
-    $emailId = $byEmail->fetchColumn();
-    $byEmail->closeCursor();
+    $emailId = false;
+    if ($email !== '') {
+        $byEmail = $pdo->prepare('SELECT id FROM students WHERE company_id = ? AND email = ? LIMIT 1');
+        $byEmail->execute([$companyId, $email]);
+        $emailId = $byEmail->fetchColumn();
+        $byEmail->closeCursor();
+    }
     if ($regId !== false && $emailId !== false && (string)$regId !== (string)$emailId) {
-        throw new RuntimeException("Student {$s['email']}: registration ID {$s['registrationId']} belongs to a different existing student.");
+        throw new RuntimeException("Student {$email}: registration ID {$s['registrationId']} belongs to a different existing student.");
+    }
+    $mobile = null;
+    if (trim((string)($s['mobile'] ?? '')) !== '' && !empty(whatsapp_schema_once($pdo)['studentsMobile'])) {
+        $cc = substr((string)preg_replace('/\D+/', '', (string)pg_env('WHATSAPP_COUNTRY_CODE', '91')), 0, 4) ?: '91';
+        $mobile = normalize_mobile((string)$s['mobile'], $cc);
     }
     $existing = $regId !== false ? (string)$regId : ($emailId !== false ? (string)$emailId : null);
     if ($existing !== null) {
-        $update = $pdo->prepare('UPDATE students SET full_name = ?, email = ?, registration_id = ? WHERE id = ? AND company_id = ?');
-        $update->execute([$s['fullName'], $s['email'], $s['registrationId'], $existing, $companyId]);
+        $sets = ['full_name = ?', 'registration_id = ?'];
+        $params = [$s['fullName'], $s['registrationId']];
+        if ($email !== '') {
+            $sets[] = 'email = ?';
+            $params[] = $email;
+        }
+        if ($mobile !== null) {
+            $sets[] = 'mobile = ?';
+            $params[] = $mobile;
+        }
+        $update = $pdo->prepare('UPDATE students SET ' . implode(', ', $sets) . ' WHERE id = ? AND company_id = ?');
+        $update->execute(array_merge($params, [$existing, $companyId]));
         $update->closeCursor();
         return [$existing, false];
     }
+    if ($email === '' && !ensure_student_email_optional($pdo)) {
+        throw new RuntimeException("Student {$s['registrationId']}: an email address is required.");
+    }
     $id = bin2hex(random_bytes(8));
-    $insert = $pdo->prepare('INSERT INTO students (id, company_id, full_name, email, registration_id) VALUES (?, ?, ?, ?, ?)');
-    $insert->execute([$id, $companyId, $s['fullName'], $s['email'], $s['registrationId']]);
+    $columns = ['id', 'company_id', 'full_name', 'email', 'registration_id'];
+    $values = [$id, $companyId, $s['fullName'], $email !== '' ? $email : null, $s['registrationId']];
+    if ($mobile !== null) {
+        $columns[] = 'mobile';
+        $values[] = $mobile;
+    }
+    $insert = $pdo->prepare('INSERT INTO students (' . implode(', ', $columns) . ') VALUES (' . implode(', ', array_fill(0, count($values), '?')) . ')');
+    $insert->execute($values);
     $insert->closeCursor();
     return [$id, true];
 }

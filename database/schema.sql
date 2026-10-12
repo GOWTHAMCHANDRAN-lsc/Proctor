@@ -178,7 +178,7 @@ DROP TABLE IF EXISTS `delivery_logs`;
 /*!50503 SET character_set_client = utf8mb4 */;
 CREATE TABLE `delivery_logs` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
-  `channel` enum('EMAIL','SMS') COLLATE utf8mb4_unicode_ci NOT NULL,
+  `channel` enum('EMAIL','SMS','WHATSAPP') CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
   `recipient` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
   `subject` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   `body` text COLLATE utf8mb4_unicode_ci,
@@ -338,6 +338,7 @@ CREATE TABLE `exam_mail_templates` (
   `kind` enum('INVITE','REMINDER') COLLATE utf8mb4_unicode_ci NOT NULL,
   `subject` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT '',
   `message` text COLLATE utf8mb4_unicode_ci,
+  `options_json` json DEFAULT NULL,
   `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`exam_id`,`kind`),
   CONSTRAINT `fk_exam_mail_templates_exam` FOREIGN KEY (`exam_id`) REFERENCES `exams` (`id`) ON DELETE CASCADE
@@ -359,6 +360,64 @@ CREATE TABLE `exam_questions` (
   KEY `idx_exam_questions_question` (`question_id`),
   CONSTRAINT `fk_exam_questions_exam` FOREIGN KEY (`exam_id`) REFERENCES `exams` (`id`) ON DELETE CASCADE,
   CONSTRAINT `fk_exam_questions_question` FOREIGN KEY (`question_id`) REFERENCES `questions` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `exam_requesters`
+--
+
+DROP TABLE IF EXISTS `exam_requesters`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `exam_requesters` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `company_id` int unsigned NOT NULL,
+  `name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `email` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `code_hash` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `code_hint` varchar(16) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `status` enum('ACTIVE','DISABLED') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'ACTIVE',
+  `created_by` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `last_request_at` timestamp NULL DEFAULT NULL,
+  `mobile` varchar(20) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_exam_requesters_email` (`email`),
+  KEY `idx_exam_requesters_company` (`company_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `exam_requests`
+--
+
+DROP TABLE IF EXISTS `exam_requests`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `exam_requests` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `company_id` int unsigned DEFAULT NULL,
+  `requester_id` bigint unsigned DEFAULT NULL,
+  `sender_email` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `sender_name` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `subject` varchar(512) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `message_hash` char(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `status` enum('PENDING','APPROVED','REJECTED','INVALID') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'PENDING',
+  `details_json` json DEFAULT NULL,
+  `students_json` json DEFAULT NULL,
+  `errors_json` json DEFAULT NULL,
+  `body_redacted` mediumtext COLLATE utf8mb4_unicode_ci,
+  `received_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `reviewed_by` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `reviewed_at` timestamp NULL DEFAULT NULL,
+  `review_note` text COLLATE utf8mb4_unicode_ci,
+  `created_exam_id` varchar(64) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_exam_requests_message` (`message_hash`),
+  KEY `idx_exam_requests_status` (`status`,`received_at`),
+  KEY `idx_exam_requests_company` (`company_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
@@ -440,6 +499,26 @@ CREATE TABLE `exam_sessions` (
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
+-- Table structure for table `exam_short_links`
+--
+
+DROP TABLE IF EXISTS `exam_short_links`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `exam_short_links` (
+  `code` varchar(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  `exam_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `student_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `company_id` int unsigned NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `last_used_at` timestamp NULL DEFAULT NULL,
+  `use_count` int NOT NULL DEFAULT '0',
+  PRIMARY KEY (`code`),
+  UNIQUE KEY `uq_exam_short_links_target` (`exam_id`,`student_id`,`company_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
 -- Table structure for table `exams`
 --
 
@@ -477,6 +556,10 @@ CREATE TABLE `exams` (
   `proctor_timing_json` json DEFAULT NULL,
   `allowed_device_types_json` json DEFAULT NULL,
   `certificate_enabled` tinyint(1) NOT NULL DEFAULT '0',
+  `proctoring_mode` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'PROCTORED',
+  `show_violation_alerts` tinyint(1) NOT NULL DEFAULT '1',
+  `auto_terminate` tinyint(1) NOT NULL DEFAULT '1',
+  `feedback_enabled` tinyint(1) NOT NULL DEFAULT '1',
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
@@ -580,6 +663,64 @@ CREATE TABLE `login_attempts` (
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
+-- Table structure for table `notification_job_items`
+--
+
+DROP TABLE IF EXISTS `notification_job_items`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `notification_job_items` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `job_id` bigint unsigned NOT NULL,
+  `student_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `student_company_id` int NOT NULL,
+  `full_name` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `email` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `email_status` varchar(12) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'PENDING',
+  `email_error` varchar(500) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `email_attempts` tinyint unsigned NOT NULL DEFAULT '0',
+  `wa_status` varchar(12) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'PENDING',
+  `wa_error` varchar(500) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_notification_job_item` (`job_id`,`student_id`),
+  KEY `idx_notification_job_items_email` (`job_id`,`email_status`),
+  KEY `idx_notification_job_items_wa` (`job_id`,`wa_status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `notification_jobs`
+--
+
+DROP TABLE IF EXISTS `notification_jobs`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `notification_jobs` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `company_id` int NOT NULL,
+  `exam_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `kind` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `use_email` tinyint(1) NOT NULL DEFAULT '1',
+  `use_whatsapp` tinyint(1) NOT NULL DEFAULT '0',
+  `subject_override` text COLLATE utf8mb4_unicode_ci,
+  `message_override` mediumtext COLLATE utf8mb4_unicode_ci,
+  `status` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'QUEUED',
+  `total` int NOT NULL DEFAULT '0',
+  `paused_until` datetime DEFAULT NULL,
+  `note` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `created_by` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `started_at` datetime DEFAULT NULL,
+  `finished_at` datetime DEFAULT NULL,
+  `heartbeat_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_notification_jobs_status` (`status`),
+  KEY `idx_notification_jobs_exam` (`company_id`,`exam_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
 -- Table structure for table `notification_templates`
 --
 
@@ -628,6 +769,46 @@ CREATE TABLE `platform_users` (
   UNIQUE KEY `uq_platform_users_email` (`email`),
   KEY `idx_platform_users_company_role` (`company_id`,`role`),
   KEY `idx_platform_users_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `question_bank_items`
+--
+
+DROP TABLE IF EXISTS `question_bank_items`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `question_bank_items` (
+  `bank_id` bigint unsigned NOT NULL,
+  `question_id` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+  `display_order` int NOT NULL DEFAULT '0',
+  `added_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`bank_id`,`question_id`),
+  KEY `idx_question_bank_items_question` (`question_id`),
+  CONSTRAINT `fk_question_bank_items_bank` FOREIGN KEY (`bank_id`) REFERENCES `question_banks` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_question_bank_items_question` FOREIGN KEY (`question_id`) REFERENCES `questions` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `question_banks`
+--
+
+DROP TABLE IF EXISTS `question_banks`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `question_banks` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `company_id` int unsigned NOT NULL,
+  `name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `description` text COLLATE utf8mb4_unicode_ci,
+  `created_by` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_question_banks_company_name` (`company_id`,`name`),
+  KEY `idx_question_banks_company` (`company_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
@@ -866,7 +1047,7 @@ DROP TABLE IF EXISTS `students`;
 CREATE TABLE `students` (
   `id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
   `full_name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `email` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `email` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   `registration_id` varchar(128) COLLATE utf8mb4_unicode_ci NOT NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `company_id` int NOT NULL DEFAULT '1',
@@ -874,9 +1055,10 @@ CREATE TABLE `students` (
   `face_descriptor` text COLLATE utf8mb4_unicode_ci,
   `face_photo` mediumtext COLLATE utf8mb4_unicode_ci,
   `enrolled_at` timestamp NULL DEFAULT NULL,
+  `mobile` varchar(20) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   PRIMARY KEY (`id`),
-  UNIQUE KEY `uq_students_company_email` (`company_id`,`email`),
   UNIQUE KEY `uq_students_company_regid` (`company_id`,`registration_id`),
+  UNIQUE KEY `uq_students_company_email` (`company_id`,`email`),
   KEY `idx_students_company_batch` (`company_id`,`batch_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
@@ -964,6 +1146,36 @@ CREATE TABLE `violation_reviews` (
   `reviewed_at` datetime(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (`violation_id`),
   CONSTRAINT `fk_violation_review` FOREIGN KEY (`violation_id`) REFERENCES `violation_logs` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `whatsapp_templates`
+--
+
+DROP TABLE IF EXISTS `whatsapp_templates`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `whatsapp_templates` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `kind` varchar(20) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `name` varchar(128) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `language` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'en',
+  `body_text` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  `fields_json` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  `button_text` varchar(40) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `status` varchar(16) COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'PENDING',
+  `meta_id` varchar(64) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `meta_status` varchar(32) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `meta_category` varchar(32) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `rejected_reason` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `created_by` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `checked_at` timestamp NULL DEFAULT NULL,
+  `activated_at` timestamp NULL DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_whatsapp_templates_name` (`name`),
+  KEY `idx_whatsapp_templates_kind` (`kind`,`status`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 

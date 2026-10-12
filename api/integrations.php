@@ -206,10 +206,13 @@ function upsert_integration_candidate(PDO $pdo, int $companyId, string $fullName
         return $studentId;
     }
 
-    $fullName = $fullName !== '' ? $fullName : $email;
+    $fullName = $fullName !== '' ? $fullName : ($email !== '' ? $email : $registrationId);
     $studentId = 'ext_' . bin2hex(random_bytes(8));
+    // No email on the event = NULL (not ''), so a second email-less learner doesn't collide on the
+    // (company_id, email) unique key.
+    $storedEmail = ($email === '' && ensure_student_email_optional($pdo)) ? null : $email;
     $insert = $pdo->prepare('INSERT INTO students (id, company_id, full_name, email, registration_id) VALUES (?, ?, ?, ?, ?)');
-    $insert->execute([$studentId, $companyId, $fullName, $email, $registrationId]);
+    $insert->execute([$studentId, $companyId, $fullName, $storedEmail, $registrationId]);
     $insert->closeCursor();
     if ($batchId !== null) {
         add_student_batch($pdo, $studentId, $batchId);

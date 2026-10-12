@@ -53,7 +53,7 @@ const EXAM_MAIL_LIMITS = [
 ];
 const EXAM_MAIL_OPTION_TEXT_KEYS = ['headerTitle', 'buttonText', 'closingNote'];
 const EXAM_MAIL_OPTION_BOOL_KEYS = [
-    'showSchedule', 'showDuration', 'showCandidate', 'showRequirements', 'showInstructionsPdf', 'showProctoringNotice',
+    'showSchedule', 'showDuration', 'showQuestions', 'showCandidate', 'showRequirements', 'showInstructionsPdf', 'showProctoringNotice',
 ];
 
 /** services/timezone.ts EXAM_TIMEZONES value → name. */
@@ -368,6 +368,7 @@ function exam_mail_resolve_options($options, bool $unproctored): array {
         'closingNote' => $text($o['closingNote'] ?? null),
         'showSchedule' => $flag($o['showSchedule'] ?? null, true),
         'showDuration' => $flag($o['showDuration'] ?? null, true),
+        'showQuestions' => $flag($o['showQuestions'] ?? null, true),
         'showCandidate' => $flag($o['showCandidate'] ?? null, true),
         'showRequirements' => $flag($o['showRequirements'] ?? null, true),
         'showInstructionsPdf' => $flag($o['showInstructionsPdf'] ?? null, !$unproctored),
@@ -491,6 +492,8 @@ function exam_mail_exam_by_id(PDO $pdo, string $examId): ?array {
         'id' => (string)$row['id'],
         'title' => (string)$row['title'],
         'durationMinutes' => (int)($row['duration_minutes'] ?? 0),
+        // Questions a candidate is given (examCandidateQuestionCount() in services/examEmail.ts).
+        'questionTotal' => exam_candidate_question_count($pdo, (string)$row['id']),
         'startTime' => $toMs($row['start_time'] ?? null),
         'endTime' => $toMs($row['end_time'] ?? null),
         'timezone' => isset($row['timezone']) && $row['timezone'] !== '' ? (string)$row['timezone'] : null,
@@ -527,6 +530,7 @@ function exam_mail_render(array $exam, string $recipientName, string $link, stri
     $endMs = $exam['endTime'] ?? null;
     $examTz = exam_mail_resolve_timezone($exam['timezone'] ?? null);
     $durationLabel = exam_mail_format_duration($exam['durationMinutes'] ?? null);
+    $questionTotal = max(0, (int)($exam['questionTotal'] ?? 0));
     $dateStr = exam_mail_format_date($startMs, $examTz);
     $timeStr = exam_mail_format_time($startMs, $examTz);
     $winOpenLabel = exam_mail_schedule_label($startMs, $examTz);
@@ -537,14 +541,15 @@ function exam_mail_render(array $exam, string $recipientName, string $link, stri
     $safeName = exam_mail_escape($recipientName);
     $safeTitle = exam_mail_escape($title);
     $safeLink = exam_mail_escape($link);
-    $fill = static function (string $tpl, bool $html = false) use ($safeName, $recipientName, $safeTitle, $title, $startLabel, $endLabel, $durationLabel, $safeLink, $link): string {
-        $out = preg_replace_callback('/\{(StudentName|ExamTitle|StartTime|EndTime|Duration|Link)\}/', static function (array $m) use ($html, $safeName, $recipientName, $safeTitle, $title, $startLabel, $endLabel, $durationLabel, $safeLink, $link): string {
+    $fill = static function (string $tpl, bool $html = false) use ($safeName, $recipientName, $safeTitle, $title, $startLabel, $endLabel, $durationLabel, $questionTotal, $safeLink, $link): string {
+        $out = preg_replace_callback('/\{(StudentName|ExamTitle|StartTime|EndTime|Duration|QuestionCount|Link)\}/', static function (array $m) use ($html, $safeName, $recipientName, $safeTitle, $title, $startLabel, $endLabel, $durationLabel, $questionTotal, $safeLink, $link): string {
             switch ($m[1]) {
                 case 'StudentName': return $html ? $safeName : $recipientName;
                 case 'ExamTitle': return $html ? $safeTitle : $title;
                 case 'StartTime': return $startLabel;
                 case 'EndTime': return $endLabel;
                 case 'Duration': return $durationLabel;
+                case 'QuestionCount': return (string)$questionTotal;
                 default: return $html ? $safeLink : $link;
             }
         }, $tpl);
@@ -580,6 +585,7 @@ function exam_mail_render(array $exam, string $recipientName, string $link, stri
     // Details card.
     $metaCells = [];
     if ($opts['showDuration']) $metaCells[] = ['Duration', $durationLabel];
+    if ($opts['showQuestions'] && $questionTotal > 0) $metaCells[] = ['Questions', (string)$questionTotal];
     if ($opts['showCandidate']) $metaCells[] = ['Candidate', $safeName];
     $rowBorder = static fn(bool $last): string => $last ? '' : 'border-bottom:1px solid #e2e8f0;';
     $scheduleRow = static function (string $label, string $value, bool $last) use ($rowBorder): string {
@@ -599,9 +605,11 @@ HTML;
     if ($metaCount > 0) {
         $cells = '';
         foreach ($metaCells as $i => [$label, $value]) {
+            // Equal-width tiles (two = 50% each, three = 33% each) with a divider after all but the last.
+            $metaWidth = intdiv(100, max(1, $metaCount));
             $style = $metaCount === 1
                 ? 'padding:16px 24px;width:100%;'
-                : ($i === 0 ? 'padding:16px 24px;border-right:1px solid #e2e8f0;width:50%;' : 'padding:16px 24px;width:50%;');
+                : ($i < $metaCount - 1 ? "padding:16px 24px;border-right:1px solid #e2e8f0;width:{$metaWidth}%;" : "padding:16px 24px;width:{$metaWidth}%;");
             $cells .= <<<HTML
 
             <td class="lsc-stack" style="{$style}">

@@ -102,7 +102,23 @@ Update on your exam request {{2}} for "{{3}}":
 You will also receive the full details by email.
 ```
 
-**Editing a template later (Meta provider).** With `WHATSAPP_META_WABA_ID` set, ProctorGuard reads
+**Editing the message text from ProctorGuard (recommended).** Settings → *WhatsApp message text*
+(super admin; Meta provider with `WHATSAPP_META_WABA_ID`). Write the invitation, reminder or
+request-update text with placeholders — `{StudentName}`, `{ExamTitle}`, `{ExamWindow}`,
+`{StartTime}`, `{EndTime}`, `{Duration}`, `{QuestionCount}`, `{Link}` (request updates:
+`{EmployeeName}`, `{RequestRef}`, `{ExamTitle}`, `{Status}`) — and choose whether the message has a
+link button. *Submit* sends it to WhatsApp as a new template version (`pg_exam_<kind>_<timestamp>`,
+Utility):
+
+* the version in use keeps sending until WhatsApp approves the new one, then ProctorGuard switches
+  by itself (checked when the Settings page is open and whenever a message is sent);
+* a message contains exactly the placeholders its text uses — a reminder written without `{Link}`
+  and without the button is sent with no link at all;
+* a version WhatsApp files under Marketing is **held**, not used (you can still choose to use it);
+  a rejected one shows WhatsApp's reason; previous versions can be restored or removed;
+* versions made here take priority over the template names in `.env`, which stay as the fallback.
+
+**Editing a template directly in WhatsApp Manager.** With `WHATSAPP_META_WABA_ID` set, ProctorGuard reads
 each template from WhatsApp Manager before sending (cached for 5 minutes) and follows it:
 
 * wording, formatting, emoji, extra instructions, footer, a fixed text header — nothing to do;

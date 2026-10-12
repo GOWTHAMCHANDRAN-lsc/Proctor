@@ -118,7 +118,7 @@ const ACCENT_PRESETS: { label: string; value: string }[] = [
 const DEFAULT_ACCENT_SWATCH = '#2563eb';
 
 type TextField = 'subject' | 'message' | 'headerTitle' | 'buttonText' | 'closingNote';
-type BlockKey = 'showSchedule' | 'showDuration' | 'showCandidate' | 'showRequirements' | 'showInstructionsPdf' | 'showProctoringNotice';
+type BlockKey = 'showSchedule' | 'showDuration' | 'showQuestions' | 'showCandidate' | 'showRequirements' | 'showInstructionsPdf' | 'showProctoringNotice';
 
 const SAMPLE_CANDIDATE = 'Alex Morgan';
 
@@ -223,6 +223,7 @@ export const ExamEmailsEditor: React.FC<{
   const blockToggles: { key: BlockKey; label: string; hint: string }[] = [
     { key: 'showSchedule', label: 'Exam window', hint: 'Date From / To in the exam’s timezone' },
     { key: 'showDuration', label: 'Duration', hint: 'How long the exam runs' },
+    { key: 'showQuestions', label: 'Number of questions', hint: 'How many questions the candidate gets' },
     { key: 'showCandidate', label: 'Candidate name', hint: 'Name tile in the details card' },
     {
       key: 'showRequirements', label: 'System requirements',

@@ -1023,6 +1023,45 @@ function exam_served_question_ids(PDO $pdo, string $examId, int $sessionId): arr
 }
 
 /**
+ * How many questions a candidate of this exam is given — the size of the draw
+ * exam_served_question_ids() makes (each section's question limit, or the exam's question count,
+ * capped at what the pool holds). Shown in invitations and reminders.
+ */
+function exam_candidate_question_count(PDO $pdo, string $examId): int {
+    try {
+        $secStmt = $pdo->prepare('SELECT s.question_limit,
+                                         (SELECT COUNT(*) FROM exam_section_questions esq JOIN questions q ON q.id = esq.question_id WHERE esq.section_id = s.id) AS pool
+                                    FROM exam_sections s WHERE s.exam_id = ?');
+        $secStmt->execute([$examId]);
+        $sections = $secStmt->fetchAll();
+        $secStmt->closeCursor();
+    } catch (Throwable $e) {
+        $sections = [];
+    }
+    if (count($sections) > 0) {
+        $total = 0;
+        foreach ($sections as $sec) {
+            $pool = (int)$sec['pool'];
+            $limit = (int)($sec['question_limit'] ?? 0);
+            $total += ($limit > 0 && $limit < $pool) ? $limit : $pool;
+        }
+        return $total;
+    }
+    $stmt = $pdo->prepare('SELECT e.question_count,
+                                  (SELECT COUNT(*) FROM exam_questions eq JOIN questions q ON q.id = eq.question_id WHERE eq.exam_id = e.id) AS pool
+                             FROM exams e WHERE e.id = ? LIMIT 1');
+    $stmt->execute([$examId]);
+    $row = $stmt->fetch();
+    $stmt->closeCursor();
+    if (!$row) {
+        return 0;
+    }
+    $pool = (int)$row['pool'];
+    $count = $row['question_count'] !== null ? (int)$row['question_count'] : 0;
+    return ($count > 0 && $count < $pool) ? $count : $pool;
+}
+
+/**
  * A per-candidate permutation of 0..n-1 (unpredictable without SESSION_SECRET, stable for the same
  * exam/student/question): the candidate is shown list[perm[0]], list[perm[1]], ... For matching and
  * ordering questions the stored list order IS the answer, so it is never sent in that order.

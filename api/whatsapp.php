@@ -24,6 +24,8 @@ declare(strict_types=1);
  */
 
 require_once __DIR__ . '/_bootstrap.php';
+// Message text managed from Settings (versions, placeholders, which template is in use).
+require_once __DIR__ . '/whatsapp_templates.php';
 
 const WHATSAPP_KINDS = ['INVITE', 'REMINDER', 'REQUEST_UPDATE'];
 const WHATSAPP_EXAM_KINDS = ['INVITE', 'REMINDER'];
@@ -34,8 +36,6 @@ const WHATSAPP_CONNECT_TIMEOUT = 5;
 // in one PHP process, further sends in that process fail fast instead of each waiting out the
 // timeout — so a provider outage can't stall a 2000-student batch (or an invitation run) for hours.
 const WHATSAPP_BREAKER_LIMIT = 5;
-// Body variables ProctorGuard fills for each message kind ({{1}}..{{n}}, fixed order).
-const WHATSAPP_BODY_VARIABLES = ['INVITE' => 5, 'REMINDER' => 4, 'REQUEST_UPDATE' => 4];
 // How long a template definition read from Meta is reused before it is read again (seconds).
 const WHATSAPP_TEMPLATE_CACHE_TTL = 300;
 
@@ -440,7 +440,8 @@ function whatsapp_meta_template(array $cfg, string $name, bool $fresh = false): 
     $cached = null;
     if (is_readable($file)) {
         $decoded = json_decode((string)@file_get_contents($file), true);
-        if (is_array($decoded) && isset($decoded['fetchedAt'], $decoded['info'])) {
+        // v2 = entries that carry the body text and button label (older cache files are ignored).
+        if (is_array($decoded) && isset($decoded['fetchedAt'], $decoded['info']) && ($decoded['v'] ?? 1) === 2) {
             $cached = $decoded;
         }
     }
@@ -449,7 +450,7 @@ function whatsapp_meta_template(array $cfg, string $name, bool $fresh = false): 
     }
 
     $url = rtrim((string)$t['baseUrl'], '/') . '/' . rawurlencode((string)$t['version']) . '/' . rawurlencode($wabaId)
-        . '/message_templates?fields=name,status,category,language,parameter_format,components&limit=50&name=' . rawurlencode($name);
+        . '/message_templates?fields=name,status,category,language,parameter_format,rejected_reason,components&limit=50&name=' . rawurlencode($name);
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
@@ -480,13 +481,14 @@ function whatsapp_meta_template(array $cfg, string $name, bool $fresh = false): 
     }
     if ($info === null) {
         $info = ['name' => $name, 'status' => 'NOT_FOUND', 'category' => null, 'language' => (string)$cfg['language'],
-                 'bodyVars' => 0, 'namedParams' => false, 'headerParams' => false, 'button' => null, 'extraButtonParams' => false];
+                 'bodyVars' => 0, 'namedParams' => false, 'headerParams' => false, 'button' => null, 'extraButtonParams' => false,
+                 'bodyText' => '', 'buttonText' => null, 'rejectedReason' => null];
     }
     if (!is_dir($dir)) {
         @mkdir($dir, 02775, true);
     }
     $tmp = $file . '.' . getmypid() . '.tmp';
-    if (@file_put_contents($tmp, json_encode(['fetchedAt' => time(), 'info' => $info])) !== false) {
+    if (@file_put_contents($tmp, json_encode(['v' => 2, 'fetchedAt' => time(), 'info' => $info])) !== false) {
         @chmod($tmp, 0664);
         @rename($tmp, $file);
     }
@@ -505,10 +507,14 @@ function whatsapp_parse_meta_template(array $row): array {
         'headerParams' => false,
         'button' => null,
         'extraButtonParams' => false,
+        'bodyText' => '',
+        'buttonText' => null,
+        'rejectedReason' => isset($row['rejected_reason']) && strtoupper((string)$row['rejected_reason']) !== 'NONE' ? (string)$row['rejected_reason'] : null,
     ];
     foreach ((array)($row['components'] ?? []) as $component) {
         $type = strtoupper((string)($component['type'] ?? ''));
         if ($type === 'BODY') {
+            $info['bodyText'] = (string)($component['text'] ?? '');
             preg_match_all('/\{\{\s*(\d+)\s*\}\}/', (string)($component['text'] ?? ''), $m);
             $info['bodyVars'] = count(array_unique($m[1]));
             if (preg_match('/\{\{\s*[A-Za-z_]\w*\s*\}\}/', (string)($component['text'] ?? '')) === 1) {
@@ -526,6 +532,7 @@ function whatsapp_parse_meta_template(array $row): array {
                 if ($buttonType === 'URL' && preg_match('/^(.*)\{\{\s*1\s*\}\}$/', $buttonUrl, $bm) === 1) {
                     if ($info['button'] === null) {
                         $info['button'] = ['index' => $index, 'prefix' => $bm[1]];
+                        $info['buttonText'] = (string)($button['text'] ?? '');
                     } else {
                         $info['extraButtonParams'] = true;
                     }
@@ -543,7 +550,7 @@ function whatsapp_parse_meta_template(array $row): array {
  * Manager that ProctorGuard cannot follow automatically; wording, formatting, the link button's
  * address / position and the language all are followed.
  */
-function whatsapp_template_problems(array $info, string $kind): array {
+function whatsapp_template_problems(array $info, string $kind, ?int $expected = null): array {
     $name = (string)$info['name'];
     $problems = [];
     if ($info['status'] === 'NOT_FOUND') {
@@ -552,11 +559,11 @@ function whatsapp_template_problems(array $info, string $kind): array {
     if ($info['status'] !== 'APPROVED') {
         $problems[] = "Template \"{$name}\" is {$info['status']} in WhatsApp Manager (only APPROVED templates can be sent).";
     }
-    $expected = WHATSAPP_BODY_VARIABLES[$kind] ?? null;
+    $expected = $expected ?? count(WHATSAPP_LEGACY_FIELDS[$kind] ?? []);
     if ($info['namedParams']) {
         $problems[] = "Template \"{$name}\" uses named variables; ProctorGuard fills numbered ones ({{1}}, {{2}}, …).";
     } elseif ($expected !== null && $info['bodyVars'] !== $expected) {
-        $problems[] = "Template \"{$name}\" has {$info['bodyVars']} variable(s) in its text but ProctorGuard fills {$expected} for this message — keep {{1}}…{{{$expected}}}.";
+        $problems[] = "Template \"{$name}\" has {$info['bodyVars']} variable(s) in its text but ProctorGuard fills {$expected} for this message. It was changed in WhatsApp Manager — edit the message from Settings → WhatsApp instead, or restore its {$expected} variable(s).";
     }
     if ($info['headerParams']) {
         $problems[] = "Template \"{$name}\" has a header that needs a value (image, document or variable), which ProctorGuard does not send.";
@@ -571,15 +578,10 @@ function whatsapp_template_problems(array $info, string $kind): array {
 }
 
 /** A short human-readable rendering of the message for the delivery log. */
-function whatsapp_preview(string $kind, array $params): string {
-    $labels = [
-        'INVITE' => ['Name', 'Exam', 'Window', 'Duration', 'Link'],
-        'REMINDER' => ['Name', 'Exam', 'Window', 'Link'],
-        'REQUEST_UPDATE' => ['Name', 'Request', 'Exam', 'Status'],
-    ][$kind] ?? [];
+function whatsapp_preview(string $kind, array $params, array $fields = []): string {
     $parts = [];
     foreach (array_values($params) as $i => $value) {
-        $label = $labels[$i] ?? ('{{' . ($i + 1) . '}}');
+        $label = $fields[$i] ?? ('{{' . ($i + 1) . '}}');
         $parts[] = "{$label}: {$value}";
     }
     return '[' . $kind . '] ' . implode(' | ', $parts);
@@ -589,10 +591,11 @@ function whatsapp_preview(string $kind, array $params): string {
  * Send one approved template message. Returns {ok, status: SENT|FAILED|SKIPPED, error?, messageId?}.
  * SENT and FAILED write a delivery_logs row; SKIPPED (WhatsApp off / not ready / no template for this
  * kind) returns immediately WITHOUT logging, so the log doesn't fill up while the feature is disabled.
- * $buttonLink is the full URL the template's dynamic link button should open (exam notices only);
- * it is used only when WHATSAPP_TEMPLATE_<KIND>_BUTTON_URL is configured.
+ * $values are named (WHATSAPP_TEMPLATE_FIELDS keys, e.g. StudentName, ExamWindow, Link): the template
+ * in use decides which of them it shows and in what order (whatsapp_active_template()).
+ * $buttonLink is the full URL the template's link button should open, when it has one.
  */
-function whatsapp_send_template(PDO $pdo, array $env, int $companyId, string $kind, string $mobile, array $params, array $meta = [], ?string $buttonLink = null): array {
+function whatsapp_send_template(PDO $pdo, array $env, int $companyId, string $kind, string $mobile, array $values, array $meta = [], ?string $buttonLink = null): array {
     static $consecutiveTransportFailures = 0;
 
     $kind = strtoupper(trim($kind));
@@ -610,9 +613,11 @@ function whatsapp_send_template(PDO $pdo, array $env, int $companyId, string $ki
     }
     whatsapp_schema_once($pdo);
 
-    $template = (string)$cfg['templates'][$kind];
-    $clean = array_map(static fn($p) => whatsapp_clean_param((string)$p), array_values($params));
-    $preview = whatsapp_preview($kind, $clean);
+    $active = whatsapp_active_template($pdo, $cfg, $kind);
+    $template = (string)$active['name'];
+    $fields = $active['fields'];
+    $clean = array_map(static fn(string $field) => whatsapp_clean_param((string)($values[$field] ?? '')), $fields);
+    $preview = whatsapp_preview($kind, $clean, $fields);
     $logMeta = array_merge($meta, [
         'kind' => $kind,
         'provider' => $cfg['provider'],
@@ -633,7 +638,7 @@ function whatsapp_send_template(PDO $pdo, array $env, int $companyId, string $ki
     $language = null;
     $live = $cfg['provider'] === 'meta' ? whatsapp_meta_template($cfg, $template) : null;
     if ($live !== null) {
-        $problems = whatsapp_template_problems($live, $kind);
+        $problems = whatsapp_template_problems($live, $kind, count($fields));
         if ($problems) {
             $error = implode(' ', $problems);
             whatsapp_log_delivery($pdo, $companyId, '+' . $to, $template, $preview, 'FAILED', $error, $logMeta);
@@ -860,23 +865,19 @@ function whatsapp_send_exam_notice(PDO $pdo, array $env, int $companyId, array $
     $title = trim((string)($exam['title'] ?? ''));
     $link = whatsapp_exam_link($pdo, (string)$exam['id'], $studentId, $studentCompany);
 
-    $params = $kind === 'INVITE'
-        ? [
-            $name !== '' ? $name : 'Candidate',
-            $title,
-            whatsapp_format_window($exam['start_time'], $exam['end_time'], $exam['timezone'] ?? null),
-            whatsapp_format_duration((int)($exam['duration_minutes'] ?? 0)),
-            $link,
-        ]
-        : [
-            $name !== '' ? $name : 'Candidate',
-            $title,
-            // The exam's date and time window (start – end), the same value the invitation carries.
-            whatsapp_format_window($exam['start_time'], $exam['end_time'], $exam['timezone'] ?? null),
-            $link,
-        ];
+    // Everything a template may show; the one in use picks what it needs.
+    $values = [
+        'StudentName' => $name !== '' ? $name : 'Candidate',
+        'ExamTitle' => $title,
+        'ExamWindow' => whatsapp_format_window($exam['start_time'], $exam['end_time'], $exam['timezone'] ?? null),
+        'StartTime' => whatsapp_format_instant($exam['start_time'], $exam['timezone'] ?? null),
+        'EndTime' => whatsapp_format_instant($exam['end_time'], $exam['timezone'] ?? null),
+        'Duration' => whatsapp_format_duration((int)($exam['duration_minutes'] ?? 0)),
+        'QuestionCount' => (string)exam_candidate_question_count($pdo, (string)$exam['id']),
+        'Link' => $link,
+    ];
 
-    return whatsapp_send_template($pdo, $env, $companyId, $kind, $mobile, $params, [
+    return whatsapp_send_template($pdo, $env, $companyId, $kind, $mobile, $values, [
         'examId' => (string)$exam['id'],
         'studentId' => $studentId,
     ], $link);
@@ -921,10 +922,10 @@ function whatsapp_notify_request_update(PDO $pdo, array $env, int $companyId, ?s
             return ['ok' => false, 'status' => 'SKIPPED', 'reason' => 'NO_MOBILE', 'error' => 'No mobile number on file.'];
         }
         return whatsapp_send_template($pdo, $env, $companyId, 'REQUEST_UPDATE', (string)$mobile, [
-            trim($employeeName) !== '' ? trim($employeeName) : 'there',
-            '#' . $requestId,
-            trim($examTitle) !== '' ? trim($examTitle) : '(untitled exam)',
-            $statusMessage,
+            'EmployeeName' => trim($employeeName) !== '' ? trim($employeeName) : 'there',
+            'RequestRef' => '#' . $requestId,
+            'ExamTitle' => trim($examTitle) !== '' ? trim($examTitle) : '(untitled exam)',
+            'Status' => $statusMessage,
         ], ['requestId' => $requestId]);
     } catch (Throwable $e) {
         error_log('[whatsapp] request update failed: ' . $e->getMessage());
@@ -961,7 +962,7 @@ function whatsapp_notify_requester(PDO $pdo, array $env, int $requesterId, int $
 }
 
 /** Public status for the admin UI — no secrets, only which pieces are configured. */
-function whatsapp_public_status(array $cfg): array {
+function whatsapp_public_status(array $cfg, ?PDO $pdo = null): array {
     $kinds = [];
     foreach (WHATSAPP_KINDS as $kind) {
         $kinds[$kind] = in_array($kind, $cfg['configuredKinds'], true);
@@ -972,11 +973,13 @@ function whatsapp_public_status(array $cfg): array {
     $issues = array_values($cfg['issues']);
     if (!empty($cfg['ready']) && $cfg['provider'] === 'meta') {
         foreach ($cfg['configuredKinds'] as $kind) {
-            $live = whatsapp_meta_template($cfg, (string)$cfg['templates'][$kind]);
+            $active = $pdo !== null ? whatsapp_active_template($pdo, $cfg, $kind)
+                : ['name' => (string)$cfg['templates'][$kind], 'fields' => WHATSAPP_LEGACY_FIELDS[$kind] ?? []];
+            $live = whatsapp_meta_template($cfg, (string)$active['name']);
             if ($live === null) {
                 continue;
             }
-            $problems = whatsapp_template_problems($live, $kind);
+            $problems = whatsapp_template_problems($live, $kind, count($active['fields']));
             $templates[] = [
                 'kind' => $kind,
                 'name' => $live['name'],
@@ -1036,8 +1039,26 @@ $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
 if ($method === 'GET') {
     // Any staff role: the exam screens and Settings use this to decide what to show.
-    require_staff();
-    json_response(whatsapp_public_status(whatsapp_config($env)));
+    $staffRole = require_staff();
+    $getCfg = whatsapp_config($env);
+    if (isset($_GET['templates'])) {
+        // Settings → WhatsApp → Message text. Templates belong to the whole WhatsApp account (every
+        // company's messages use them), so only a super admin can change them.
+        if (!empty($getCfg['ready']) && $getCfg['provider'] === 'meta') {
+            whatsapp_templates_refresh($pdo, $getCfg, null, isset($_GET['refresh']));
+        }
+        $kinds = [];
+        foreach (WHATSAPP_KINDS as $kind) {
+            $kinds[] = whatsapp_template_editor_state($pdo, $getCfg, $kind);
+        }
+        json_response([
+            'editable' => $staffRole === 'SUPER_ADMIN' && !empty($getCfg['ready']) && $getCfg['provider'] === 'meta'
+                && (string)($getCfg['_transport']['meta']['wabaId'] ?? '') !== '',
+            'limits' => ['body' => WHATSAPP_TEMPLATE_BODY_MAX, 'button' => WHATSAPP_TEMPLATE_BUTTON_MAX],
+            'kinds' => $kinds,
+        ]);
+    }
+    json_response(whatsapp_public_status($getCfg, $pdo));
 }
 
 if ($method !== 'POST') {
@@ -1179,16 +1200,25 @@ if ($action === 'TEST') {
     $start = (new DateTimeImmutable('tomorrow 10:00', $zone))->setTimezone(new DateTimeZone('UTC'));
     $end = $start->modify('+8 hours');
     $sampleTitle = 'Sample Exam (test message)';
-    $params = [
-        'INVITE' => ['Test Candidate', $sampleTitle, whatsapp_format_window($start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), 'Asia/Kolkata'), '30 minutes', $origin . '?TESTLINK00'],
-        'REMINDER' => ['Test Candidate', $sampleTitle, whatsapp_format_window($start->format('Y-m-d H:i:s'), $end->format('Y-m-d H:i:s'), 'Asia/Kolkata'), $origin . '?TESTLINK00'],
-        'REQUEST_UPDATE' => ['Test Employee', '#0', $sampleTitle, 'test message from ProctorGuard Settings'],
-    ][$kind];
+    $sampleStart = $start->format('Y-m-d H:i:s');
+    $sampleEnd = $end->format('Y-m-d H:i:s');
+    $values = $kind === 'REQUEST_UPDATE'
+        ? ['EmployeeName' => 'Test Employee', 'RequestRef' => '#0', 'ExamTitle' => $sampleTitle, 'Status' => 'test message from ProctorGuard Settings']
+        : [
+            'StudentName' => 'Test Candidate',
+            'ExamTitle' => $sampleTitle,
+            'ExamWindow' => whatsapp_format_window($sampleStart, $sampleEnd, 'Asia/Kolkata'),
+            'StartTime' => whatsapp_format_instant($sampleStart, 'Asia/Kolkata'),
+            'EndTime' => whatsapp_format_instant($sampleEnd, 'Asia/Kolkata'),
+            'Duration' => '30 minutes',
+            'QuestionCount' => '25',
+            'Link' => $origin . '?TESTLINK00',
+        ];
 
     // The test has no real exam: its link (text and button) carries a placeholder code, so it opens
     // the "invalid link" notice.
     $testButtonLink = in_array($kind, WHATSAPP_EXAM_KINDS, true) ? $origin . '?TESTLINK00' : null;
-    $res = whatsapp_send_template($pdo, $env, $companyId, $kind, $to, $params, ['test' => true], $testButtonLink);
+    $res = whatsapp_send_template($pdo, $env, $companyId, $kind, $to, $values, ['test' => true], $testButtonLink);
     audit_log($pdo, [
         'companyId' => $companyId,
         'actorRole' => $actorRole,
@@ -1204,6 +1234,87 @@ if ($action === 'TEST') {
         'error' => $res['error'] ?? null,
         'to' => '+' . $to,
     ]);
+}
+
+// ---- Message text (Settings → WhatsApp): super admin only, account-wide ----------------------
+if (in_array($action, ['TEMPLATE_SAVE', 'TEMPLATE_ACTIVATE', 'TEMPLATE_DELETE'], true)) {
+    $superRole = require_role(['SUPER_ADMIN'], $payload);
+    $actorId = (string)(get_actor_id($payload) ?? 'super-admin');
+    ensure_whatsapp_template_schema($pdo);
+
+    if ($action === 'TEMPLATE_SAVE') {
+        $kind = strtoupper(trim((string)($payload['kind'] ?? '')));
+        if (!in_array($kind, WHATSAPP_KINDS, true)) {
+            json_response(['error' => 'kind must be INVITE, REMINDER or REQUEST_UPDATE.'], 400);
+        }
+        $buttonText = array_key_exists('buttonText', $payload) && is_string($payload['buttonText']) ? $payload['buttonText'] : null;
+        $result = whatsapp_template_create($pdo, $cfg, $kind, (string)($payload['body'] ?? ''), $buttonText, $actorId);
+        if (!$result['ok']) {
+            json_response(['error' => implode(' ', $result['errors']), 'errors' => $result['errors']], 400);
+        }
+        audit_log($pdo, [
+            'companyId' => $companyId, 'actorRole' => $superRole, 'actorId' => $actorId,
+            'action' => 'WHATSAPP_TEMPLATE_SUBMIT', 'targetType' => 'whatsapp', 'targetId' => $kind,
+            'message' => 'WhatsApp ' . strtolower($kind) . ' text submitted for review as ' . $result['row']['name'],
+        ]);
+        json_response(['ok' => true, 'version' => $result['row'], 'state' => whatsapp_template_editor_state($pdo, $cfg, $kind)]);
+    }
+
+    $id = (int)($payload['id'] ?? 0);
+    $stmt = $pdo->prepare('SELECT * FROM whatsapp_templates WHERE id = ? LIMIT 1');
+    $stmt->execute([$id]);
+    $row = $stmt->fetch();
+    $stmt->closeCursor();
+    if (!$row) {
+        json_response(['error' => 'Version not found.'], 404);
+    }
+    $kind = (string)$row['kind'];
+
+    if ($action === 'TEMPLATE_ACTIVATE') {
+        // Use a version that is approved but not in use: one held because WhatsApp put it in
+        // Marketing, or an earlier version being restored.
+        if (!in_array((string)$row['status'], ['HELD', 'RETIRED'], true)) {
+            json_response(['error' => 'Only an approved version that is not in use can be switched to.'], 409);
+        }
+        $live = whatsapp_meta_template($cfg, (string)$row['name'], true);
+        if ($live === null || $live['status'] !== 'APPROVED') {
+            json_response(['error' => 'WhatsApp no longer lists this version as approved, so it cannot be used.'], 409);
+        }
+        whatsapp_template_activate($pdo, $id);
+        audit_log($pdo, [
+            'companyId' => $companyId, 'actorRole' => $superRole, 'actorId' => $actorId,
+            'action' => 'WHATSAPP_TEMPLATE_ACTIVATE', 'targetType' => 'whatsapp', 'targetId' => $kind,
+            'message' => 'WhatsApp ' . strtolower($kind) . ' messages now use ' . $row['name'],
+        ]);
+        json_response(['ok' => true, 'state' => whatsapp_template_editor_state($pdo, $cfg, $kind)]);
+    }
+
+    // TEMPLATE_DELETE: remove a version that is not in use — from WhatsApp Manager too, so the
+    // account doesn't fill up with superseded versions.
+    if ((string)$row['status'] === 'ACTIVE') {
+        json_response(['error' => 'This version is in use. Switch to another version first.'], 409);
+    }
+    $t = $cfg['_transport']['meta'] ?? null;
+    if ($cfg['provider'] === 'meta' && $t !== null && (string)($t['wabaId'] ?? '') !== '') {
+        $url = rtrim((string)$t['baseUrl'], '/') . '/' . rawurlencode((string)$t['version']) . '/' . rawurlencode((string)$t['wabaId'])
+            . '/message_templates?name=' . rawurlencode((string)$row['name']);
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 10, CURLOPT_CONNECTTIMEOUT => 5, CURLOPT_CUSTOMREQUEST => 'DELETE',
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS, CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $t['accessToken']],
+        ]);
+        curl_exec($ch);
+        curl_close($ch);
+    }
+    $del = $pdo->prepare('DELETE FROM whatsapp_templates WHERE id = ?');
+    $del->execute([$id]);
+    $del->closeCursor();
+    audit_log($pdo, [
+        'companyId' => $companyId, 'actorRole' => $superRole, 'actorId' => $actorId,
+        'action' => 'WHATSAPP_TEMPLATE_DELETE', 'targetType' => 'whatsapp', 'targetId' => $kind,
+        'message' => 'WhatsApp template version removed: ' . $row['name'],
+    ]);
+    json_response(['ok' => true, 'state' => whatsapp_template_editor_state($pdo, $cfg, $kind)]);
 }
 
 json_response(['error' => 'Unknown action.'], 400);

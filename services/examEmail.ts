@@ -50,6 +50,7 @@ export const EXAM_MAIL_PLACEHOLDERS: { tag: string; label: string; inviteOnly?: 
   { tag: '{StartTime}', label: 'Opens at' },
   { tag: '{EndTime}', label: 'Closes at' },
   { tag: '{Duration}', label: 'Duration' },
+  { tag: '{QuestionCount}', label: 'Number of questions' },
   { tag: '{Link}', label: 'Exam link', inviteOnly: true },
 ];
 
@@ -65,7 +66,7 @@ export const EXAM_MAIL_LIMITS = {
 const ACCENT_RE = /^#[0-9a-fA-F]{6}$/;
 const OPTION_TEXT_KEYS = ['headerTitle', 'buttonText', 'closingNote'] as const;
 const OPTION_BOOL_KEYS = [
-  'showSchedule', 'showDuration', 'showCandidate', 'showRequirements', 'showInstructionsPdf', 'showProctoringNotice',
+  'showSchedule', 'showDuration', 'showQuestions', 'showCandidate', 'showRequirements', 'showInstructionsPdf', 'showProctoringNotice',
 ] as const;
 
 /** True when a colour is a 6-digit hex like #1a73e8 (the only accent format the server accepts). */
@@ -132,6 +133,7 @@ export interface ResolvedMailOptions {
   closingNote: string;   // '' → no closing note
   showSchedule: boolean;
   showDuration: boolean;
+  showQuestions: boolean;
   showCandidate: boolean;
   showRequirements: boolean;
   showInstructionsPdf: boolean;
@@ -153,6 +155,7 @@ export const resolveMailOptions = (options: ExamMailTemplateOptions | undefined 
     closingNote: text(o.closingNote),
     showSchedule: flag(o.showSchedule, true),
     showDuration: flag(o.showDuration, true),
+    showQuestions: flag(o.showQuestions, true),
     showCandidate: flag(o.showCandidate, true),
     showRequirements: flag(o.showRequirements, true),
     showInstructionsPdf: flag(o.showInstructionsPdf, !unproctored),
@@ -257,7 +260,25 @@ const escapeEmailHtml = (value: string) => value
   .replace(/'/g, '&#39;');
 
 // One pass over every placeholder, so a value that itself contains "{Link}" is never re-expanded.
-const PLACEHOLDER_RE = /\{(StudentName|ExamTitle|StartTime|EndTime|Duration|Link)\}/g;
+const PLACEHOLDER_RE = /\{(StudentName|ExamTitle|StartTime|EndTime|Duration|QuestionCount|Link)\}/g;
+
+/**
+ * How many questions a candidate of this exam is given: each section's question limit (or its whole
+ * pool), or the exam's question count, capped at what the pool holds. Mirrors
+ * exam_candidate_question_count() in api/_bootstrap.php.
+ */
+export const examCandidateQuestionCount = (exam: Exam): number => {
+  if (exam.sections && exam.sections.length > 0) {
+    return exam.sections.reduce((sum, section) => {
+      const pool = (section.questions || []).length;
+      const limit = Number(section.questionLimit) || 0;
+      return sum + (limit > 0 && limit < pool ? limit : pool);
+    }, 0);
+  }
+  const pool = (exam.questions || []).length;
+  const count = Number(exam.questionCount) || 0;
+  return count > 0 && count < pool ? count : pool;
+};
 
 // The instructions PDF is served from the app's own public root.
 const appOrigin = () => (typeof window !== 'undefined' && window.location ? window.location.origin : '');
@@ -284,6 +305,7 @@ export const buildExamEmailContent = (
   // Use the exam's actual time limit, not the availability window (endTime - startTime).
   const durationMin = exam.durationMinutes;
   const durationLabel = formatDuration(durationMin);
+  const questionTotal = examCandidateQuestionCount(exam);
   const dateStr = formatDateInZone(exam.startTime, examTz);
   const timeStr = formatTimeInZone(exam.startTime, examTz);
 
@@ -306,6 +328,7 @@ export const buildExamEmailContent = (
       case 'StartTime': return startLabel;
       case 'EndTime': return endLabel;
       case 'Duration': return durationLabel;
+      case 'QuestionCount': return String(questionTotal);
       default: return html ? safeLink : link;
     }
   });
@@ -348,6 +371,7 @@ export const buildExamEmailContent = (
   // last row of the card never carries a bottom border.
   const metaCells: [string, string][] = [];
   if (opts.showDuration) metaCells.push(['Duration', durationLabel]);
+  if (opts.showQuestions && questionTotal > 0) metaCells.push(['Questions', String(questionTotal)]);
   if (opts.showCandidate) metaCells.push(['Candidate', safeName]);
   const rowBorder = (last: boolean) => (last ? '' : 'border-bottom:1px solid #e2e8f0;');
   const scheduleRow = (label: string, value: string, last: boolean) => `
@@ -357,9 +381,11 @@ export const buildExamEmailContent = (
         <p style="margin:0;font-size:14px;font-weight:600;color:#0f172a;">${value}</p>
       </td>
     </tr>`;
+  // Equal-width tiles (two = 50% each, three = 33% each) with a divider after all but the last.
+  const metaCellWidth = Math.floor(100 / Math.max(1, metaCells.length));
   const metaCellStyle = (i: number) => (metaCells.length === 1
     ? 'padding:16px 24px;width:100%;'
-    : i === 0 ? 'padding:16px 24px;border-right:1px solid #e2e8f0;width:50%;' : 'padding:16px 24px;width:50%;');
+    : i < metaCells.length - 1 ? `padding:16px 24px;border-right:1px solid #e2e8f0;width:${metaCellWidth}%;` : `padding:16px 24px;width:${metaCellWidth}%;`);
   const metaRow = metaCells.length === 0 ? '' : `
     <tr>
       <td style="padding:0;">

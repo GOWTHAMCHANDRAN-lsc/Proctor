@@ -4,6 +4,7 @@ import { useSettings, isValidHex, DEFAULT_SETTINGS } from '../../services/appSet
 import { apiGet, apiPost, getApiErrorMessage } from '../../services/api';
 import { UserRole } from '../../types';
 import type { WhatsAppKind, WhatsAppStatus } from '../../types';
+import { WhatsAppTemplateEditor } from './WhatsAppTemplateEditor';
 
 const ACCENT_PRESETS = [
   { name: 'Google Blue', hex: '#1a73e8' },
@@ -548,6 +549,11 @@ export const Settings: React.FC<{ role?: UserRole }> = ({ role }) => {
 
         {/* WhatsApp notifications — status from the server's .env; admins can send a test. */}
         <WhatsAppPanel canTest={isFullAdmin} />
+        {/* WhatsApp message text — full width (text + phone preview side by side). Renders nothing
+            until WhatsApp is set up with Meta. */}
+        <div className="xl:col-span-2">
+          <WhatsAppTemplateEditor />
+        </div>
         </>)}
 
         {/* Security — self-service password reset (hidden for super admins) */}

@@ -304,6 +304,8 @@ export interface ExamMailTemplateOptions {
   showSchedule?: boolean;
   /** Duration tile. Default on. */
   showDuration?: boolean;
+  /** "Questions" tile: how many questions the candidate is given. Default on. */
+  showQuestions?: boolean;
   /** Candidate-name tile. Default on. */
   showCandidate?: boolean;
   /** "Before you begin" device/system requirements. Default on (unproctored: no camera/mic items). */
@@ -736,6 +738,52 @@ export interface WhatsAppStatus {
     /** Why it can't be sent as it stands; empty when fine. */
     problems: string[];
   }[];
+}
+
+/** One version of a WhatsApp message text made in Settings → WhatsApp (api/whatsapp_templates.php). */
+export interface WhatsAppTemplateVersion {
+  id: number;
+  kind: WhatsAppKind;
+  name: string;
+  /** PENDING (under WhatsApp review) · ACTIVE (in use) · HELD (approved as Marketing) · REJECTED · RETIRED. */
+  status: 'PENDING' | 'ACTIVE' | 'HELD' | 'REJECTED' | 'RETIRED';
+  metaStatus: string | null;
+  category: string | null;
+  /** Text with {Placeholder} tokens. */
+  body: string;
+  /** Placeholders the text uses, in order — exactly what a send fills in. */
+  fields: string[];
+  /** Label of the link button; null = no button. */
+  buttonText: string | null;
+  rejectedReason: string | null;
+  createdBy: string | null;
+  createdAt: number | null;
+  activatedAt: number | null;
+}
+
+export interface WhatsAppTemplateKindState {
+  kind: WhatsAppKind;
+  fields: { key: string; label: string; sample: string }[];
+  supportsButton: boolean;
+  /** The template messages of this kind are sent with right now. */
+  active: {
+    name: string;
+    managed: boolean;
+    status: string | null;
+    category: string | null;
+    body: string | null;
+    buttonText: string | null;
+    fields: string[];
+    problems: string[];
+  } | null;
+  versions: WhatsAppTemplateVersion[];
+}
+
+/** GET api/whatsapp.php?templates=1 */
+export interface WhatsAppTemplateEditorData {
+  editable: boolean;
+  limits: { body: number; button: number };
+  kinds: WhatsAppTemplateKindState[];
 }
 
 /** POST api/whatsapp.php {action:'SEND_EXAM_NOTICE'} result. */

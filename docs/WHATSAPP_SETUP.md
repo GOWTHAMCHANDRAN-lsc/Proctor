@@ -71,7 +71,7 @@ This link is personal to you. Please do not share it.
 |---|---|---|
 | `{{1}}` | candidate name | Asha Rao |
 | `{{2}}` | exam title | Sales Assessment Q4 |
-| `{{3}}` | when the exam window closes, in the exam's timezone | 15 Oct 2026, 18:00 IST |
+| `{{3}}` | the exam's date and time window, in the exam's timezone (same value as the invitation's `{{3}}`) | 15 Oct 2026, 10:00 – 18:00 IST |
 | `{{4}}` | the candidate's personal exam link | https://proctor.lsc-crm.in?Ab3dE5gH9k |
 
 ```
@@ -101,6 +101,21 @@ Update on your exam request {{2}} for "{{3}}":
 
 You will also receive the full details by email.
 ```
+
+**Editing a template later (Meta provider).** With `WHATSAPP_META_WABA_ID` set, ProctorGuard reads
+each template from WhatsApp Manager before sending (cached for 5 minutes) and follows it:
+
+* wording, formatting, emoji, extra instructions, footer, a fixed text header — nothing to do;
+* the link button's text, address (`https://proctor.lsc-crm.in/{{1}}`, `…/?{{1}}`, `…?{{1}}` or
+  `…/x/{{1}}` — the site opens all of them), its position among the buttons, or removing it;
+* the template's language.
+
+What it cannot follow, and reports instead of sending (in the delivery log and in Settings →
+WhatsApp → *Templates in WhatsApp Manager*): a template that is not APPROVED (paused, rejected,
+pending re-review after an edit), a different **number of variables** in the text (keep `{{1}}…{{5}}`
+for invitations, `{{1}}…{{4}}` for reminders and request updates, in the order above), named
+variables, a header that needs an image/document/variable, or a link button on another website.
+Note that WhatsApp Manager stores a button address written `…/?{{1}}` as `…/{{1}}`.
 
 **Keep them Utility.** Meta re-checks the category after approval and may move a template to
 *Marketing* (the 2026-10-08 `_v1` templates were moved). Marketing templates are capped per

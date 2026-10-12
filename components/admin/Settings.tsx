@@ -156,6 +156,43 @@ const WhatsAppPanel: React.FC<{ canTest: boolean }> = ({ canTest }) => {
                 number. Every message is recorded in Communications → Delivery Logs. Setup details: <code>docs/WHATSAPP_SETUP.md</code>.
               </p>
             )}
+            {status.ready && status.templates && status.templates.length > 0 && (
+              <div className="rounded-lg border border-slate-200 overflow-hidden">
+                <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 text-[13px] font-medium text-slate-700">
+                  Templates in WhatsApp Manager
+                  <span className="ml-2 font-normal text-xs text-slate-400">read live — edits there are picked up within 5 minutes</span>
+                </div>
+                <ul className="divide-y divide-slate-100">
+                  {status.templates.map(t => (
+                    <li key={t.kind} className="px-3 py-2.5 text-sm space-y-1">
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <code className="text-slate-800">{t.name}</code>
+                        <span className={`text-[11px] font-semibold px-1.5 py-0.5 rounded border ${t.status === 'APPROVED' && t.problems.length === 0 ? 'bg-teal-50 text-teal-700 border-teal-200' : 'bg-rose-50 text-rose-700 border-rose-200'}`}>
+                          {t.status === 'APPROVED' ? (t.problems.length === 0 ? 'Live' : 'Needs attention') : t.status.replace(/_/g, ' ')}
+                        </span>
+                        {t.category && (
+                          <span className={`text-[11px] px-1.5 py-0.5 rounded border ${t.category === 'MARKETING' ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-slate-50 text-slate-600 border-slate-200'}`}>
+                            {t.category.charAt(0) + t.category.slice(1).toLowerCase()}
+                          </span>
+                        )}
+                        <span className="text-xs text-slate-400">
+                          {WHATSAPP_KIND_LABELS.find(k => k.kind === t.kind)?.label || t.kind} · {t.language} · {t.variables} variable{t.variables === 1 ? '' : 's'}
+                        </span>
+                      </div>
+                      <div className="text-xs text-slate-500 break-all">
+                        {t.linkButton ? <>Link button: <code>{t.linkButton}</code></> : 'No link button'}
+                      </div>
+                      {t.problems.map(problem => <p key={problem} role="alert" className="text-xs text-rose-600">{problem}</p>)}
+                    </li>
+                  ))}
+                </ul>
+                {status.templates.some(t => t.category === 'MARKETING') && (
+                  <p className="px-3 py-2 border-t border-slate-100 bg-amber-50 text-xs text-amber-800">
+                    WhatsApp limits how many Marketing messages each person receives, so some may not be delivered. Utility templates are not limited.
+                  </p>
+                )}
+              </div>
+            )}
 
             {canTest && (
               <form onSubmit={sendTest} className="border-t border-slate-100 pt-4 space-y-3">

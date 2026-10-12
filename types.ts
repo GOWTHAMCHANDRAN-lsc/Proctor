@@ -720,8 +720,22 @@ export interface WhatsAppStatus {
   ready: boolean;
   /** Which message kinds have a template name configured. */
   kinds: Record<WhatsAppKind, boolean>;
-  /** .env keys that still need setting (names only, never values). */
+  /** .env keys that still need setting (names only, never values), and template problems. */
   issues?: string[];
+  /** Each configured template as it is in WhatsApp Manager right now (Meta provider with a WABA id). */
+  templates?: {
+    kind: WhatsAppKind;
+    name: string;
+    /** APPROVED, PAUSED, REJECTED, PENDING, DISABLED, NOT_FOUND … */
+    status: string;
+    category: string | null;
+    language: string;
+    variables: number;
+    /** The link button's address pattern, e.g. "https://proctor.lsc-crm.in/{{1}}"; null = no link button. */
+    linkButton: string | null;
+    /** Why it can't be sent as it stands; empty when fine. */
+    problems: string[];
+  }[];
 }
 
 /** POST api/whatsapp.php {action:'SEND_EXAM_NOTICE'} result. */

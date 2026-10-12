@@ -19,6 +19,11 @@ const resolveApiBase = () => {
   if (segments[0] === 'admin' || segments[0] === 'x') {
     return API_BASE_RAW;
   }
+  // '/<10-character code>' is a short exam link too (a WhatsApp template's link button), not a
+  // deployment prefix.
+  if (segments.length === 1 && /^[A-Za-z0-9]{10}$/.test(segments[0])) {
+    return API_BASE_RAW;
+  }
   const prefix = `/${segments[0]}`;
   if (API_BASE_RAW === prefix || API_BASE_RAW.startsWith(`${prefix}/`)) {
     return API_BASE_RAW;

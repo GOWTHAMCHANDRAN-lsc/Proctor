@@ -886,12 +886,14 @@ const AdminApp: React.FC = () => (
 // Short exam links: "<origin>?<code>" — and the earlier "<origin>/x/<code>" form, which links already
 // sent still use (api/link.php swaps the code for the signed access token, and the page then runs
 // exactly the ?token= flow). The short URL stays in the address bar, so a reload simply resolves the
-// code again.
+// code again. "<origin>/<code>" is accepted too: it is what a WhatsApp template's link button opens
+// when its address is written "https://…/{{1}}" (WhatsApp Manager drops a "?" before the variable).
 const SHORT_LINK_PATH = /^\/x\/([A-Za-z0-9]{6,16})\/?$/;
+const SHORT_LINK_BARE_PATH = /^\/([A-Za-z0-9]{10})\/?$/; // codes are exactly 10 characters
 const SHORT_LINK_CODE = /^[A-Za-z0-9]{6,16}$/;
 const getShortLinkCode = (): string | null => {
   if (typeof window === 'undefined') return null;
-  const match = window.location.pathname.match(SHORT_LINK_PATH);
+  const match = window.location.pathname.match(SHORT_LINK_PATH) || window.location.pathname.match(SHORT_LINK_BARE_PATH);
   if (match) return match[1];
   if (window.location.pathname !== '/' && window.location.pathname !== '') return null;
   // "?<code>": the code is the first query item and has no "=" (apps that open links sometimes

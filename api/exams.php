@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/_bootstrap.php';
 require_once __DIR__ . '/exam_mail_render.php';
+require_once __DIR__ . '/exam_attachments.php';
 
 function ms_to_datetime(?int $ms): ?string {
     if ($ms === null) return null;
@@ -825,6 +826,7 @@ if ($method === 'GET') {
         $mailTemplates[(string)$tplRow['exam_id']][(string)$tplRow['kind']] = exam_mail_template_payload($tplRow);
     }
     $tplStmt->closeCursor();
+    $mailAttachments = exam_attachments_for_company($pdo, $companyId);
 
     $exams = [];
     foreach ($rows as $row) {
@@ -832,6 +834,8 @@ if ($method === 'GET') {
         $exam['pendingInviteCount'] = $pendingInvites[(string)$exam['id']] ?? 0;
         $exam['notAttemptedCount'] = $notAttempted[(string)$exam['id']] ?? 0;
         $exam['mailTemplates'] = $mailTemplates[(string)$exam['id']] ?? new stdClass();
+        // {name, size, mimeType, uploadedAt} of the document this exam's emails carry, or null.
+        $exam['mailAttachment'] = $mailAttachments[(string)$exam['id']] ?? null;
         $exams[] = $exam;
     }
 
@@ -1000,8 +1004,13 @@ if ($method === 'POST') {
                 json_response(['ok' => true, 'archived' => true]);
             }
 
+            // The attachment's row goes with the exam (foreign key); its file is removed below.
+            $attachmentRow = exam_attachment_row_safe($pdo, $id);
             $stmt = $pdo->prepare('DELETE FROM exams WHERE id = ? AND company_id = ?');
             $stmt->execute([$id, $companyId]);
+            if ($attachmentRow && $stmt->rowCount() > 0) {
+                exam_attachment_delete_file((string)$attachmentRow['stored_path']);
+            }
             audit_log($pdo, [
                 'companyId' => $companyId,
                 'actorRole' => 'ADMIN',
@@ -1564,6 +1573,8 @@ if ($method === 'POST') {
     $exam['id'] = $id;
     // Echo the templates as stored (normalised, cleared kinds gone), not whatever the client sent.
     $exam['mailTemplates'] = fetch_exam_mail_templates($pdo, (string)$id);
+    // The attachment is uploaded on its own (exam_attachments.php); echo what is stored.
+    $exam['mailAttachment'] = exam_attachment_meta($pdo, (string)$id);
     $exam['assignedStudentIds'] = is_array($assignedIds) ? array_values(array_unique($assignedIds)) : [];
     $exam['assignedBatchIds'] = $assignedBatchIds;
     $exam['allowedDeviceTypes'] = $allowedDevices;

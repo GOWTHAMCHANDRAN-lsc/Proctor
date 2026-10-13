@@ -195,6 +195,9 @@ export interface Exam {
   // Per-exam subject/message/design overrides (exam editor "Emails" section, Mail Composer). An
   // absent kind means the built-in default email is used for that mail.
   mailTemplates?: Partial<Record<ExamMailKind, ExamMailTemplate>>;
+  // The document this exam's emails carry (server-computed, read-only: it is uploaded and removed
+  // through exam_attachments.php when the exam is saved). null / absent = none.
+  mailAttachment?: ExamMailAttachment | null;
   notificationConfig?: NotificationConfig;
 }
 
@@ -315,7 +318,7 @@ export interface ExamMailTemplateOptions {
   showRequirements?: boolean;
   /** Instructions PDF link. Default on for proctored exams, off for unproctored ones. */
   showInstructionsPdf?: boolean;
-  /** AI-proctoring warning (unproctored: the "not proctored" note). Default on. */
+  /** AI-proctoring warning. Default on. Never shown for an unproctored exam. */
   showProctoringNotice?: boolean;
   /** Optional sign-off above the footer (plain text, placeholders allowed). */
   closingNote?: string;
@@ -323,8 +326,18 @@ export interface ExamMailTemplateOptions {
 
 export interface ExamMailTemplate {
   subject: string;
+  /** Text with blank lines between paragraphs; may carry <b>, <i> and <u> (the editor's formatting). */
   message: string;
   options?: ExamMailTemplateOptions;
+}
+
+/** The optional document attached to every invitation and reminder email of an exam. */
+export interface ExamMailAttachment {
+  name: string;
+  /** Bytes. */
+  size: number;
+  mimeType: string;
+  uploadedAt?: number | null;
 }
 
 export interface ExamSection {

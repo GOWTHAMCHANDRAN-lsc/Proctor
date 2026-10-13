@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertCircle, CheckCircle2, Clock, Loader2, Mail, MessageCircle, RotateCcw, Send, Square, X } from 'lucide-react';
+import { AlertCircle, CheckCircle2, Clock, Loader2, Mail, MessageCircle, Paperclip, RotateCcw, Send, Square, X } from 'lucide-react';
 import { apiGet, apiPost, getApiErrorMessage } from '../../services/api';
 import type { NotifyJob } from '../../types';
 
@@ -17,6 +17,8 @@ export interface SendRequest {
   channels: { email: boolean; whatsapp: boolean };
   subject?: string;
   message?: string;
+  /** Name of the document this exam's emails carry, shown in the confirmation (display only). */
+  attachmentName?: string;
 }
 
 interface SendProgressDialogProps {
@@ -207,6 +209,12 @@ export const SendProgressDialog: React.FC<SendProgressDialogProps> = ({ request,
                 Send this {noun} {via(request.channels)} to{' '}
                 <span className="font-semibold text-slate-900">{request.studentIds.length}</span> student{request.studentIds.length === 1 ? '' : 's'}?
               </p>
+              {request.attachmentName && request.channels.email && (
+                <p className="text-sm text-slate-700 flex items-start gap-1.5">
+                  <Paperclip size={14} className="shrink-0 mt-0.5 text-slate-400" aria-hidden="true" />
+                  <span>Each email carries the attachment <span className="font-medium text-slate-900 break-all">{request.attachmentName}</span>.</span>
+                </p>
+              )}
               <p className="text-xs text-slate-500">
                 Sending runs in the background at a steady pace, so large lists are delivered reliably. You can close this window or the browser — it carries on, and you can come back to see the result.
               </p>

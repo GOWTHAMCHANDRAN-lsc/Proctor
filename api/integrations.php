@@ -10,6 +10,7 @@ require_once __DIR__ . '/_bootstrap.php';
 require_once __DIR__ . '/notify.php';
 // Per-exam invitation email, used when the admin customised this exam's invitation.
 require_once __DIR__ . '/exam_mail_render.php';
+require_once __DIR__ . '/exam_attachments.php';
 // WhatsApp copy of the invitation (whatsapp_send_invite_for_student). Same $isIncluded-style guard:
 // requiring it only defines the functions. A no-op until WhatsApp is configured in .env.
 require_once __DIR__ . '/whatsapp.php';
@@ -334,7 +335,12 @@ HTML;
             $env['SMTP_USER'] ?? '',
             $env['SMTP_PASS'] ?? '',
             $smtpFrom,
-            ['to' => $email, 'subject' => $subject, 'body' => $body, 'fromName' => $companyName . ' ProctorGuard'],
+            [
+                'to' => $email, 'subject' => $subject, 'body' => $body, 'fromName' => $companyName . ' ProctorGuard',
+                // The exam's own document, when one is attached to its emails (best effort here: an
+                // automated invitation still goes out if the file cannot be read; it is logged).
+                'attachments' => exam_attachment_for_mail($pdo, (string)$exam['id'])['attachments'],
+            ],
             $env['SMTP_SECURE'] ?? '',
             (int)($env['SMTP_TIMEOUT'] ?? 15),
             (($env['SMTP_ALLOW_SELF_SIGNED'] ?? '0') === '1')

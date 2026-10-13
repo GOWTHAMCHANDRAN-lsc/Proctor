@@ -174,17 +174,27 @@ function build_mime_data(string $from, string $to, string $subject, string $html
         $parts[] = implode("\r\n", $alt);
         foreach ($attachments as $att) {
             $fname = sanitize_header_value((string)($att['filename'] ?? 'attachment'));
-            $fname = str_replace('"', '', $fname);
+            $fname = str_replace(['"', '\\'], '', $fname);
             $ctype = sanitize_header_value((string)($att['mimetype'] ?? 'application/octet-stream'));
+            // A name with non-ASCII characters (e.g. "Syllabus – Unit 1.pdf") must be encoded in the
+            // headers: an encoded-word for older clients plus the standard filename*= form. Each
+            // parameter goes on its own folded line, so a long name never makes an over-long line.
+            $nameParam = " name=\"{$fname}\"";
+            $fileParam = " filename=\"{$fname}\"";
+            if (preg_match('/[^\x20-\x7E]/', $fname) === 1) {
+                $encodedWord = '=?UTF-8?B?' . base64_encode($fname) . '?=';
+                $nameParam = "\r\n name=\"{$encodedWord}\"";
+                $fileParam = "\r\n filename=\"{$encodedWord}\";\r\n filename*=UTF-8''" . rawurlencode($fname);
+            }
             // Accept a pre-encoded base64 body so a batch can encode a shared attachment once
             // instead of re-encoding the same file for every recipient.
             $encoded = isset($att['b64']) && $att['b64'] !== ''
                 ? (string)$att['b64']
                 : rtrim(chunk_split(base64_encode((string)($att['data'] ?? '')), 76, "\r\n"), "\r\n");
             $parts[] = "--{$mixedBoundary}";
-            $parts[] = "Content-Type: {$ctype}; name=\"{$fname}\"";
+            $parts[] = "Content-Type: {$ctype};{$nameParam}";
             $parts[] = 'Content-Transfer-Encoding: base64';
-            $parts[] = "Content-Disposition: attachment; filename=\"{$fname}\"";
+            $parts[] = "Content-Disposition: attachment;{$fileParam}";
             $parts[] = '';
             $parts[] = $encoded;
         }

@@ -327,6 +327,26 @@ CREATE TABLE `exam_location_logs` (
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
+-- Table structure for table `exam_mail_attachments`
+--
+
+DROP TABLE IF EXISTS `exam_mail_attachments`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `exam_mail_attachments` (
+  `exam_id` varchar(64) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `file_name` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+  `mime_type` varchar(120) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `size_bytes` int unsigned NOT NULL,
+  `stored_path` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `uploaded_by` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `uploaded_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`exam_id`),
+  CONSTRAINT `fk_exam_mail_attachments_exam` FOREIGN KEY (`exam_id`) REFERENCES `exams` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
 -- Table structure for table `exam_mail_templates`
 --
 

@@ -15,8 +15,10 @@ import {
   formatScheduleShort,
 } from '../../services/timezone';
 import { buildExamEmailContent, resolveExamMailTemplate, DEFAULT_INVITE_MESSAGE, DEFAULT_REMINDER_MESSAGE } from '../../services/examEmail';
-import type { ExamMailTemplate } from '../../types';
-import { ExamEmailsEditor, EmailPreviewFrame } from './ExamEmailsEditor';
+import type { ExamMailAttachment, ExamMailTemplate } from '../../types';
+import { ExamEmailsEditor, EmailPreviewFrame, AttachmentNote } from './ExamEmailsEditor';
+import { RichTextEditor } from './RichTextEditor';
+import { fileToBase64 } from '../../services/examAttachment';
 
 // A student resolved as the target of one exam's mail run.
 // attemptStatus / attemptCount come from the server's exam_sessions aggregate and drive the Mail
@@ -284,6 +286,9 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
   const [showArchived, setShowArchived] = useState(false);
   // JSON snapshot of the exam as it was when the editor opened, so Cancel can warn about unsaved edits.
   const editorSnapshotRef = useRef<string>('');
+  // The email attachment chosen (or removed) in the editor but not saved yet. Like the rest of the
+  // form it only takes effect on Save: the file is uploaded right after the exam itself is stored.
+  const [attachmentDraft, setAttachmentDraft] = useState<{ file: File } | { remove: true } | null>(null);
   // Set when an exam has both already-invited and newly-assigned students: the admin picks who to mail.
   // Also used (with confirmText) as the plain send confirmation when WhatsApp invitations are on, so
   // the Email / WhatsApp checkboxes can sit next to the send button.
@@ -1228,12 +1233,36 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     };
 
     setSavingExam(true);
+    let attachmentProblem: string | null = null;
     try {
       const result = await apiPost<{ exam: Exam }>('exams.php', withCompany({ exam: payload }));
-      const savedExam = result.exam || payload;
+      let savedExam = result.exam || payload;
+      // The attachment travels separately (it can be several MB) once the exam exists on the server.
+      if (attachmentDraft) {
+        const uploading = 'file' in attachmentDraft;
+        try {
+          if ('file' in attachmentDraft) {
+            const uploaded = await apiPost<{ ok: boolean; attachment: ExamMailAttachment | null }>('exam_attachments.php', withCompany({
+              action: 'UPLOAD',
+              examId: savedExam.id,
+              fileName: attachmentDraft.file.name,
+              dataBase64: await fileToBase64(attachmentDraft.file),
+            }));
+            savedExam = { ...savedExam, mailAttachment: uploaded.attachment };
+          } else {
+            await apiPost('exam_attachments.php', withCompany({ action: 'REMOVE', examId: savedExam.id }));
+            savedExam = { ...savedExam, mailAttachment: null };
+          }
+        } catch (e) {
+          console.error(e);
+          attachmentProblem = `The exam was saved, but the attachment could not be ${uploading ? 'uploaded' : 'removed'}: `
+            + `${apiErrorMessage(e, 'please try again.')}\n\nOpen the exam and ${uploading ? 'attach the file' : 'remove it'} again in the Emails section.`;
+        }
+      }
+      const finalExam = savedExam;
       onUpdateExams(prev => {
-        const exists = prev.some(e => e.id === savedExam.id);
-        return exists ? prev.map(e => (e.id === savedExam.id ? savedExam : e)) : [savedExam, ...prev];
+        const exists = prev.some(e => e.id === finalExam.id);
+        return exists ? prev.map(e => (e.id === finalExam.id ? finalExam : e)) : [finalExam, ...prev];
       });
     } catch (e) {
       console.error(e);
@@ -1244,6 +1273,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     }
 
     resetForm();
+    if (attachmentProblem) alert(attachmentProblem);
   };
 
   const handleEditExam = (exam: Exam) => {
@@ -1303,6 +1333,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       }
     };
     setNewExam(editable);
+    setAttachmentDraft(null);
     editorSnapshotRef.current = JSON.stringify(editable);
     if (exam.sections && exam.sections.length > 0) {
       setActiveSectionId(exam.sections[0].id);
@@ -1323,6 +1354,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
     setSelectedTemplateId(null);
     const fresh = buildExamDefaults();
     setNewExam(fresh);
+    setAttachmentDraft(null);
     editorSnapshotRef.current = JSON.stringify(fresh);
     setUploadStatus('IDLE');
     setCsvErrors([]);
@@ -1331,7 +1363,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
 
   // Cancel used to drop every unsaved edit (a whole question paper) on a single misclick.
   const handleCancelEdit = () => {
-    if (JSON.stringify(newExam) !== editorSnapshotRef.current
+    if ((JSON.stringify(newExam) !== editorSnapshotRef.current || attachmentDraft !== null)
       && !confirm('Discard your unsaved changes to this exam?')) return;
     resetForm();
   };
@@ -1398,6 +1430,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       pendingInviteCount: 0,
       notAttemptedCount: 0,
       mailTemplates: {},
+      mailAttachment: null,
       notificationConfig: {
         enabled: false,
         reminders: source.notificationConfig?.reminders || { hours24: false, hours1: false },
@@ -1540,6 +1573,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         channels,
         ...(override?.subject !== undefined ? { subject: override.subject } : {}),
         ...(override?.message !== undefined ? { message: override.message } : {}),
+        ...(exam.mailAttachment ? { attachmentName: exam.mailAttachment.name } : {}),
       },
     });
   };
@@ -3388,18 +3422,14 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                                 />
                             </div>
                              <div>
-                                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">Message Body</label>
-                                <textarea 
-                                    className="w-full px-3 py-2 border border-slate-200 rounded-lg outline-none text-sm transition-shadow min-h-[120px]"
+                                <label id="exam-notification-message-label" className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">Message Body</label>
+                                <RichTextEditor
+                                    ariaLabelledBy="exam-notification-message-label"
                                     rows={5}
-                                    value={newExam.notificationConfig.customMessage}
-                                    onChange={e => setNewExam({
-                                        ...newExam,
-                                        notificationConfig: {
-                                            ...newExam.notificationConfig!,
-                                            customMessage: e.target.value
-                                        }
-                                    })}
+                                    value={newExam.notificationConfig.customMessage || ''}
+                                    onChange={value => setNewExam(prev => (prev.notificationConfig
+                                        ? { ...prev, notificationConfig: { ...prev.notificationConfig, customMessage: value } }
+                                        : prev))}
                                 />
                                 <div className="mt-2 flex flex-wrap gap-2">
                                     {['{StudentName}', '{ExamTitle}', '{StartTime}', '{Link}'].map(tag => (
@@ -3847,6 +3877,18 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                exam={{ ...newExam, proctoringConfig: effectiveProctoringConfig(proctoringConfig) }}
                sampleLink={sampleExamLink()}
                onChange={mailTemplates => setNewExam(prev => ({ ...prev, mailTemplates }))}
+               attachment={{
+                 current: attachmentDraft === null
+                   ? (newExam.mailAttachment ?? null)
+                   : 'file' in attachmentDraft
+                     ? { name: attachmentDraft.file.name, size: attachmentDraft.file.size, mimeType: attachmentDraft.file.type }
+                     : null,
+                 pending: attachmentDraft === null ? null : 'file' in attachmentDraft ? 'upload' : 'remove',
+                 onPick: file => setAttachmentDraft({ file }),
+                 // Removing a file that was only just chosen simply forgets it.
+                 onRemove: () => setAttachmentDraft(newExam.mailAttachment ? { remove: true } : null),
+                 onUndo: () => setAttachmentDraft(null),
+               }}
              />
           </div>
         </div>
@@ -4161,15 +4203,17 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1.5">Message</label>
-                <textarea
-                  value={message}
-                  onChange={e => setMailComposer(prev => (prev ? { ...prev, message: e.target.value, dirty: true, notice: null } : prev))}
+                <label id="mail-composer-message-label" className="block text-xs font-semibold text-slate-500 uppercase tracking-wide mb-1.5">Message</label>
+                <RichTextEditor
+                  ariaLabelledBy="mail-composer-message-label"
                   rows={10}
-                  className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono leading-relaxed focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-300"
+                  maxLength={20000}
+                  value={message}
+                  onChange={value => setMailComposer(prev => (prev ? { ...prev, message: value, dirty: true, notice: null } : prev))}
                 />
                 <p className="text-[11px] text-slate-400 mt-1.5">
-                  Placeholders: <code>{'{StudentName}'}</code>, <code>{'{ExamTitle}'}</code>, <code>{'{StartTime}'}</code>,
+                  Select text and press B, I or U to make it bold, italic or underlined.
+                  {' '}Placeholders: <code>{'{StudentName}'}</code>, <code>{'{ExamTitle}'}</code>, <code>{'{StartTime}'}</code>,
                   {' '}<code>{'{EndTime}'}</code>, <code>{'{Duration}'}</code>
                   {!reminder && <> , <code>{'{Link}'}</code></>}. Blank lines start a new paragraph. The exam details,
                   requirements and instructions link are added below your message; their design (header, colour,
@@ -4207,6 +4251,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               <p className="text-xs text-slate-500 mb-2">
                 Preview as <span className="font-medium text-slate-700">{sample?.fullName || 'Sample Student'}</span> — exactly the HTML that will be sent.
               </p>
+              <AttachmentNote attachment={exam.mailAttachment} className="mb-2" />
               <EmailPreviewFrame
                 html={preview.body}
                 title="Composed email preview"
@@ -4313,6 +4358,8 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
               <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5">
                 {renderChannelOptions(inviteScopeTarget.exam, 'INVITE', inviteScopeTarget.confirmText ? inviteScopeTarget.recipients : inviteScopeTarget.pending)}
               </div>
+              {/* Emails only: WhatsApp messages do not carry the document. */}
+              <AttachmentNote attachment={inviteScopeTarget.exam.mailAttachment} />
               {inviteScopeTarget.confirmText ? (
                 <button
                   onClick={() => {

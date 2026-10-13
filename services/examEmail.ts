@@ -100,7 +100,9 @@ export const isEmptyMailTemplate = (tpl?: Partial<ExamMailTemplate> | null): boo
 // An unproctored exam has no camera, microphone or screen monitoring, so its built-in copy must not
 // call it "proctored".
 const isUnproctoredExam = (exam: Partial<Exam>) => exam.proctoringConfig?.mode === 'UNPROCTORED';
-const unproctoredCopy = (text: string) => text.replace(/proctored online examination/g, 'online examination');
+const unproctoredCopy = (text: string) => text
+  .replace(/a proctored online examination/g, 'an online examination')
+  .replace(/proctored online examination/g, 'online examination');
 
 // Resolve the subject/message actually used for one exam + mail kind, in priority order:
 // per-exam override (exam editor / Mail Composer) → legacy notificationConfig (invitations only) →
@@ -142,8 +144,9 @@ export interface ResolvedMailOptions {
 
 // Defaults reproduce the original email exactly. The only per-mode default: the instructions PDF is
 // off for an unproctored exam (the guide is about camera/mic/screen permissions), though an admin
-// may switch it back on. The requirements and notice blocks adapt their own copy to the mode, so an
-// unproctored email never mentions a camera, a microphone or AI monitoring whatever is switched on.
+// may switch it back on. The requirements block adapts its copy to the mode and the monitoring
+// notice is left out of an unproctored email altogether, so that email never mentions a camera, a
+// microphone or monitoring (nor the lack of it) whatever is switched on.
 export const resolveMailOptions = (options: ExamMailTemplateOptions | undefined | null, unproctored: boolean): ResolvedMailOptions => {
   const o = options || {};
   const text = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
@@ -480,15 +483,8 @@ export const buildExamEmailContent = (
   const monitoredText = monitoredParts.length === 1
     ? monitoredParts[0]
     : `${monitoredParts.slice(0, -1).join(', ')}${monitoredParts.length > 2 ? ',' : ''} and ${monitoredParts[monitoredParts.length - 1]}`;
-  const noticeBlock = !opts.showProctoringNotice ? '' : unproctored ? `
-      <!-- Notice -->
-      <tr>
-        <td class="lsc-pad" style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 40px;">
-          <p style="margin:0;font-size:12px;color:#334155;line-height:1.6;">
-            <strong>&#9432; Please note:</strong> This exam is <strong>not proctored</strong> — there is no camera, microphone or screen monitoring. Answer the questions on your own and submit before the exam window closes.
-          </p>
-        </td>
-      </tr>` : `
+  // Proctored exams only: an unproctored email says nothing about monitoring, or the lack of it.
+  const noticeBlock = !opts.showProctoringNotice || unproctored ? '' : `
       <!-- Warning Banner -->
       <tr>
         <td class="lsc-pad" style="background:#fef2f2;border-top:1px solid #fecaca;padding:16px 40px;">

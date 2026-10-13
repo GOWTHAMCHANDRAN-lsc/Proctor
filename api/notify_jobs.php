@@ -13,7 +13,8 @@ declare(strict_types=1);
  * temporary failures, and records each recipient's outcome. Closing the browser changes nothing.
  *
  * Emails are rendered on the server with api/exam_mail_render.php (the same HTML the console
- * previews); WhatsApp goes through whatsapp_send_exam_notice(), i.e. the template in use.
+ * previews) and carry the exam's attachment when it has one (api/exam_attachments.php); WhatsApp
+ * goes through whatsapp_send_exam_notice(), i.e. the template in use.
  *
  * Required by scripts/notify_worker.php for the functions; the HTTP handler at the bottom only runs
  * when this file is the requested script (the notify.php / whatsapp.php pattern).
@@ -23,6 +24,7 @@ require_once __DIR__ . '/_bootstrap.php';
 require_once __DIR__ . '/notify.php';           // smtp_open / smtp_deliver / add_delivery_log / html_to_plain
 require_once __DIR__ . '/whatsapp.php';
 require_once __DIR__ . '/exam_mail_render.php';
+require_once __DIR__ . '/exam_attachments.php';
 
 const NOTIFY_JOB_KINDS = ['INVITE', 'REMINDER'];
 const NOTIFY_JOB_MAX_RECIPIENTS = 5000;
@@ -347,6 +349,9 @@ function notify_worker_run(PDO $pdo, array $env, float $budget = 55.0): string {
                     'options' => $existing['options'] ?? null,
                 ];
             }
+            // The exam's attachment, read and encoded once for the whole run. If it exists but cannot
+            // be read, the emails fail with that reason rather than go out without the document.
+            $mailAttachment = $mailExam !== null ? exam_attachment_for_mail($pdo, $examId) : ['attachments' => [], 'error' => null];
             $markInvited = $pdo->prepare('INSERT IGNORE INTO exam_invitations (exam_id, student_id) VALUES (?, ?)');
             $setEmail = $pdo->prepare('UPDATE notification_job_items SET email_status = ?, email_error = ?, email_attempts = ? WHERE id = ?');
             $setWa = $pdo->prepare('UPDATE notification_job_items SET wa_status = ?, wa_error = ? WHERE id = ?');
@@ -398,6 +403,8 @@ function notify_worker_run(PDO $pdo, array $env, float $budget = 55.0): string {
                             $setEmail->execute(['FAILED', 'Exam not found.', (int)$item['email_attempts'], $itemId]);
                         } elseif (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
                             $setEmail->execute(['FAILED', 'Invalid email address.', (int)$item['email_attempts'], $itemId]);
+                        } elseif ($mailAttachment['error'] !== null) {
+                            $setEmail->execute(['FAILED', mb_substr((string)$mailAttachment['error'], 0, 480, 'UTF-8'), (int)$item['email_attempts'], $itemId]);
                         } elseif ($emailsThisHour >= $limit) {
                             // Hourly ceiling reached: wait for the oldest of this hour's emails to age out.
                             $waitStmt = $pdo->prepare("SELECT TIMESTAMPDIFF(SECOND, NOW(), DATE_ADD(created_at, INTERVAL 1 HOUR)) FROM delivery_logs
@@ -418,7 +425,7 @@ function notify_worker_run(PDO $pdo, array $env, float $budget = 55.0): string {
                                 }
                             }
                         }
-                        if ($emailBlock === null && is_resource($smtpFp) && $mailExam !== null && filter_var($email, FILTER_VALIDATE_EMAIL) !== false) {
+                        if ($emailBlock === null && is_resource($smtpFp) && $mailExam !== null && $mailAttachment['error'] === null && filter_var($email, FILTER_VALIDATE_EMAIL) !== false) {
                             $link = $kind === 'INVITE' ? exam_access_link($pdo, $origin, $examId, $studentId, $studentCompany) : '';
                             $rendered = exam_mail_render($mailExam, $fullName, $link, $kind);
                             $send = smtp_deliver($smtpFp, $from, [
@@ -426,6 +433,7 @@ function notify_worker_run(PDO $pdo, array $env, float $budget = 55.0): string {
                                 'subject' => $rendered['subject'],
                                 'body' => $rendered['html'],
                                 'plain' => html_to_plain($rendered['html']),
+                                'attachments' => $mailAttachment['attachments'],
                             ]);
                             $attempts = (int)$item['email_attempts'] + 1;
                             if ($send['ok']) {

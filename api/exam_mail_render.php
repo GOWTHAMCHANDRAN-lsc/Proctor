@@ -330,7 +330,7 @@ function exam_mail_resolve_template(array $exam, bool $reminder): array {
     $proctoring = exam_mail_as_array($exam['proctoringConfig'] ?? null);
     $unproctored = is_array($proctoring) && ($proctoring['mode'] ?? null) === 'UNPROCTORED';
     $copy = static fn(string $text): string => $unproctored
-        ? str_replace('proctored online examination', 'online examination', $text)
+        ? str_replace(['a proctored online examination', 'proctored online examination'], ['an online examination', 'online examination'], $text)
         : $text;
     $options = exam_mail_as_array($saved['options'] ?? null);
     $options = is_array($options) ? $options : null;
@@ -713,20 +713,9 @@ HTML;
     $monitoredText = $mc === 1
         ? $monitoredParts[0]
         : implode(', ', array_slice($monitoredParts, 0, -1)) . ($mc > 2 ? ',' : '') . ' and ' . $monitoredParts[$mc - 1];
-    if (!$opts['showProctoringNotice']) {
+    // Proctored exams only: an unproctored email says nothing about monitoring, or the lack of it.
+    if (!$opts['showProctoringNotice'] || $unproctored) {
         $noticeBlock = '';
-    } elseif ($unproctored) {
-        $noticeBlock = <<<HTML
-
-      <!-- Notice -->
-      <tr>
-        <td class="lsc-pad" style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:16px 40px;">
-          <p style="margin:0;font-size:12px;color:#334155;line-height:1.6;">
-            <strong>&#9432; Please note:</strong> This exam is <strong>not proctored</strong> — there is no camera, microphone or screen monitoring. Answer the questions on your own and submit before the exam window closes.
-          </p>
-        </td>
-      </tr>
-HTML;
     } else {
         $noticeBlock = <<<HTML
 

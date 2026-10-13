@@ -1,10 +1,12 @@
 import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { Mail, Monitor, Smartphone, RotateCcw, Palette, Check, Braces } from 'lucide-react';
-import type { Exam, ExamMailKind, ExamMailTemplate, ExamMailTemplateOptions } from '../../types';
+import { Mail, Monitor, Smartphone, RotateCcw, Palette, Check, Braces, Paperclip, FileText, Upload, Trash2, Undo2, AlertCircle } from 'lucide-react';
+import type { Exam, ExamMailAttachment, ExamMailKind, ExamMailTemplate, ExamMailTemplateOptions } from '../../types';
 import {
   buildExamEmailContent, resolveExamMailTemplate, resolveMailOptions, isEmptyMailTemplate, isValidAccentColor,
   EXAM_MAIL_PLACEHOLDERS, EXAM_MAIL_LIMITS, BRAND_ACCENT, DEFAULT_BUTTON_TEXT,
 } from '../../services/examEmail';
+import { EXAM_ATTACHMENT_ACCEPT, formatFileSize, validateExamAttachment } from '../../services/examAttachment';
+import { RichTextEditor, type RichTextEditorHandle } from './RichTextEditor';
 
 type MailTemplates = Partial<Record<ExamMailKind, ExamMailTemplate>>;
 type PreviewDevice = 'desktop' | 'phone';
@@ -122,10 +124,35 @@ type BlockKey = 'showSchedule' | 'showDuration' | 'showQuestions' | 'showCandida
 
 const SAMPLE_CANDIDATE = 'Alex Morgan';
 
+/** The attachment line shown with an email preview (the file itself is not part of the HTML). */
+export const AttachmentNote: React.FC<{ attachment: ExamMailAttachment | null | undefined; className?: string }> = ({ attachment, className = '' }) => {
+  if (!attachment) return null;
+  return (
+    <p className={`text-xs text-slate-500 break-words flex items-start gap-1.5 ${className}`}>
+      <Paperclip size={12} className="shrink-0 mt-0.5" aria-hidden="true" />
+      <span>
+        Attachment: <span className="font-medium text-slate-800">{attachment.name}</span> ({formatFileSize(attachment.size)})
+      </span>
+    </p>
+  );
+};
+
+/** The exam's email attachment as the editor shows it, including a change not saved yet. */
+export interface ExamAttachmentField {
+  /** The file the emails will carry once the exam is saved (the stored one, or the one just chosen). */
+  current: ExamMailAttachment | null;
+  /** 'upload' = a new file was chosen, 'remove' = the stored file will be removed; null = unchanged. */
+  pending: 'upload' | 'remove' | null;
+  onPick: (file: File) => void;
+  onRemove: () => void;
+  /** Drop the pending change and keep what is stored. */
+  onUndo: () => void;
+}
+
 /**
  * The exam editor's "Emails" section: per-exam invitation and reminder content and design, with a
  * live preview rendered by the same builder that sends. Edits go straight into the draft exam's
- * `mailTemplates` and are saved with the exam.
+ * `mailTemplates` and are saved with the exam; so is the optional attachment.
  */
 export const ExamEmailsEditor: React.FC<{
   /** The draft exam (with its effective proctoring config) — schedule, mode and devices drive the preview. */
@@ -133,10 +160,15 @@ export const ExamEmailsEditor: React.FC<{
   /** Link shown in the invitation preview (a sample, never a real token). */
   sampleLink: string;
   onChange: (templates: MailTemplates) => void;
-}> = ({ exam, sampleLink, onChange }) => {
+  /** The optional document both emails carry. Omit to hide the attachment field. */
+  attachment?: ExamAttachmentField;
+}> = ({ exam, sampleLink, onChange, attachment }) => {
   const [kind, setKind] = useState<ExamMailKind>('INVITE');
   const [accentDraft, setAccentDraft] = useState('');
-  const fieldRefs = useRef<Partial<Record<TextField, HTMLInputElement | HTMLTextAreaElement | null>>>({});
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const fieldRefs = useRef<Partial<Record<Exclude<TextField, 'message'>, HTMLInputElement | HTMLTextAreaElement | null>>>({});
+  const messageRef = useRef<RichTextEditorHandle>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const lastFocused = useRef<TextField>('message');
 
   const reminder = kind === 'REMINDER';
@@ -163,9 +195,10 @@ export const ExamEmailsEditor: React.FC<{
   // Subject / message: the field shows the text that will be used. Text equal to the default is
   // stored as "no override", so an exam that only changes colours keeps following the built-in copy
   // (e.g. it switches to the unproctored wording when the mode changes). Clearing a field restores
-  // the default text.
+  // the default text. The comparison is exact: treating "default + a space" as the default put the
+  // default back on screen, which swallowed the space when typing on at the end of the text.
   const setText = (field: 'subject' | 'message', value: string) => {
-    const isDefault = value.trim() === defaults[field].trim();
+    const isDefault = value === defaults[field];
     setTemplate({ ...current(), [field]: isDefault ? '' : value });
   };
 
@@ -192,12 +225,16 @@ export const ExamEmailsEditor: React.FC<{
   // Placeholder chips insert at the cursor of the text field used last (the message by default).
   const insertPlaceholder = (tag: string) => {
     const field = lastFocused.current === 'buttonText' && reminder ? 'message' : lastFocused.current;
+    if (field === 'message') {
+      messageRef.current?.insertText(tag);
+      return;
+    }
     const el = fieldRefs.current[field];
-    const currentValue = field === 'subject' || field === 'message' ? shown[field] : String(options[field] ?? '');
+    const currentValue = field === 'subject' ? shown[field] : String(options[field] ?? '');
     const start = el?.selectionStart ?? currentValue.length;
     const end = el?.selectionEnd ?? currentValue.length;
     const nextValue = currentValue.slice(0, start) + tag + currentValue.slice(end);
-    if (field === 'subject' || field === 'message') setText(field, nextValue);
+    if (field === 'subject') setText(field, nextValue);
     else setOption(field, nextValue);
     requestAnimationFrame(() => {
       const target = fieldRefs.current[field];
@@ -233,10 +270,18 @@ export const ExamEmailsEditor: React.FC<{
       key: 'showInstructionsPdf', label: 'Instructions PDF link',
       hint: unproctored ? 'Off by default: the guide covers camera/mic checks' : 'Download link to the exam guide',
     },
-    unproctored
-      ? { key: 'showProctoringNotice', label: '“Not proctored” note', hint: 'Tells candidates there is no monitoring' }
-      : { key: 'showProctoringNotice', label: 'AI proctoring notice', hint: 'Warns that webcam, mic and screen are monitored' },
+    // An unproctored exam's email carries no monitoring notice at all, so there is nothing to switch.
+    ...(unproctored ? [] : [
+      { key: 'showProctoringNotice' as BlockKey, label: 'AI proctoring notice', hint: 'Warns that webcam, mic and screen are monitored' },
+    ]),
   ];
+
+  const pickAttachment = (file: File | undefined) => {
+    if (!file || !attachment) return;
+    const problem = validateExamAttachment(file);
+    setAttachmentError(problem);
+    if (!problem) attachment.onPick(file);
+  };
 
   const customised = (k: ExamMailKind) => !isEmptyMailTemplate(templates[k]);
   const labelBase = 'block text-xs font-semibold text-slate-500 uppercase tracking-wide';
@@ -277,6 +322,95 @@ export const ExamEmailsEditor: React.FC<{
         </div>
       </div>
 
+      {attachment && (
+        <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 sm:p-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <p className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+                <Paperclip size={14} aria-hidden="true" /> Attachment <span className="font-normal text-slate-400">(optional)</span>
+              </p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                One document sent with every invitation and reminder email of this exam. PDF, Word, Excel,
+                PowerPoint, text, CSV, PNG or JPG, up to 5 MB.
+              </p>
+            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept={EXAM_ATTACHMENT_ACCEPT}
+              className="sr-only"
+              aria-label="Choose a file to attach to this exam's emails"
+              tabIndex={-1}
+              onChange={e => {
+                pickAttachment(e.target.files?.[0]);
+                e.target.value = ''; // the same file can be chosen again
+              }}
+            />
+            {!attachment.current && (
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="inline-flex items-center justify-center gap-1.5 px-3 py-2 lsc-button-ghost text-xs shrink-0"
+              >
+                <Upload size={13} aria-hidden="true" /> Choose file
+              </button>
+            )}
+          </div>
+
+          {attachment.current && (
+            <div className="mt-3 flex flex-col gap-2 rounded-lg border border-slate-200 bg-white p-2.5 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <FileText size={18} className="shrink-0 mt-0.5 text-slate-400" aria-hidden="true" />
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-slate-800 break-all leading-snug">{attachment.current.name}</p>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    {formatFileSize(attachment.current.size)}
+                    {attachment.pending === 'upload' ? ' · uploads when you save the exam' : ''}
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 lsc-button-ghost text-xs"
+                >
+                  <Upload size={12} aria-hidden="true" /> Replace
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setAttachmentError(null); attachment.onRemove(); }}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-rose-600 hover:bg-rose-50"
+                >
+                  <Trash2 size={12} aria-hidden="true" /> Remove
+                </button>
+              </div>
+            </div>
+          )}
+
+          {attachment.pending === 'remove' && (
+            <p className="mt-3 flex flex-wrap items-center gap-2 text-xs text-amber-700">
+              The attachment will be removed when you save the exam.
+              <button type="button" onClick={attachment.onUndo} className="inline-flex items-center gap-1 font-semibold underline underline-offset-2">
+                <Undo2 size={12} aria-hidden="true" /> Keep it
+              </button>
+            </p>
+          )}
+          {attachment.pending === 'upload' && (
+            <p className="mt-2 text-[11px] text-slate-500">
+              <button type="button" onClick={attachment.onUndo} className="inline-flex items-center gap-1 font-semibold text-slate-600 underline underline-offset-2">
+                <Undo2 size={12} aria-hidden="true" /> Undo this change
+              </button>
+            </p>
+          )}
+          {attachmentError && (
+            <p role="alert" className="mt-2 flex items-start gap-1.5 text-xs text-rose-600">
+              <AlertCircle size={13} className="shrink-0 mt-0.5" aria-hidden="true" /> {attachmentError}
+            </p>
+          )}
+        </div>
+      )}
+
       <div className="grid grid-cols-1 2xl:grid-cols-2 gap-6">
         {/* Form */}
         <div className="space-y-5 min-w-0" role="tabpanel" aria-label={reminder ? 'Reminder email' : 'Invitation email'}>
@@ -299,21 +433,22 @@ export const ExamEmailsEditor: React.FC<{
             </div>
             <div>
               <div className="flex items-center justify-between gap-2 mb-1.5">
-                <label htmlFor="exam-mail-message" className={labelBase}>Message</label>
+                <span id="exam-mail-message-label" className={labelBase}>Message</span>
                 {counter(shown.message, EXAM_MAIL_LIMITS.message)}
               </div>
-              <textarea
+              <RichTextEditor
+                ref={messageRef}
                 id="exam-mail-message"
-                ref={el => { fieldRefs.current.message = el; }}
+                ariaLabelledBy="exam-mail-message-label"
                 rows={7}
                 maxLength={EXAM_MAIL_LIMITS.message}
-                className={`${inputCls} font-mono leading-relaxed`}
                 value={shown.message}
                 onFocus={() => { lastFocused.current = 'message'; }}
-                onChange={e => setText('message', e.target.value)}
+                onChange={value => setText('message', value)}
               />
               <p className="text-[11px] text-slate-400 mt-1">
-                A blank line starts a new paragraph. Clear a field to go back to the default text.
+                Select text and press B, I or U to make it bold, italic or underlined. A blank line starts a
+                new paragraph. Clear a field to go back to the default text.
               </p>
             </div>
             <div>
@@ -499,6 +634,7 @@ export const ExamEmailsEditor: React.FC<{
           <p className="text-xs text-slate-500 mb-2 break-words">
             Subject: <span className="font-medium text-slate-800">{preview.subject}</span>
           </p>
+          <AttachmentNote attachment={attachment?.current} className="mb-2" />
           <EmailPreviewFrame html={preview.body} title={`${reminder ? 'Reminder' : 'Invitation'} email preview`} maxHeight={640} />
           <p className="text-[11px] text-slate-400 mt-2">
             Sample candidate “{SAMPLE_CANDIDATE}”{reminder ? '' : ' and a sample link'} — exactly the HTML that will be sent.

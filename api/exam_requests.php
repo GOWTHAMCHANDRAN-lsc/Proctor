@@ -27,6 +27,7 @@ require_once __DIR__ . '/notify.php';
 require_once __DIR__ . '/whatsapp.php';
 // Per-exam invitation email (the same HTML the admin console previews and sends).
 require_once __DIR__ . '/exam_mail_render.php';
+require_once __DIR__ . '/exam_attachments.php';
 
 const ER_CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ'; // no 0/O/1/I/L
 const ER_MAX_STUDENTS = 2000;
@@ -1193,6 +1194,9 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
     $useEmail = !empty($channels['email']);
     $useWhatsApp = !empty($channels['whatsapp']) && whatsapp_kind_ready(whatsapp_config($env), 'INVITE');
     $mailExam = exam_mail_exam_by_id($pdo, $examId);
+    // The exam's own document, when one is attached to its emails. Best effort here: the automatic
+    // invitation still goes out if the file cannot be read (exam_attachment_for_mail logs it).
+    $mailAttachments = $useEmail ? exam_attachment_for_mail($pdo, $examId)['attachments'] : [];
     $cfg = er_smtp_config($env);
     $countRemaining = static function (string $cursor) use ($pdo, $examId): int {
         return db_scalar_int($pdo, 'SELECT COUNT(*) FROM exam_assignments ea
@@ -1301,6 +1305,7 @@ function er_send_invitations(PDO $pdo, array $env, string $examId, string $after
                         'body' => $html,
                         'plain' => er_html_to_plain($html),
                         'fromName' => $companyNames[$studentCompany] . ' ProctorGuard',
+                        'attachments' => $mailAttachments,
                     ]);
                     if ($send['ok']) {
                         // Reset for the next recipient; a bad RSET means the session is suspect — reopen.

@@ -477,6 +477,10 @@ db_add_column_if_missing($pdo, 'exams', 'certificate_enabled', 'TINYINT(1) NOT N
 // Post-exam feedback form on the candidate's completion screen. Default on = what every existing
 // exam already does.
 db_add_column_if_missing($pdo, 'exams', 'feedback_enabled', 'TINYINT(1) NOT NULL DEFAULT 1');
+// On = every attempt ends at the exam's end time (a candidate who starts at 11:59 for a window
+// closing at 12:00 gets one minute). Off = each attempt runs its full duration from its own start,
+// which is what every existing exam already does. Read by sessions.php and results.php.
+db_add_column_if_missing($pdo, 'exams', 'end_at_exam_close', 'TINYINT(1) NOT NULL DEFAULT 0');
 // Optional cap on the length of a descriptive (TEXT) answer. NULL = no limit, which is what every
 // existing question keeps, so adding this changes nothing until an admin sets a value.
 db_add_column_if_missing($pdo, 'questions', 'word_limit', 'INT NULL AFTER marks');
@@ -566,6 +570,7 @@ function build_exam_response(array $row, PDO $pdo, int $companyId, bool $include
         'showResults' => (bool)$row['show_results'],
         'certificateEnabled' => (bool)($row['certificate_enabled'] ?? 0),
         'feedbackEnabled' => (bool)($row['feedback_enabled'] ?? 1),
+        'endAtExamClose' => (bool)($row['end_at_exam_close'] ?? 0),
         'attemptPolicy' => $row['attempt_policy'] ?? 'LAST',
         'passPercent' => isset($row['pass_percent']) ? (int)$row['pass_percent'] : 60,
         'reconnectLimit' => isset($row['reconnect_limit']) ? (int)$row['reconnect_limit'] : 0,
@@ -1398,6 +1403,13 @@ if ($method === 'POST') {
             $feedbackUpdate = $pdo->prepare('UPDATE exams SET feedback_enabled = ? WHERE id = ? AND company_id = ?');
             $feedbackUpdate->execute([exam_bool_flag($exam['feedbackEnabled'] ?? null, true) ? 1 : 0, $id, $companyId]);
             $feedbackUpdate->closeCursor();
+        }
+
+        // Same rule as feedbackEnabled: only a payload that carries the switch changes it.
+        if (array_key_exists('endAtExamClose', $exam) && db_column_exists($pdo, 'exams', 'end_at_exam_close')) {
+            $closeUpdate = $pdo->prepare('UPDATE exams SET end_at_exam_close = ? WHERE id = ? AND company_id = ?');
+            $closeUpdate->execute([exam_bool_flag($exam['endAtExamClose'] ?? null, false) ? 1 : 0, $id, $companyId]);
+            $closeUpdate->closeCursor();
         }
 
         if (exam_proctoring_mode_ready($pdo)) {

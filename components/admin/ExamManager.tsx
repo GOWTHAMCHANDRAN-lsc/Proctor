@@ -241,6 +241,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
       showResults: d.showResults,
       certificateEnabled: false,
       feedbackEnabled: true,
+      endAtExamClose: false,
       reconnectLimit: d.reconnectLimit,
       passPercent: d.passPercent,
       proctoringConfig: {
@@ -1310,6 +1311,7 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
         showResults: exam.showResults ?? false,
         certificateEnabled: exam.certificateEnabled ?? false,
         feedbackEnabled: exam.feedbackEnabled ?? true,
+        endAtExamClose: exam.endAtExamClose ?? false,
         reconnectLimit: exam.reconnectLimit ?? 0,
         passPercent: exam.passPercent ?? 60,
         proctoringConfig: {
@@ -2558,6 +2560,29 @@ export const ExamManager: React.FC<ExamManagerProps> = ({ students: propStudents
                   value={newExam.durationMinutes}
                   onChange={e => setNewExam({...newExam, durationMinutes: Number(e.target.value)})}
                 />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-2">At the End Time</label>
+                <div className="bg-slate-50 p-3 rounded-lg border border-slate-200">
+                  <label className="flex items-center gap-2 text-sm text-slate-700 cursor-pointer">
+                      <div className={`w-9 h-5 rounded-full relative transition-colors ${newExam.endAtExamClose ? 'bg-[var(--lsc-primary)]' : 'bg-slate-300'}`}>
+                        <input
+                          type="checkbox"
+                          className="sr-only"
+                          checked={newExam.endAtExamClose ?? false}
+                          onChange={e => setNewExam({...newExam, endAtExamClose: e.target.checked})}
+                        />
+                        <div className={`absolute top-1 left-1 bg-white w-3 h-3 rounded-full transition-transform ${newExam.endAtExamClose ? 'translate-x-4' : 'translate-x-0'}`}></div>
+                      </div>
+                      <span>End every attempt at the exam's end time</span>
+                  </label>
+                  <p className="text-[10px] text-slate-500 mt-1 leading-tight">
+                    {newExam.endAtExamClose
+                      ? `On: all attempts stop at the end time. A candidate who starts 1 minute before it gets 1 minute, not ${newExam.durationMinutes || 0}.`
+                      : `Off: every candidate gets the full ${newExam.durationMinutes || 0} minutes from when they start, even if they start just before the end time.`}
+                  </p>
+                </div>
               </div>
 
               <div>

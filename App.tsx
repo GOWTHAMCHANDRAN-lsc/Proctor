@@ -342,6 +342,9 @@ const buildPreStartInstructions = (exam: Exam): string[] => {
   const examTz = resolveExamTimezone(exam.timezone);
 
   lines.push(`Read all questions carefully. You have ${exam.durationMinutes} minutes to complete this exam.`);
+  if (exam.endAtExamClose && exam.endTime) {
+    lines.push(`Every attempt ends at ${formatScheduleShort(exam.endTime, examTz)}. If you start later than ${exam.durationMinutes} minutes before that, you will have less than ${exam.durationMinutes} minutes.`);
+  }
 
   // UNPROCTORED: nothing is monitored, so no camera / microphone / screen / fullscreen / tab rules —
   // listing them (from stale flags on the row) would send the candidate hunting for a webcam.
@@ -952,7 +955,7 @@ const StudentApp: React.FC = () => {
   // The server's verdict for the results screen (score + per-question right/wrong, never answers).
   const [examServerResult, setExamServerResult] = useState<CandidateResult | null>(null);
   // From the start/reconnect response: how far into the attempt we are, and violations on record.
-  const [sessionResume, setSessionResume] = useState<{ elapsedSeconds: number; violationCounts: Record<string, number> } | null>(null);
+  const [sessionResume, setSessionResume] = useState<{ elapsedSeconds: number; secondsUntilClose: number | null; violationCounts: Record<string, number> } | null>(null);
   const [resubmittingSession, setResubmittingSession] = useState(false);
   const pendingCompletePayloadRef = useRef<Record<string, unknown> | null>(null);
 
@@ -1233,7 +1236,7 @@ const StudentApp: React.FC = () => {
         ? await getGeoLocation()
         : { label: 'Not collected (unproctored exam)', lat: null, lng: null, accuracy: null };
       const macAddress = await getMacAddress();
-      const start = await apiPost<{ ok: boolean; sessionId?: number | null; attempt?: number; reconnect?: boolean; remaining?: number; elapsedSeconds?: number; violationCounts?: Record<string, number> }>('sessions.php', {
+      const start = await apiPost<{ ok: boolean; sessionId?: number | null; attempt?: number; reconnect?: boolean; remaining?: number; elapsedSeconds?: number; secondsUntilClose?: number | null; violationCounts?: Record<string, number> }>('sessions.php', {
         action: 'start',
         examId: exam.id,
         studentId: student.id,
@@ -1269,6 +1272,8 @@ const StudentApp: React.FC = () => {
       setSessionId(start?.sessionId ?? null);
       setSessionResume({
         elapsedSeconds: Math.max(0, Number(start?.elapsedSeconds) || 0),
+        // Set only for an exam that ends every attempt at its end time.
+        secondsUntilClose: typeof start?.secondsUntilClose === 'number' ? Math.max(0, start.secondsUntilClose) : null,
         violationCounts: start?.violationCounts && typeof start.violationCounts === 'object' ? start.violationCounts : {},
       });
       setActiveExam(examToRun);
@@ -1562,6 +1567,7 @@ const StudentApp: React.FC = () => {
         student={currentStudent}
         sessionId={sessionId ?? undefined}
         serverElapsedSeconds={sessionResume?.elapsedSeconds}
+        serverSecondsUntilClose={sessionResume?.secondsUntilClose ?? null}
         serverViolationCounts={sessionResume?.violationCounts}
         onFinish={handleExamFinish}
       />

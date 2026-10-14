@@ -89,20 +89,22 @@ if ($method === 'GET') {
 
     // Reconcile unfinished attempts so no attempt (and its violations) is lost from results.
     // Both of these must surface as a FAIL:
-    //   (a) Abandoned — still IN_PROGRESS but the attempt has outlived its own allotted time by a
-    //       30-minute grace, so the candidate never submitted. Definitively over → TERMINATED + fail.
-    //       (Duration-based only: this never touches a genuinely live attempt within its time.)
+    //   (a) Abandoned — still IN_PROGRESS but the attempt has outlived its own deadline (start +
+    //       duration, or the exam's end time for an exam that ends every attempt there) by a 30-minute
+    //       grace, so the candidate never submitted. Definitively over → TERMINATED + fail. Its end
+    //       time is the deadline, when its clock ran out, not the moment this sweep happened to run.
     //   (b) Terminated attempts that predate pass/fail stamping (passed IS NULL) → stamp passed = 0.
     db_add_column_if_missing($pdo, 'exam_sessions', 'termination_reason', 'VARCHAR(255) NULL AFTER passed');
     try {
+        $deadline = session_deadline_sql($pdo, 'es', 'e');
         $sweepAbandoned = $pdo->prepare(
             "UPDATE exam_sessions es
              JOIN exams e ON e.id = es.exam_id AND e.company_id = es.company_id
-                SET es.status = 'TERMINATED', es.end_time = NOW(3), es.passed = 0,
+                SET es.status = 'TERMINATED', es.end_time = GREATEST(es.start_time, LEAST(NOW(3), {$deadline})), es.passed = 0,
                     es.termination_reason = COALESCE(es.termination_reason, 'Not submitted — exam time elapsed. Scored on attended questions.')
               WHERE es.company_id = ?
                 AND es.status = 'IN_PROGRESS'
-                AND DATE_ADD(es.start_time, INTERVAL (COALESCE(e.duration_minutes, 0) + 30) MINUTE) < NOW(3)"
+                AND DATE_ADD({$deadline}, INTERVAL 30 MINUTE) < NOW(3)"
         );
         $sweepAbandoned->execute([$companyId]);
         $sweepAbandoned->closeCursor();

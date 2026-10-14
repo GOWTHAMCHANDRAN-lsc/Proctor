@@ -225,14 +225,16 @@ function candidate_result_summary(PDO $pdo, string $examId, int $sessionId, arra
 const SESSION_ANSWER_GRACE_MINUTES = 20;
 
 /**
- * True once an attempt is past start + duration + grace. The exam clock runs in the browser, so
- * without this a candidate could reset it (clear site data and reload) or keep a tab open and
- * submit hours later. Answers arriving after this are ignored; the last autosave stands.
+ * True once an attempt is past its deadline (start + duration, or the exam's end time for an exam that
+ * ends every attempt there) + grace. The exam clock runs in the browser, so without this a candidate
+ * could reset it (clear site data and reload) or keep a tab open and submit hours later. Answers
+ * arriving after this are ignored; the last autosave stands.
  */
 function session_answers_closed(PDO $pdo, int $sessionId): bool {
-    $stmt = $pdo->prepare('SELECT DATE_ADD(s.start_time, INTERVAL (COALESCE(e.duration_minutes, 0) + ?) MINUTE) < NOW(3) AS closed
+    $deadline = session_deadline_sql($pdo, 's', 'e');
+    $stmt = $pdo->prepare("SELECT DATE_ADD({$deadline}, INTERVAL ? MINUTE) < NOW(3) AS closed
                              FROM exam_sessions s JOIN exams e ON e.id = s.exam_id
-                            WHERE s.id = ? LIMIT 1');
+                            WHERE s.id = ? LIMIT 1");
     $stmt->execute([SESSION_ANSWER_GRACE_MINUTES, $sessionId]);
     $closed = $stmt->fetchColumn();
     $stmt->closeCursor();
@@ -929,18 +931,21 @@ if ($method === 'POST') {
                 'sessionId' => $existingId ? (int)$existingId : null,
                 'attempt' => $attemptNumber,
                 'elapsedSeconds' => $elapsed,
+                'secondsUntilClose' => exam_seconds_until_close($pdo, (string)$examId, $companyId),
                 'violationCounts' => (object)session_violation_counts($pdo, (int)$existingId),
             ]);
         }
 
         // Entry gate for a NEW attempt (a reconnect into a live attempt returned above, so a started
-        // exam still always runs its full duration). The browser checks the window too, but only
+        // exam still runs to its own deadline). The browser checks the window too, but only
         // against the candidate's own clock — a machine clock set back, or a direct API call, could
         // otherwise open an archived exam or one whose window closed hours ago. A few minutes of
         // slack absorbs ordinary clock skew between the candidate's device and the server.
+        // An exam that ends every attempt at its end time gets no slack: a start after it has no time left.
+        $closeSlack = db_column_exists($pdo, 'exams', 'end_at_exam_close') ? 'IF(end_at_exam_close = 1, 0, 5)' : '5';
         $windowStmt = $pdo->prepare("SELECT status,
                                             (start_time IS NOT NULL AND NOW(3) < DATE_SUB(start_time, INTERVAL 5 MINUTE)) AS not_open,
-                                            (end_time IS NOT NULL AND NOW(3) > DATE_ADD(end_time, INTERVAL 5 MINUTE)) AS closed
+                                            (end_time IS NOT NULL AND NOW(3) > DATE_ADD(end_time, INTERVAL {$closeSlack} MINUTE)) AS closed
                                      FROM exams WHERE id = ? AND company_id = ? LIMIT 1");
         $windowStmt->execute([$examId, $companyId]);
         $windowRow = $windowStmt->fetch();
@@ -1044,7 +1049,9 @@ if ($method === 'POST') {
             'metadata' => ['attempt' => $attemptNumber]
         ]);
 
-        json_response(['ok' => true, 'sessionId' => $sessionId, 'attempt' => $attemptNumber, 'elapsedSeconds' => 0, 'violationCounts' => new stdClass()]);
+        json_response(['ok' => true, 'sessionId' => $sessionId, 'attempt' => $attemptNumber, 'elapsedSeconds' => 0,
+            'secondsUntilClose' => exam_seconds_until_close($pdo, (string)$examId, $companyId),
+            'violationCounts' => new stdClass()]);
     }
 
     if ($action === 'location') {

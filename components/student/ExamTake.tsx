@@ -183,6 +183,8 @@ interface ExamTakeProps {
   // violations already recorded for it. The clock and counters otherwise live only in this
   // browser's storage, so clearing it used to restart the clock and zero the counters.
   serverElapsedSeconds?: number;
+  /** Seconds (server clock) until the exam's end time, for an exam that ends every attempt there. */
+  serverSecondsUntilClose?: number | null;
   serverViolationCounts?: Record<string, number>;
   onFinish: (data: {
     answers: Record<string, string | number>;
@@ -206,7 +208,7 @@ interface ExamTakeProps {
 // so the page always submits while the server still accepts answers.
 const RESUME_PAUSE_ALLOWANCE_SECONDS = 15 * 60;
 
-export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, serverElapsedSeconds = 0, serverViolationCounts, onFinish }) => {
+export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, serverElapsedSeconds = 0, serverSecondsUntilClose = null, serverViolationCounts, onFinish }) => {
   // --- LOGIC SECTION ---
 
   const seedFromString = (value: string) => {
@@ -305,8 +307,18 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, se
   const [answers, setAnswers] = useState<Record<string, any>>({});
   const examDurationSeconds = Math.max(0, Math.round((Number(exam.durationMinutes) || 0) * 60));
   const safeServerElapsed = Math.max(0, Math.floor(Number(serverElapsedSeconds) || 0));
+  // An exam that ends every attempt at its end time: that moment on this device's clock, from the
+  // server's count (so a wrong device clock cannot move it). Unlike the duration, it does not pause
+  // while the exam is blocked. null = the attempt runs its full duration.
+  const closeAtRef = useRef<number | null>(
+    typeof serverSecondsUntilClose === 'number' && Number.isFinite(serverSecondsUntilClose)
+      ? Date.now() + Math.max(0, serverSecondsUntilClose) * 1000
+      : null
+  );
+  const secondsUntilClose = (): number =>
+    closeAtRef.current === null ? Infinity : Math.max(0, Math.floor((closeAtRef.current - Date.now()) / 1000));
   // A reconnect continues the attempt's own clock (server time), not a fresh full duration.
-  const [timeLeft, setTimeLeft] = useState(() => Math.max(0, examDurationSeconds - safeServerElapsed));
+  const [timeLeft, setTimeLeft] = useState(() => Math.max(0, Math.min(examDurationSeconds - safeServerElapsed, secondsUntilClose())));
   const [violations, setViolations] = useState<ViolationLog[]>([]);
   const [questionTimes, setQuestionTimes] = useState<Record<string, number>>({});
   const questionTimerRef = useRef<number>(Date.now());
@@ -2441,7 +2453,8 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, se
       const elapsed = Math.floor((Date.now() - last) / 1000);
       if (elapsed < 1) return;
       last += elapsed * 1000;
-      setTimeLeft(prev => Math.max(0, prev - elapsed));
+      const untilClose = secondsUntilClose();
+      setTimeLeft(prev => Math.max(0, Math.min(prev - elapsed, untilClose)));
     }, 1000);
     return () => window.clearInterval(timer);
   }, [examBlocked, resumePending]);
@@ -2590,7 +2603,7 @@ export const ExamTake: React.FC<ExamTakeProps> = ({ exam, student, sessionId, se
       // The saved value lives in this browser and could be edited; the server's elapsed time bounds
       // it (plus a pause allowance for time the exam was blocked).
       const ceiling = Math.max(0, examDurationSeconds - safeServerElapsed + RESUME_PAUSE_ALLOWANCE_SECONDS);
-      setTimeLeft(Math.max(0, Math.min(examDurationSeconds, ceiling, payload.timeLeft - elapsed)));
+      setTimeLeft(Math.max(0, Math.min(examDurationSeconds, ceiling, payload.timeLeft - elapsed, secondsUntilClose())));
     }
     if (typeof payload.sectionTimeLeft === 'number') {
       const nextSectionTime = Math.max(0, payload.sectionTimeLeft - elapsed);

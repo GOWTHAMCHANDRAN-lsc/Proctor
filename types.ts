@@ -152,6 +152,9 @@ export interface Exam {
   certificateEnabled?: boolean;
   // Ask candidates for star ratings + comments on the completion screen (default true).
   feedbackEnabled?: boolean;
+  // True = every attempt ends at endTime, so a late starter gets less than durationMinutes.
+  // False (default) = each attempt runs its full durationMinutes from its own start.
+  endAtExamClose?: boolean;
   attemptPolicy?: 'LAST'; // Multi-attempt scoring policy disabled; always last attempt
   reconnectLimit?: number; // Allowed reconnection attempts for active sessions
   passPercent?: number; // Percentage required to pass the exam

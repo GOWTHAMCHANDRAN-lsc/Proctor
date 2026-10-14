@@ -6,6 +6,8 @@ import { Exam, ExamResultRecord, QuestionType, ResultAuditLog, SessionFeedback, 
 import { formatResultAnswer } from '../../services/answerFormat';
 import { resolveExamTimezone, formatScheduleShort } from '../../services/timezone';
 import { groupViolationEpisodes, formatEpisodeDuration } from '../../services/violationEpisodes';
+import { downloadXlsx } from '../../services/xlsxExport';
+import { attendanceRows, attendanceSheet, resultsSheet } from '../../services/resultSheets';
 
 interface ResultsProps {
   exams: Exam[];
@@ -1556,7 +1558,8 @@ export const Results: React.FC<ResultsProps> = ({ exams, students, role }) => {
           r.s.enrolled ? 'Yes' : 'No',
           String(r.attempts),
           r.avg === null ? '' : String(r.avg),
-          `${r.passed}/${r.attempts}`,
+          // Not "1/3": Excel opens that as the date 1-Mar.
+          `${r.passed} of ${r.attempts}`,
           String(r.vio),
         ]),
       ];
@@ -1567,33 +1570,36 @@ export const Results: React.FC<ResultsProps> = ({ exams, students, role }) => {
     }
   };
 
-  const handleExportFiltered = () => {
-    const rows: string[][] = [
-      // 'Result' is appended last so existing column positions are unchanged for anyone parsing this.
-      ['Student Name', 'Registration ID', 'Exam Title', 'Attempt', 'Status', 'Score', 'Percent', 'Final Score', 'Final Percent', 'Start Time', 'End Time', 'Result'],
-    ];
+  // Excel, not CSV: Excel read a CSV score such as "11/60" as the date "Nov-60" and long phone
+  // numbers as "9.19E+11". The .xlsx states each cell's type.
+  const handleExportFiltered = async () => {
+    try {
+      const stamp = new Date().toISOString().slice(0, 10);
+      await downloadXlsx(`results_${stamp}.xlsx`, [resultsSheet(filteredResults, students, exams)]);
+    } catch {
+      alert('Could not create the Excel file. Please try again.');
+    }
+  };
 
-    filteredResults.forEach(result => {
-      const student = students.find(s => s.id === result.studentId);
-      const exam = exams.find(e => e.id === result.examId);
-      rows.push([
-        student?.fullName || result.studentId,
-        student?.registrationId || '',
-        exam?.title || result.examId,
-        result.attemptIndex ? `Attempt ${result.attemptIndex}${result.attemptCount ? `/${result.attemptCount}` : ''}` : '',
-        result.status,
-        formatScore(result),
-        formatPercent(result),
-        formatFinalScore(result),
-        formatFinalPercent(result),
-        formatScheduleShort(result.startTime, resolveExamTimezone(exam?.timezone)),
-        result.endTime ? formatScheduleShort(result.endTime, resolveExamTimezone(exam?.timezone)) : '',
-        getPassBadge(result).label,
-      ]);
-    });
-
-    const stamp = new Date().toISOString().slice(0, 10);
-    downloadCsv(`results_export_${stamp}.csv`, rows);
+  // Attendance for the selected exam: every assigned candidate, Appeared or Not Appeared.
+  const handleExportAttendance = async () => {
+    const exam = exams.find(e => e.id === selectedExamId);
+    if (!exam) {
+      alert('Select a specific exam in the Exam filter to download its attendance.');
+      return;
+    }
+    const rows = attendanceRows(exam, students, results);
+    if (rows.length === 0) {
+      alert('No candidates are assigned to this exam and nobody has attempted it yet.');
+      return;
+    }
+    try {
+      const safeExam = (exam.title || 'exam').replace(/[^\w\-]+/g, '_');
+      const stamp = new Date().toISOString().slice(0, 10);
+      await downloadXlsx(`attendance_${safeExam}_${stamp}.xlsx`, [attendanceSheet(exam, rows)]);
+    } catch {
+      alert('Could not create the Excel file. Please try again.');
+    }
   };
 
   const handleExportAnswerSheet = () => {
@@ -1606,7 +1612,8 @@ export const Results: React.FC<ResultsProps> = ({ exams, students, role }) => {
       ['Student', student?.fullName || selectedResult.studentId],
       ['Registration ID', student?.registrationId || ''],
       ['Status', selectedResult.status],
-      ['Score', formatScore(selectedResult)],
+      // Not "11 / 60": Excel opens that as the date Nov-60.
+      ['Score', formatScore(selectedResult).replace(' / ', ' out of ')],
       ['Percent', formatPercent(selectedResult)],
       [],
       ['Q#', 'Question', 'Type', 'Answer', 'Correct Answer', 'Marks', 'Awarded', 'Correct?'],
@@ -1895,6 +1902,22 @@ export const Results: React.FC<ResultsProps> = ({ exams, students, role }) => {
                 </button>
                 <button
                   role="menuitem"
+                  onClick={() => { setReportsMenuOpen(false); void handleExportAttendance(); }}
+                  disabled={selectedExamId === 'ALL'}
+                  className="w-full text-left px-3 py-2 rounded-lg hover:bg-slate-50 disabled:opacity-40 disabled:hover:bg-transparent flex items-start gap-2.5"
+                >
+                  <ClipboardList size={15} className="text-[var(--lsc-primary)] mt-0.5 shrink-0" />
+                  <span>
+                    <span className="block text-sm font-medium text-slate-800">Attendance (Excel)</span>
+                    <span className="block text-[11px] text-slate-400">
+                      {selectedExamId === 'ALL'
+                        ? 'Pick an exam in the filter first'
+                        : 'Name, contact number, Appeared / Not Appeared'}
+                    </span>
+                  </span>
+                </button>
+                <button
+                  role="menuitem"
                   onClick={() => { setReportsMenuOpen(false); handleExportNotAttendedCsv(); }}
                   disabled={selectedExamId === 'ALL' || !notAttempted || notAttempted.list.length === 0}
                   className="w-full text-left px-3 py-2 rounded-lg hover:bg-slate-50 disabled:opacity-40 disabled:hover:bg-transparent flex items-start gap-2.5"
@@ -1916,13 +1939,13 @@ export const Results: React.FC<ResultsProps> = ({ exams, students, role }) => {
                 <div className="px-3 pt-2 pb-1 text-[10px] font-bold uppercase tracking-wide text-slate-400">Results</div>
                 <button
                   role="menuitem"
-                  onClick={() => { setReportsMenuOpen(false); handleExportFiltered(); }}
+                  onClick={() => { setReportsMenuOpen(false); void handleExportFiltered(); }}
                   className="w-full text-left px-3 py-2 rounded-lg hover:bg-slate-50 flex items-start gap-2.5"
                 >
                   <Download size={15} className="text-slate-500 mt-0.5 shrink-0" />
                   <span>
-                    <span className="block text-sm font-medium text-slate-800">Results (CSV)</span>
-                    <span className="block text-[11px] text-slate-400">Current filtered results table</span>
+                    <span className="block text-sm font-medium text-slate-800">Results (Excel)</span>
+                    <span className="block text-[11px] text-slate-400">Filtered results: marks, correct / incorrect, attempts, termination reason</span>
                   </span>
                 </button>
                 <button

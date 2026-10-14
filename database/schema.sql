@@ -580,6 +580,7 @@ CREATE TABLE `exams` (
   `show_violation_alerts` tinyint(1) NOT NULL DEFAULT '1',
   `auto_terminate` tinyint(1) NOT NULL DEFAULT '1',
   `feedback_enabled` tinyint(1) NOT NULL DEFAULT '1',
+  `end_at_exam_close` tinyint(1) NOT NULL DEFAULT '0',
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;

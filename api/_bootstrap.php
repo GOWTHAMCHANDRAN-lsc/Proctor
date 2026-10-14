@@ -643,6 +643,39 @@ function finalize_stuck_recordings(PDO $pdo, int $companyId, string $examId, str
     }
 }
 
+/**
+ * SQL for the moment an attempt's time runs out: its start + the exam's duration, or the exam's end
+ * time if that comes first and the exam ends every attempt there (exams.end_at_exam_close, set in the
+ * exam editor; added by exams.php). $s / $e are the aliases of exam_sessions and exams in the query.
+ */
+function session_deadline_sql(PDO $pdo, string $s = 's', string $e = 'e'): string {
+    $byDuration = "DATE_ADD({$s}.start_time, INTERVAL COALESCE({$e}.duration_minutes, 0) MINUTE)";
+    if (!db_column_exists($pdo, 'exams', 'end_at_exam_close')) {
+        return $byDuration;
+    }
+    return "(CASE WHEN {$e}.end_at_exam_close = 1 AND {$e}.end_time IS NOT NULL
+                  THEN LEAST({$byDuration}, {$e}.end_time) ELSE {$byDuration} END)";
+}
+
+/**
+ * Seconds (server clock) until the exam's end time when the exam ends every attempt there; null when
+ * attempts run their full duration. Sent with the start/reconnect response so the page caps its timer.
+ */
+function exam_seconds_until_close(PDO $pdo, string $examId, int $companyId): ?int {
+    if (!db_column_exists($pdo, 'exams', 'end_at_exam_close')) {
+        return null;
+    }
+    $stmt = $pdo->prepare('SELECT end_at_exam_close, GREATEST(0, TIMESTAMPDIFF(SECOND, NOW(3), end_time)) AS seconds_left
+                             FROM exams WHERE id = ? AND company_id = ? LIMIT 1');
+    $stmt->execute([$examId, $companyId]);
+    $row = $stmt->fetch();
+    $stmt->closeCursor();
+    if (!$row || (int)$row['end_at_exam_close'] !== 1 || $row['seconds_left'] === null) {
+        return null;
+    }
+    return (int)$row['seconds_left'];
+}
+
 function db_add_column_if_missing(PDO $pdo, string $table, string $column, string $definition): void {
     try {
         if (!db_column_exists($pdo, $table, $column)) {

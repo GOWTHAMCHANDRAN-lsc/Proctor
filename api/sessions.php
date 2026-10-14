@@ -241,27 +241,6 @@ function session_answers_closed(PDO $pdo, int $sessionId): bool {
     return (int)$closed === 1;
 }
 
-/** [score, maxScore] of the already-stored answers, over the served questions only. */
-function stored_score_for_served(PDO $pdo, int $sessionId, array $servedIds): array {
-    if (count($servedIds) === 0) {
-        return [0, 0];
-    }
-    $ph = implode(',', array_fill(0, count($servedIds), '?'));
-    $stmt = $pdo->prepare("SELECT q.id, q.marks, sa.awarded_marks
-                             FROM questions q
-                             LEFT JOIN session_answers sa ON sa.question_id = q.id AND sa.session_id = ?
-                            WHERE q.id IN ($ph)");
-    $stmt->execute(array_merge([$sessionId], $servedIds));
-    $score = 0.0;
-    $max = 0;
-    foreach ($stmt->fetchAll() as $r) {
-        $max += (int)$r['marks'];
-        $score += $r['awarded_marks'] !== null ? (float)$r['awarded_marks'] : 0;
-    }
-    $stmt->closeCursor();
-    return [$score, $max];
-}
-
 /**
  * The violation category whose recorded count has reached the exam's limit, or null. Mirrors
  * ExamTake.tsx (violationCategoriesByType + categoryLimits): the page ends the attempt itself at the

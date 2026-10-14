@@ -7,7 +7,7 @@ import { formatResultAnswer } from '../../services/answerFormat';
 import { resolveExamTimezone, formatScheduleShort } from '../../services/timezone';
 import { groupViolationEpisodes, formatEpisodeDuration } from '../../services/violationEpisodes';
 import { downloadXlsx } from '../../services/xlsxExport';
-import { attendanceRows, attendanceSheet, resultsSheet } from '../../services/resultSheets';
+import { attendanceRows, attendanceSheet, examWorkbookSheets, resultsSheet } from '../../services/resultSheets';
 
 interface ResultsProps {
   exams: Exam[];
@@ -1596,7 +1596,24 @@ export const Results: React.FC<ResultsProps> = ({ exams, students, role }) => {
     try {
       const safeExam = (exam.title || 'exam').replace(/[^\w\-]+/g, '_');
       const stamp = new Date().toISOString().slice(0, 10);
-      await downloadXlsx(`attendance_${safeExam}_${stamp}.xlsx`, [attendanceSheet(exam, rows)]);
+      await downloadXlsx(`attendance_${safeExam}_${stamp}.xlsx`, [attendanceSheet([exam], rows)]);
+    } catch {
+      alert('Could not create the Excel file. Please try again.');
+    }
+  };
+
+  // One workbook: Dashboard (exam statistics), Results and Attendance — for the selected exam, or
+  // for every exam when the filter is on All. Other filters (batch, status, search) do not apply.
+  const handleExportExamWorkbook = async () => {
+    const scope = selectedExamId === 'ALL' ? exams : exams.filter(e => e.id === selectedExamId);
+    if (scope.length === 0) {
+      alert('There are no exams to report on yet.');
+      return;
+    }
+    try {
+      const name = scope.length === 1 ? (scope[0].title || 'exam').replace(/[^\w\-]+/g, '_') : 'all_exams';
+      const stamp = new Date().toISOString().slice(0, 10);
+      await downloadXlsx(`exam_report_${name}_${stamp}.xlsx`, examWorkbookSheets(scope, students, results));
     } catch {
       alert('Could not create the Excel file. Please try again.');
     }
@@ -1897,6 +1914,21 @@ export const Results: React.FC<ResultsProps> = ({ exams, students, role }) => {
                     <span className="block text-sm font-medium text-slate-800">{examZipBusy ? (zipProgress || 'Zipping…') : 'All Student Reports (ZIP of PDFs)'}</span>
                     <span className="block text-[11px] text-slate-400">
                       {selectedExamId === 'ALL' ? 'Pick an exam in the filter first' : 'One PDF per assigned student (incl. did-not-attempt), zipped'}
+                    </span>
+                  </span>
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => { setReportsMenuOpen(false); void handleExportExamWorkbook(); }}
+                  className="w-full text-left px-3 py-2 rounded-lg hover:bg-slate-50 flex items-start gap-2.5"
+                >
+                  <BarChart3 size={15} className="text-[var(--lsc-primary)] mt-0.5 shrink-0" />
+                  <span>
+                    <span className="block text-sm font-medium text-slate-800">Exam Report (Excel)</span>
+                    <span className="block text-[11px] text-slate-400">
+                      {selectedExamId === 'ALL'
+                        ? 'Dashboard, Results and Attendance sheets for all exams'
+                        : 'Dashboard, Results and Attendance sheets for the selected exam'}
                     </span>
                   </span>
                 </button>

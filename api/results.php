@@ -88,26 +88,43 @@ if ($method === 'GET') {
     }
 
     // Reconcile unfinished attempts so no attempt (and its violations) is lost from results.
-    // Both of these must surface as a FAIL:
-    //   (a) Abandoned — still IN_PROGRESS but the attempt has outlived its own deadline (start +
+    //   (a) Not submitted — still IN_PROGRESS but the attempt has outlived its own deadline (start +
     //       duration, or the exam's end time for an exam that ends every attempt there) by a 30-minute
-    //       grace, so the candidate never submitted. Definitively over → TERMINATED + fail. Its end
-    //       time is the deadline, when its clock ran out, not the moment this sweep happened to run.
+    //       grace: the candidate closed the page or lost the connection and never pressed Submit.
+    //       Graded on the answers autosaved in time. At or above the pass mark it is a successful
+    //       attempt (COMPLETED, pass); below it, TERMINATED + fail (the user's rule, 2026-10-14).
+    //       Either way the reason records that it was not submitted, and its end time is the
+    //       deadline, when its clock ran out, not the moment this sweep happened to run.
     //   (b) Terminated attempts that predate pass/fail stamping (passed IS NULL) → stamp passed = 0.
     db_add_column_if_missing($pdo, 'exam_sessions', 'termination_reason', 'VARCHAR(255) NULL AFTER passed');
     try {
         $deadline = session_deadline_sql($pdo, 'es', 'e');
-        $sweepAbandoned = $pdo->prepare(
-            "UPDATE exam_sessions es
-             JOIN exams e ON e.id = es.exam_id AND e.company_id = es.company_id
-                SET es.status = 'TERMINATED', es.end_time = GREATEST(es.start_time, LEAST(NOW(3), {$deadline})), es.passed = 0,
-                    es.termination_reason = COALESCE(es.termination_reason, 'Not submitted — exam time elapsed. Scored on attended questions.')
+        $abandonedStmt = $pdo->prepare(
+            "SELECT es.id, es.exam_id, e.pass_percent, GREATEST(es.start_time, LEAST(NOW(3), {$deadline})) AS ended_at
+               FROM exam_sessions es
+               JOIN exams e ON e.id = es.exam_id AND e.company_id = es.company_id
               WHERE es.company_id = ?
                 AND es.status = 'IN_PROGRESS'
                 AND DATE_ADD({$deadline}, INTERVAL 30 MINUTE) < NOW(3)"
         );
-        $sweepAbandoned->execute([$companyId]);
-        $sweepAbandoned->closeCursor();
+        $abandonedStmt->execute([$companyId]);
+        $abandoned = $abandonedStmt->fetchAll();
+        $abandonedStmt->closeCursor();
+        $closeAbandoned = $pdo->prepare(
+            "UPDATE exam_sessions
+                SET status = ?, end_time = ?, total_score = ?, max_score = ?, passed = ?,
+                    termination_reason = COALESCE(termination_reason, 'Not submitted — exam time elapsed. Scored on attended questions.')
+              WHERE id = ? AND company_id = ? AND status = 'IN_PROGRESS'"
+        );
+        foreach ($abandoned as $a) {
+            $sessionId = (int)$a['id'];
+            [$score, $max] = stored_score_for_served($pdo, $sessionId, exam_served_question_ids($pdo, (string)$a['exam_id'], $sessionId));
+            $passPercent = max(0, min(100, (int)($a['pass_percent'] ?? 60)));
+            // Same rule as a submitted attempt (sessions.php 'complete').
+            $passed = $max > 0 && ($score / $max) >= ($passPercent / 100) ? 1 : 0;
+            $closeAbandoned->execute([$passed ? 'COMPLETED' : 'TERMINATED', $a['ended_at'], $score, $max, $passed, $sessionId, $companyId]);
+            $closeAbandoned->closeCursor();
+        }
 
         $sweepTerminated = $pdo->prepare(
             "UPDATE exam_sessions

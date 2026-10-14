@@ -1096,6 +1096,27 @@ function exam_served_question_ids(PDO $pdo, string $examId, int $sessionId): arr
     return array_values(array_unique($ids));
 }
 
+/** [score, maxScore] of the already-stored answers, over the served questions only (sessions.php, results.php). */
+function stored_score_for_served(PDO $pdo, int $sessionId, array $servedIds): array {
+    if (count($servedIds) === 0) {
+        return [0, 0];
+    }
+    $ph = implode(',', array_fill(0, count($servedIds), '?'));
+    $stmt = $pdo->prepare("SELECT q.id, q.marks, sa.awarded_marks
+                             FROM questions q
+                             LEFT JOIN session_answers sa ON sa.question_id = q.id AND sa.session_id = ?
+                            WHERE q.id IN ($ph)");
+    $stmt->execute(array_merge([$sessionId], $servedIds));
+    $score = 0.0;
+    $max = 0;
+    foreach ($stmt->fetchAll() as $r) {
+        $max += (int)$r['marks'];
+        $score += $r['awarded_marks'] !== null ? (float)$r['awarded_marks'] : 0;
+    }
+    $stmt->closeCursor();
+    return [$score, $max];
+}
+
 /**
  * How many questions a candidate of this exam is given — the size of the draw
  * exam_served_question_ids() makes (each section's question limit, or the exam's question count,
